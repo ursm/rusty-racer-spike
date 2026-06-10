@@ -14,12 +14,14 @@ module RustyRacer
   class ParseError < EvalError; end
   class RuntimeError < EvalError; end
   class ScriptTerminatedError < EvalError; end
+  class SnapshotError < Error; end
   class PlatformAlreadyInitialized < Error; end
 
   class Context
-    # csim's keyword-arg constructor over the positional Rust primitive.
-    def self.new(host_namespace: nil)
-      _new(host_namespace)
+    # csim's keyword-arg constructor over the positional Rust primitive. A
+    # snapshot (RustyRacer::Snapshot) boots the isolate with its baked-in state.
+    def self.new(host_namespace: nil, snapshot: nil)
+      _new(host_namespace, snapshot)
     end
 
     # csim's keyword-arg API over the positional Rust primitive. `resolve` maps

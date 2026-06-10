@@ -111,6 +111,47 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2, @ctx.eval("1 + 1") # realm usable after reset
   end
 
+  def test_snapshot_bakes_globals_into_a_booted_context
+    snap = RustyRacer::Snapshot.new(<<~JS)
+      globalThis.GREETING = "from snapshot";
+      function double(x) { return x * 2 }
+    JS
+    assert_operator snap.size, :>, 0
+
+    ctx = RustyRacer::Context.new(snapshot: snap)
+    assert_equal "from snapshot", ctx.eval("GREETING")
+    assert_equal 42, ctx.eval("double(21)")
+
+    # a context with no snapshot does not have those globals
+    assert_equal "undefined", @ctx.eval("typeof GREETING")
+  end
+
+  def test_snapshot_dump_and_load_round_trip
+    snap = RustyRacer::Snapshot.new('globalThis.V = 7')
+    blob = snap.dump
+    assert_equal Encoding::ASCII_8BIT, blob.encoding
+    reloaded = RustyRacer::Snapshot.load(blob)
+    assert_equal snap.size, reloaded.size
+    ctx = RustyRacer::Context.new(snapshot: reloaded)
+    assert_equal 7, ctx.eval("V")
+  end
+
+  def test_snapshot_warmup_grows_and_still_boots
+    snap = RustyRacer::Snapshot.new('globalThis.A = 1')
+    before = snap.size
+    snap.warmup!('function warmMe() { return A + 1 } warmMe();')
+    assert_operator snap.size, :>=, before
+    ctx = RustyRacer::Context.new(snapshot: snap)
+    assert_equal 1, ctx.eval("A")
+    assert_equal 2, ctx.eval("warmMe()")
+  end
+
+  def test_snapshot_with_broken_code_raises
+    assert_raises(RustyRacer::SnapshotError) do
+      RustyRacer::Snapshot.new("this is not valid js ===")
+    end
+  end
+
   def test_create_realm_is_isolated_from_main_and_siblings
     a = @ctx.create_realm
     b = @ctx.create_realm

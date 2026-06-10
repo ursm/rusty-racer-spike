@@ -571,9 +571,16 @@ fn v8_thread_main(
     rx: Receiver<Request>,
     handle_tx: Sender<v8::IsolateHandle>,
     host_namespace: Option<String>,
+    snapshot: Option<Vec<u8>>,
 ) {
     init_v8();
-    let mut isolate = v8::Isolate::new(Default::default());
+    // A snapshot blob bakes globalThis state into the isolate: the first
+    // Context::new below then deserializes that default context for free.
+    let create_params = match snapshot {
+        Some(bytes) => v8::CreateParams::default().snapshot_blob(v8::StartupData::from(bytes)),
+        None => Default::default(),
+    };
+    let mut isolate = v8::Isolate::new(create_params);
     let _ = handle_tx.send(isolate.thread_safe_handle());
     // mut: reset_realm swaps this for a fresh Context in the same warm isolate.
     let mut main_context = {
@@ -783,6 +790,13 @@ struct Realm {
     disposed: AtomicBool,
 }
 
+// A V8 startup blob. Built by running code in a throwaway isolate; consumed by
+// Context.new(snapshot:). warmup! re-snapshots with extra code to pre-compile.
+#[magnus::wrap(class = "RustyRacer::Snapshot")]
+struct Snapshot {
+    blob: RefCell<Vec<u8>>,
+}
+
 // Set true once V8 is initialized; Platform.set_flags! refuses after that
 // (flags must be set before V8::initialize), like mini_racer's
 // PlatformAlreadyInitialized.
@@ -855,11 +869,62 @@ fn install_host_namespace(isolate: &mut v8::Isolate, ctx: &v8::Global<v8::Contex
     }
 }
 
+// Build a startup blob by running |code| in a throwaway isolate and snapshotting
+// its default context. Runs entirely on the calling (Ruby) thread: the
+// OwnedIsolate is a local, never stored in a Send wrapper, so the !Send dedicated
+// -thread rule doesn't apply. |base| warms an existing blob further.
+fn build_snapshot(code: &str, base: Option<Vec<u8>>) -> Result<Vec<u8>, String> {
+    init_v8();
+    let mut creator = match base {
+        Some(bytes) => v8::Isolate::snapshot_creator_from_existing_snapshot(
+            v8::StartupData::from(bytes),
+            None,
+            None,
+        ),
+        None => v8::Isolate::snapshot_creator(None, None),
+    };
+    let mut err: Option<String> = None;
+    {
+        v8::scope!(let scope, &mut creator);
+        let context = v8::Context::new(scope, Default::default());
+        {
+            let cscope = &mut v8::ContextScope::new(scope, context);
+            if !code.is_empty() {
+                if let Err(e) = run_source(cscope, code) {
+                    err = Some(match e {
+                        VmError::Parse(m) | VmError::Runtime(m) => m,
+                        VmError::Terminated => "snapshot code was terminated".to_string(),
+                    });
+                }
+            }
+        }
+        // Mark this context as the one to deserialize on boot (after the
+        // ContextScope is dropped, like denoland/rusty_v8's snapshot path).
+        scope.set_default_context(context);
+    }
+    // create_blob MUST run before the creator is dropped (rusty_v8 panics
+    // otherwise), even when the user code failed — so consume it first, then
+    // surface the error.
+    let blob = creator.create_blob(v8::FunctionCodeHandling::Keep);
+    if let Some(e) = err {
+        return Err(e);
+    }
+    blob.map(|d| d.to_vec())
+        .ok_or_else(|| "snapshot creation failed".to_string())
+}
+
 impl Context {
-    fn new(ruby: &Ruby, host_namespace: Option<String>) -> Result<Self, Error> {
+    fn new(
+        ruby: &Ruby,
+        host_namespace: Option<String>,
+        snapshot: Option<magnus::typed_data::Obj<Snapshot>>,
+    ) -> Result<Self, Error> {
+        let snapshot_bytes = snapshot.map(|s| s.blob.borrow().clone());
         let (tx, rx) = channel::<Request>();
         let (handle_tx, handle_rx) = channel::<v8::IsolateHandle>();
-        std::thread::spawn(move || v8_thread_main(rx, handle_tx, host_namespace));
+        std::thread::spawn(move || {
+            v8_thread_main(rx, handle_tx, host_namespace, snapshot_bytes)
+        });
         let handle = handle_rx
             .recv()
             .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread failed to boot"))?;
@@ -1172,6 +1237,50 @@ impl Realm {
     }
 }
 
+impl Snapshot {
+    // Snapshot.new(code = "") — run code into a fresh blob.
+    fn new(args: &[Value]) -> Result<Snapshot, Error> {
+        let ruby = Ruby::get().unwrap();
+        let code = match args.first() {
+            Some(v) if !v.is_nil() => String::try_convert(*v)?,
+            _ => String::new(),
+        };
+        let blob = build_snapshot(&code, None)
+            .map_err(|m| Error::new(err_class(&ruby, "SnapshotError"), m))?;
+        Ok(Snapshot {
+            blob: RefCell::new(blob),
+        })
+    }
+
+    // Snapshot.load(blob) — rewrap raw bytes (no validation until boot).
+    fn load(blob: magnus::RString) -> Snapshot {
+        // Safe: the slice is copied into an owned Vec before any Ruby code
+        // (which could move/free the string) can run.
+        let bytes = unsafe { blob.as_slice() }.to_vec();
+        Snapshot {
+            blob: RefCell::new(bytes),
+        }
+    }
+
+    // warmup!(code) — re-snapshot the existing blob with extra code so its
+    // functions are pre-compiled. Spike: returns nil (csim returns self).
+    fn warmup(ruby: &Ruby, rb_self: &Self, code: String) -> Result<(), Error> {
+        let base = rb_self.blob.borrow().clone();
+        let blob = build_snapshot(&code, Some(base))
+            .map_err(|m| Error::new(err_class(ruby, "SnapshotError"), m))?;
+        *rb_self.blob.borrow_mut() = blob;
+        Ok(())
+    }
+
+    fn dump(ruby: &Ruby, rb_self: &Self) -> Value {
+        ruby.str_from_slice(&rb_self.blob.borrow()).as_value()
+    }
+
+    fn size(&self) -> usize {
+        self.blob.borrow().len()
+    }
+}
+
 fn json_quote(s: &str) -> String {
     let mut out = String::with_capacity(s.len() + 2);
     out.push('"');
@@ -1396,7 +1505,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("RustyRacer")?;
     let class = module.define_class("Context", ruby.class_object())?;
     // keyword-arg wrapper Context.new(host_namespace:) lives in lib/rusty_racer.rb
-    class.define_singleton_method("_new", function!(Context::new, 1))?;
+    class.define_singleton_method("_new", function!(Context::new, 2))?;
     class.define_method("eval", method!(Context::eval, 1))?;
     class.define_method("eval_t", method!(Context::eval_t, 2))?;
     class.define_method("call", method!(Context::call, -1))?;
@@ -1416,6 +1525,14 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     realm.define_method("attach", method!(Realm::attach, 2))?;
     realm.define_method("dispose", method!(Realm::dispose, 0))?;
     realm.define_method("disposed?", method!(Realm::disposed, 0))?;
+
+    // V8 startup blob: Snapshot.new(code) -> Context.new(snapshot:).
+    let snapshot = module.define_class("Snapshot", ruby.class_object())?;
+    snapshot.define_singleton_method("new", function!(Snapshot::new, -1))?;
+    snapshot.define_singleton_method("load", function!(Snapshot::load, 1))?;
+    snapshot.define_method("warmup!", method!(Snapshot::warmup, 1))?;
+    snapshot.define_method("dump", method!(Snapshot::dump, 0))?;
+    snapshot.define_method("size", method!(Snapshot::size, 0))?;
 
     let platform = module.define_module("Platform")?;
     platform.define_singleton_method("set_flags!", function!(platform_set_flags, -1))?;
