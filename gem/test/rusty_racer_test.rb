@@ -37,6 +37,40 @@ class RustyRacerTest < Minitest::Test
     assert_operator counter, :>, 1000, "GVL not released during eval"
   end
 
+  def test_host_namespace_injects_drain_microtasks
+    ctx = RustyRacer::Context.new(host_namespace: "MiniRacer")
+    assert_equal "object", ctx.eval("typeof MiniRacer")
+    assert_equal "function", ctx.eval("typeof MiniRacer.drainMicrotasks")
+    order = ctx.eval(<<~JS)
+      const seen = [];
+      Promise.resolve().then(() => seen.push("microtask"));
+      seen.push("before");
+      MiniRacer.drainMicrotasks();
+      seen.push("after");
+      seen;
+    JS
+    assert_equal %w[before microtask after], order
+  end
+
+  def test_host_namespace_survives_reset_realm
+    ctx = RustyRacer::Context.new(host_namespace: "MiniRacer")
+    ctx.reset_realm
+    assert_equal "object", ctx.eval("typeof MiniRacer")
+  end
+
+  def test_no_host_namespace_by_default
+    assert_equal "undefined", @ctx.eval("typeof MiniRacer")
+  end
+
+  def test_set_flags_after_init_raises
+    # V8 is already initialized by setup's Context.new, so set_flags! must
+    # refuse (a successful set_flags! needs a fresh process — see csim's
+    # subprocess single-threaded tests).
+    assert_raises(RustyRacer::PlatformAlreadyInitialized) do
+      RustyRacer::Platform.set_flags!(:use_strict)
+    end
+  end
+
   def test_marshals_arrays_and_hashes
     # JS -> Ruby
     assert_equal [1, 2, 3], @ctx.eval("[1, 2, 3]")

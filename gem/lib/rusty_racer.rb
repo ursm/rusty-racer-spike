@@ -14,8 +14,14 @@ module RustyRacer
   class ParseError < EvalError; end
   class RuntimeError < EvalError; end
   class ScriptTerminatedError < EvalError; end
+  class PlatformAlreadyInitialized < Error; end
 
   class Context
+    # csim's keyword-arg constructor over the positional Rust primitive.
+    def self.new(host_namespace: nil)
+      _new(host_namespace)
+    end
+
     # csim's keyword-arg API over the positional Rust primitive. `resolve` maps
     # [[specifier, referrer], ...] -> [url|nil, ...]; `fetch_batch` maps
     # [url, ...] -> [[source, cached_data]|nil, ...]. Returns { modules: [...] }.

@@ -34,6 +34,7 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
 use std::ptr::null_mut;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::sync::{Mutex, Once};
 use std::time::Duration;
@@ -541,7 +542,11 @@ fn load_module_graph_inner(
     Ok(new_urls)
 }
 
-fn v8_thread_main(rx: Receiver<Request>, handle_tx: Sender<v8::IsolateHandle>) {
+fn v8_thread_main(
+    rx: Receiver<Request>,
+    handle_tx: Sender<v8::IsolateHandle>,
+    host_namespace: Option<String>,
+) {
     init_v8();
     let mut isolate = v8::Isolate::new(Default::default());
     let _ = handle_tx.send(isolate.thread_safe_handle());
@@ -551,6 +556,9 @@ fn v8_thread_main(rx: Receiver<Request>, handle_tx: Sender<v8::IsolateHandle>) {
         let context = v8::Context::new(scope, Default::default());
         v8::Global::new(scope, context)
     };
+    if let Some(ref name) = host_namespace {
+        install_host_namespace(&mut isolate, &global_context, name);
+    }
 
     while let Ok(request) = rx.recv() {
         match request {
@@ -631,6 +639,9 @@ fn v8_thread_main(rx: Receiver<Request>, handle_tx: Sender<v8::IsolateHandle>) {
                 };
                 global_context = fresh;
                 REGISTRY.with(|r| r.borrow_mut().clear());
+                if let Some(ref name) = host_namespace {
+                    install_host_namespace(&mut isolate, &global_context, name);
+                }
                 let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
             }
             Request::LoadModuleGraph { entry_url, reply } => {
@@ -678,20 +689,83 @@ struct Context {
     procs: RefCell<Vec<Opaque<Proc>>>,
 }
 
+// Set true once V8 is initialized; Platform.set_flags! refuses after that
+// (flags must be set before V8::initialize), like mini_racer's
+// PlatformAlreadyInitialized.
+static V8_INITED: AtomicBool = AtomicBool::new(false);
+
 fn init_v8() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
         let platform = v8::new_default_platform(0, false).make_shared();
         v8::V8::initialize_platform(platform);
         v8::V8::initialize();
+        V8_INITED.store(true, Ordering::SeqCst);
     });
 }
 
+// RustyRacer::Platform.set_flags!(*flags, **kwargs): symbol/string -> --flag,
+// hash entry -> --key=value. Must run before the first Context.new.
+fn platform_set_flags(args: &[Value]) -> Result<(), Error> {
+    let ruby = Ruby::get().unwrap();
+    if V8_INITED.load(Ordering::SeqCst) {
+        return Err(Error::new(
+            err_class(&ruby, "PlatformAlreadyInitialized"),
+            "the V8 platform is already initialized; set flags before the first Context.new",
+        ));
+    }
+    let mut flags = String::new();
+    for a in args {
+        if let Ok(h) = RHash::try_convert(*a) {
+            h.foreach(|k: Value, v: Value| {
+                let ks = k.funcall::<_, _, String>("to_s", ())?;
+                let vs = v.funcall::<_, _, String>("to_s", ())?;
+                flags.push_str(&format!(" --{ks}={vs}"));
+                Ok(magnus::r_hash::ForEach::Continue)
+            })?;
+        } else {
+            let s = a.funcall::<_, _, String>("to_s", ())?;
+            flags.push_str(&format!(" --{s}"));
+        }
+    }
+    v8::V8::set_flags_from_string(flags.trim());
+    Ok(())
+}
+
+// A globalThis.<host_namespace> member: drain the microtask queue inline.
+// Self-contained native callback (no Ruby roundtrip).
+fn drain_microtasks(
+    scope: &mut v8::PinScope<'_, '_>,
+    _args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    scope.perform_microtask_checkpoint();
+}
+
+// Inject globalThis.<name> = { drainMicrotasks } into a context. Re-run on
+// reset_realm so the fresh realm keeps the namespace.
+fn install_host_namespace(isolate: &mut v8::Isolate, ctx: &v8::Global<v8::Context>, name: &str) {
+    v8::scope!(let scope, isolate);
+    let context = v8::Local::new(scope, ctx);
+    let scope = &mut v8::ContextScope::new(scope, context);
+    let ns = v8::Object::new(scope);
+    if let (Some(f), Some(k)) = (
+        v8::Function::new(scope, drain_microtasks),
+        v8::String::new(scope, "drainMicrotasks"),
+    ) {
+        ns.set(scope, k.into(), f.into());
+    }
+    if let Some(key) = v8::String::new(scope, name) {
+        let global = context.global(scope);
+        global.set(scope, key.into(), ns.into());
+    }
+}
+
 impl Context {
-    fn new(ruby: &Ruby) -> Result<Self, Error> {
+    fn new(ruby: &Ruby, host_namespace: Option<String>) -> Result<Self, Error> {
         let (tx, rx) = channel::<Request>();
         let (handle_tx, handle_rx) = channel::<v8::IsolateHandle>();
-        std::thread::spawn(move || v8_thread_main(rx, handle_tx));
+        std::thread::spawn(move || v8_thread_main(rx, handle_tx, host_namespace));
         let handle = handle_rx
             .recv()
             .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread failed to boot"))?;
@@ -1112,7 +1186,8 @@ fn ruby_to_jsval_d(val: Value, depth: u32) -> Result<JsVal, Error> {
 fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("RustyRacer")?;
     let class = module.define_class("Context", ruby.class_object())?;
-    class.define_singleton_method("new", function!(Context::new, 0))?;
+    // keyword-arg wrapper Context.new(host_namespace:) lives in lib/rusty_racer.rb
+    class.define_singleton_method("_new", function!(Context::new, 1))?;
     class.define_method("eval", method!(Context::eval, 1))?;
     class.define_method("eval_t", method!(Context::eval_t, 2))?;
     class.define_method("call", method!(Context::call, -1))?;
@@ -1122,5 +1197,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("_load_module_graph", method!(Context::load_module_graph, 3))?;
     class.define_method("stop", method!(Context::stop, 0))?;
     class.define_method("dispose", method!(Context::dispose, 0))?;
+
+    let platform = module.define_module("Platform")?;
+    platform.define_singleton_method("set_flags!", function!(platform_set_flags, -1))?;
     Ok(())
 }
