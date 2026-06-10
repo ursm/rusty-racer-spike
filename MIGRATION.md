@@ -73,10 +73,10 @@ same role `libv8-node` plays for the C++ side.
 
 ## Structure (proposal)
 
-The spike repo (`rusty-racer-spike`: stage1/stage2/gem) is exploratory. For the
-real project, graduate to clean repos: the gem (`rusty_racer` or a
-`mini_racer-csim` successor) and `libv8-rusty` as separate repos. Until then,
-work continues here under `gem/` + `libv8-rusty/`.
+Graduated from the `rusty-racer-spike` exploration: this repo (`rusty_racer`)
+is now the gem itself at its root (the stage1/stage2 spikes are in history).
+`libv8-rusty` (the library-TLS `librusty_v8.a` build) remains a separate
+concern, currently driven by `.github/workflows/libv8-rusty.yml`.
 
 ## Open risks / decisions
 

@@ -68,7 +68,7 @@ extension's shared object can't use. The extension therefore needs a
 
 ```ruby
 # In a consuming Gemfile, while developing:
-gem "rusty_racer", path: "../rusty-racer-spike"
+gem "rusty_racer", path: "../rusty_racer"
 ```
 
 ## License

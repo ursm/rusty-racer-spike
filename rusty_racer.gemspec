@@ -11,7 +11,7 @@ Gem::Specification.new do |spec|
   spec.description = "A V8 engine for Ruby built on rusty_v8 and Magnus: eval, " \
                      "host functions, ES modules, snapshots, realms, bytecode " \
                      "cache, and faithful value marshalling."
-  spec.homepage    = "https://github.com/ursm/rusty-racer-spike"
+  spec.homepage    = "https://github.com/ursm/rusty_racer"
   spec.license     = "MIT"
 
   spec.required_ruby_version = ">= 3.3"
