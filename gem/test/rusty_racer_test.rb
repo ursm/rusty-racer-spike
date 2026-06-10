@@ -121,6 +121,39 @@ class RustyRacerTest < Minitest::Test
     assert_equal false, @ctx.call("isBig", 42)
   end
 
+  def test_shared_reference_preserved_js_to_ruby
+    # one object referenced twice stays one object on the Ruby side
+    h = @ctx.eval('const x = {v: 1}; ({a: x, b: x})')
+    assert_same h["a"], h["b"]
+    h["a"]["v"] = 99
+    assert_equal 99, h["b"]["v"]
+  end
+
+  def test_cycle_preserved_js_to_ruby
+    # a self-referential object round-trips as a Ruby cycle, not a crash/truncation
+    h = @ctx.eval('const a = {name: "root"}; a.self = a; a')
+    assert_equal "root", h["name"]
+    assert_same h, h["self"]
+    assert_same h, h["self"]["self"]["self"]
+  end
+
+  def test_cycle_preserved_ruby_to_js
+    # build a cyclic Ruby Hash, hand it to JS via a host fn return (the faithful
+    # marshalling path), prove JS sees the cycle. (Context#call args go through
+    # a JSON-shaped injection that cannot express refs — a known simplification.)
+    cyclic = {}
+    cyclic["self"] = cyclic
+    @ctx.attach("getCyclic", proc { cyclic })
+    assert_equal true, @ctx.eval("(() => { const x = getCyclic(); return x.self === x })()")
+  end
+
+  def test_shared_reference_preserved_ruby_to_js
+    shared = {"v" => 1}
+    pair = {"a" => shared, "b" => shared}
+    @ctx.attach("getPair", proc { pair })
+    assert_equal true, @ctx.eval("(() => { const x = getPair(); return x.a === x.b })()")
+  end
+
   def test_invalid_date_raises_not_silent_nil
     # parity with csim's des_date: a non-finite Date is a RangeError, not nil.
     assert_raises(RangeError) { @ctx.eval('new Date("not a date")') }
