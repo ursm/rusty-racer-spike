@@ -37,6 +37,24 @@ class RustyRacerTest < Minitest::Test
     assert_operator counter, :>, 1000, "GVL not released during eval"
   end
 
+  def test_marshals_arrays_and_hashes
+    # JS -> Ruby
+    assert_equal [1, 2, 3], @ctx.eval("[1, 2, 3]")
+    assert_equal({ "a" => 1, "b" => [true, "x"] }, @ctx.eval('({a: 1, b: [true, "x"]})'))
+    # Ruby -> JS -> Ruby through call args + return
+    @ctx.eval("function echo(x) { return x }")
+    assert_equal({ "k" => [1, 2] }, @ctx.call("echo", { "k" => [1, 2] }))
+  end
+
+  def test_strict_bool_marshalling
+    # regression: an Integer arg must NOT become `true` (bool::try_convert is
+    # truthy; ruby_to_jsval checks the actual true/false singletons instead).
+    @ctx.eval("function kind(x) { return typeof x }")
+    assert_equal "number", @ctx.call("kind", 42)
+    assert_equal "boolean", @ctx.call("kind", true)
+    assert_equal "string", @ctx.call("kind", "hi")
+  end
+
   def test_reset_realm_clears_globals
     @ctx.eval("globalThis.x = 41")
     assert_equal 41, @ctx.eval("globalThis.x")

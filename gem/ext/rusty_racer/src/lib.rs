@@ -41,7 +41,8 @@ use std::time::Duration;
 use magnus::block::Proc;
 use magnus::value::{Opaque, ReprValue};
 use magnus::{
-    function, method, prelude::*, Error, ExceptionClass, IntoValue, RArray, Ruby, TryConvert, Value,
+    function, method, prelude::*, Error, ExceptionClass, IntoValue, RArray, RHash, Ruby, TryConvert,
+    Value,
 };
 
 // Look up a RustyRacer::<name> exception class at raise time. The classes are
@@ -66,7 +67,16 @@ enum JsVal {
     Int(i64),
     Num(f64),
     Str(String),
+    Array(Vec<JsVal>),
+    // JS object / Ruby Hash with string keys (mini_racer marshals objects to
+    // string-keyed Hashes). Insertion order preserved.
+    Obj(Vec<(String, JsVal)>),
 }
+
+// Recursion bound so a cyclic object graph degrades to a leaf instead of
+// overflowing the stack (the hand-rolled serde.c uses a visited-set; the spike
+// uses a depth cap — a real impl would mirror ValueSerializer's ref table).
+const MAX_MARSHAL_DEPTH: u32 = 64;
 
 #[derive(Debug)]
 enum VmError {
@@ -179,19 +189,56 @@ thread_local! {
 }
 
 fn js_to_jsval(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> JsVal {
+    js_to_jsval_d(scope, value, 0)
+}
+
+fn js_to_jsval_d(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>, depth: u32) -> JsVal {
     if value.is_undefined() {
-        JsVal::Undefined
-    } else if value.is_null() {
-        JsVal::Null
-    } else if value.is_boolean() {
-        JsVal::Bool(value.boolean_value(scope))
-    } else if value.is_int32() {
-        JsVal::Int(value.integer_value(scope).unwrap_or(0))
-    } else if value.is_number() {
-        JsVal::Num(value.number_value(scope).unwrap_or(f64::NAN))
-    } else {
-        JsVal::Str(value.to_rust_string_lossy(scope))
+        return JsVal::Undefined;
     }
+    if value.is_null() {
+        return JsVal::Null;
+    }
+    if value.is_boolean() {
+        return JsVal::Bool(value.boolean_value(scope));
+    }
+    if value.is_int32() {
+        return JsVal::Int(value.integer_value(scope).unwrap_or(0));
+    }
+    if value.is_number() {
+        return JsVal::Num(value.number_value(scope).unwrap_or(f64::NAN));
+    }
+    if depth < MAX_MARSHAL_DEPTH && value.is_array() {
+        let arr = v8::Local::<v8::Array>::try_from(value).unwrap();
+        let mut out = Vec::with_capacity(arr.length() as usize);
+        for i in 0..arr.length() {
+            let el = arr
+                .get_index(scope, i)
+                .unwrap_or_else(|| v8::undefined(scope).into());
+            out.push(js_to_jsval_d(scope, el, depth + 1));
+        }
+        return JsVal::Array(out);
+    }
+    // Plain object -> string-keyed Obj. Functions/Date/etc. fall through to
+    // their toString (the spike's primitive escape hatch).
+    if depth < MAX_MARSHAL_DEPTH && value.is_object() && !value.is_function() {
+        let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
+        if let Some(names) = obj.get_own_property_names(scope, Default::default()) {
+            let mut entries = Vec::with_capacity(names.length() as usize);
+            for i in 0..names.length() {
+                let Some(key) = names.get_index(scope, i) else {
+                    continue;
+                };
+                let key_str = key.to_rust_string_lossy(scope);
+                let val = obj
+                    .get(scope, key)
+                    .unwrap_or_else(|| v8::undefined(scope).into());
+                entries.push((key_str, js_to_jsval_d(scope, val, depth + 1)));
+            }
+            return JsVal::Obj(entries);
+        }
+    }
+    JsVal::Str(value.to_rust_string_lossy(scope))
 }
 
 fn jsval_to_js<'s>(scope: &mut v8::PinScope<'s, '_>, val: &JsVal) -> v8::Local<'s, v8::Value> {
@@ -204,6 +251,25 @@ fn jsval_to_js<'s>(scope: &mut v8::PinScope<'s, '_>, val: &JsVal) -> v8::Local<'
         JsVal::Str(s) => v8::String::new(scope, s)
             .map(|s| s.into())
             .unwrap_or_else(|| v8::undefined(scope).into()),
+        JsVal::Array(items) => {
+            let arr = v8::Array::new(scope, items.len() as i32);
+            for (i, it) in items.iter().enumerate() {
+                let v = jsval_to_js(scope, it);
+                arr.set_index(scope, i as u32, v);
+            }
+            arr.into()
+        }
+        JsVal::Obj(entries) => {
+            let obj = v8::Object::new(scope);
+            for (k, it) in entries {
+                let Some(key) = v8::String::new(scope, k) else {
+                    continue;
+                };
+                let v = jsval_to_js(scope, it);
+                obj.set(scope, key.into(), v);
+            }
+            obj.into()
+        }
     }
 }
 
@@ -842,8 +908,25 @@ impl Context {
     }
 }
 
-// Minimal JSON encoding for Context#call's argument injection (primitives only,
-// matching what the marshaller supports).
+fn json_quote(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('"');
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out.push('"');
+    out
+}
+
+// JSON encoding for Context#call's argument injection (now incl. array/object).
 fn jsval_to_json(val: &JsVal) -> String {
     match val {
         JsVal::Undefined | JsVal::Null => "null".to_string(),
@@ -851,22 +934,17 @@ fn jsval_to_json(val: &JsVal) -> String {
         JsVal::Int(i) => i.to_string(),
         JsVal::Num(n) if n.is_finite() => n.to_string(),
         JsVal::Num(_) => "null".to_string(),
-        JsVal::Str(s) => {
-            let mut out = String::with_capacity(s.len() + 2);
-            out.push('"');
-            for c in s.chars() {
-                match c {
-                    '"' => out.push_str("\\\""),
-                    '\\' => out.push_str("\\\\"),
-                    '\n' => out.push_str("\\n"),
-                    '\r' => out.push_str("\\r"),
-                    '\t' => out.push_str("\\t"),
-                    c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-                    c => out.push(c),
-                }
-            }
-            out.push('"');
-            out
+        JsVal::Str(s) => json_quote(s),
+        JsVal::Array(items) => {
+            let parts: Vec<String> = items.iter().map(jsval_to_json).collect();
+            format!("[{}]", parts.join(","))
+        }
+        JsVal::Obj(entries) => {
+            let parts: Vec<String> = entries
+                .iter()
+                .map(|(k, v)| format!("{}:{}", json_quote(k), jsval_to_json(v)))
+                .collect();
+            format!("{{{}}}", parts.join(","))
         }
     }
 }
@@ -956,16 +1034,43 @@ fn jsval_to_ruby(ruby: &Ruby, val: &JsVal) -> Value {
         JsVal::Int(i) => (*i).into_value_with(ruby),
         JsVal::Num(n) => (*n).into_value_with(ruby),
         JsVal::Str(s) => s.clone().into_value_with(ruby),
+        JsVal::Array(items) => {
+            let arr = ruby.ary_new();
+            for it in items {
+                let _ = arr.push(jsval_to_ruby(ruby, it));
+            }
+            arr.as_value()
+        }
+        // mini_racer marshals JS objects to string-keyed Hashes.
+        JsVal::Obj(entries) => {
+            let h = ruby.hash_new();
+            for (k, it) in entries {
+                let _ = h.aset(k.as_str(), jsval_to_ruby(ruby, it));
+            }
+            h.as_value()
+        }
     }
 }
 
 fn ruby_to_jsval(val: Value) -> Result<JsVal, Error> {
+    ruby_to_jsval_d(val, 0)
+}
+
+fn ruby_to_jsval_d(val: Value, depth: u32) -> Result<JsVal, Error> {
+    let ruby = Ruby::get().unwrap();
     if val.is_nil() {
         return Ok(JsVal::Null);
     }
-    if let Ok(b) = bool::try_convert(val) {
-        return Ok(JsVal::Bool(b));
+    // NB: bool::try_convert is RTEST (truthiness) — it returns Ok(true) for
+    // ANY non-false value — so check the actual true/false singletons by
+    // identity instead, or every Integer/String/Array would marshal as `true`.
+    if val.eql(ruby.qtrue()).unwrap_or(false) {
+        return Ok(JsVal::Bool(true));
     }
+    if val.eql(ruby.qfalse()).unwrap_or(false) {
+        return Ok(JsVal::Bool(false));
+    }
+    // Integer/Float/String try_convert are type-strict (Err on a mismatch).
     if let Ok(i) = i64::try_convert(val) {
         return Ok(JsVal::Int(i));
     }
@@ -975,9 +1080,31 @@ fn ruby_to_jsval(val: Value) -> Result<JsVal, Error> {
     if let Ok(s) = String::try_convert(val) {
         return Ok(JsVal::Str(s));
     }
+    if depth < MAX_MARSHAL_DEPTH {
+        if let Ok(arr) = RArray::try_convert(val) {
+            let mut out = Vec::with_capacity(arr.len());
+            for i in 0..arr.len() {
+                let el: Value = arr.entry::<Value>(i as isize)?;
+                out.push(ruby_to_jsval_d(el, depth + 1)?);
+            }
+            return Ok(JsVal::Array(out));
+        }
+        if let Ok(hash) = RHash::try_convert(val) {
+            let entries = RefCell::new(Vec::new());
+            hash.foreach(|k: Value, v: Value| {
+                // String/Symbol keys -> String; anything else via to_s.
+                let key = String::try_convert(k).or_else(|_| {
+                    k.funcall::<_, _, String>("to_s", ())
+                })?;
+                entries.borrow_mut().push((key, ruby_to_jsval_d(v, depth + 1)?));
+                Ok(magnus::r_hash::ForEach::Continue)
+            })?;
+            return Ok(JsVal::Obj(entries.into_inner()));
+        }
+    }
     Err(Error::new(
-        Ruby::get().unwrap().exception_type_error(),
-        "unsupported type crossing into JS (spike supports nil/bool/int/float/string)",
+        ruby.exception_type_error(),
+        "unsupported type crossing into JS",
     ))
 }
 
