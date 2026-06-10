@@ -1,1 +1,10 @@
-/target
+# Cargo build artifacts — at the workspace root AND in nested gem extensions
+# (gem/ext/rusty_racer/target/, which a leading-slash /target would miss).
+target/
+
+# Ruby/gem build artifacts
+*.so
+*.bundle
+/gem/pkg/
+/gem/tmp/
+/gem/Gemfile.lock
