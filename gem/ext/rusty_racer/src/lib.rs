@@ -36,7 +36,7 @@ use std::ffi::c_void;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Mutex, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
 use magnus::block::Proc;
@@ -89,21 +89,34 @@ enum VmError {
     Terminated,      // watchdog/stop -> RustyRacer::ScriptTerminatedError
 }
 
-// Ruby thread -> V8 thread
+// Ruby thread -> V8 thread. |realm_id| selects which realm in the isolate the
+// op runs in: 0 = the main realm (Context's own globalThis, swappable by
+// reset_realm), N >= 1 = an extra realm made by create_realm.
 enum Request {
     Eval {
+        realm_id: i32,
         source: String,
         timeout_ms: u64,
         reply: Sender<VmReply>,
     },
     Attach {
+        realm_id: i32,
         name: String,
         host_fn_id: usize,
         reply: Sender<VmReply>,
     },
     // reset_realm: swap globalThis for a fresh Context in the same (warm)
-    // isolate — csim's per-visit reset.
+    // isolate — csim's per-visit reset. Main realm only.
     Reset {
+        reply: Sender<VmReply>,
+    },
+    // create_realm: build a fresh, persistent realm in the same isolate and
+    // return its id (csim's multi-realm model). DisposeRealm frees one.
+    CreateRealm {
+        reply: Sender<VmReply>,
+    },
+    DisposeRealm {
+        realm_id: i32,
         reply: Sender<VmReply>,
     },
     // load_module_graph: walk the static import graph on the V8 thread,
@@ -563,18 +576,23 @@ fn v8_thread_main(
     let mut isolate = v8::Isolate::new(Default::default());
     let _ = handle_tx.send(isolate.thread_safe_handle());
     // mut: reset_realm swaps this for a fresh Context in the same warm isolate.
-    let mut global_context = {
+    let mut main_context = {
         v8::scope!(let scope, &mut isolate);
         let context = v8::Context::new(scope, Default::default());
         v8::Global::new(scope, context)
     };
     if let Some(ref name) = host_namespace {
-        install_host_namespace(&mut isolate, &global_context, name);
+        install_host_namespace(&mut isolate, &main_context, name);
     }
+    // Extra realms from create_realm, keyed by id (1, 2, ...). The main realm
+    // is id 0 and lives in `main_context` so reset_realm can swap it freely.
+    let mut realms: HashMap<i32, v8::Global<v8::Context>> = HashMap::new();
+    let mut next_realm_id: i32 = 1;
 
     while let Ok(request) = rx.recv() {
         match request {
             Request::Eval {
+                realm_id,
                 source,
                 timeout_ms,
                 reply,
@@ -598,11 +616,14 @@ fn v8_thread_main(
                     })
                 });
 
-                let outcome = {
-                    v8::scope!(let scope, &mut isolate);
-                    let context = v8::Local::new(scope, &global_context);
-                    let scope = &mut v8::ContextScope::new(scope, context);
-                    run_source(scope, &source)
+                let outcome = match realm_context(&main_context, &realms, realm_id) {
+                    Some(ctx) => {
+                        v8::scope!(let scope, &mut isolate);
+                        let context = v8::Local::new(scope, &ctx);
+                        let scope = &mut v8::ContextScope::new(scope, context);
+                        run_source(scope, &source)
+                    }
+                    None => Err(VmError::Runtime("realm disposed or unknown".into())),
                 };
 
                 let fired = watchdog.is_some_and(|w| {
@@ -619,27 +640,31 @@ fn v8_thread_main(
                 let _ = reply.send(VmReply::Done(outcome));
             }
             Request::Attach {
+                realm_id,
                 name,
                 host_fn_id,
                 reply,
             } => {
-                let outcome = {
-                    v8::scope!(let scope, &mut isolate);
-                    let context = v8::Local::new(scope, &global_context);
-                    let scope = &mut v8::ContextScope::new(scope, context);
-                    let external = v8::External::new(scope, host_fn_id as *mut c_void);
-                    match v8::Function::builder(host_fn_callback)
-                        .data(external.into())
-                        .build(scope)
-                    {
-                        Some(function) => {
-                            let key = v8::String::new(scope, &name).unwrap();
-                            let global = context.global(scope);
-                            global.set(scope, key.into(), function.into());
-                            Ok(JsVal::Undefined)
+                let outcome = match realm_context(&main_context, &realms, realm_id) {
+                    Some(ctx) => {
+                        v8::scope!(let scope, &mut isolate);
+                        let context = v8::Local::new(scope, &ctx);
+                        let scope = &mut v8::ContextScope::new(scope, context);
+                        let external = v8::External::new(scope, host_fn_id as *mut c_void);
+                        match v8::Function::builder(host_fn_callback)
+                            .data(external.into())
+                            .build(scope)
+                        {
+                            Some(function) => {
+                                let key = v8::String::new(scope, &name).unwrap();
+                                let global = context.global(scope);
+                                global.set(scope, key.into(), function.into());
+                                Ok(JsVal::Undefined)
+                            }
+                            None => Err(VmError::Runtime("failed to build function".into())),
                         }
-                        None => Err(VmError::Runtime("failed to build function".into())),
                     }
+                    None => Err(VmError::Runtime("realm disposed or unknown".into())),
                 };
                 let _ = reply.send(VmReply::Done(outcome));
             }
@@ -649,11 +674,31 @@ fn v8_thread_main(
                     let context = v8::Context::new(scope, Default::default());
                     v8::Global::new(scope, context)
                 };
-                global_context = fresh;
+                main_context = fresh;
                 REGISTRY.with(|r| r.borrow_mut().clear());
                 if let Some(ref name) = host_namespace {
-                    install_host_namespace(&mut isolate, &global_context, name);
+                    install_host_namespace(&mut isolate, &main_context, name);
                 }
+                let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
+            }
+            Request::CreateRealm { reply } => {
+                let id = next_realm_id;
+                next_realm_id += 1;
+                let fresh = {
+                    v8::scope!(let scope, &mut isolate);
+                    let context = v8::Context::new(scope, Default::default());
+                    v8::Global::new(scope, context)
+                };
+                if let Some(ref name) = host_namespace {
+                    install_host_namespace(&mut isolate, &fresh, name);
+                }
+                realms.insert(id, fresh);
+                let _ = reply.send(VmReply::Done(Ok(JsVal::Int(id as i64))));
+            }
+            Request::DisposeRealm { realm_id, reply } => {
+                // Dropping the Global lets V8 collect the realm. id 0 (main) is
+                // never wrapped as a Realm, so this only ever frees extras.
+                realms.remove(&realm_id);
                 let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
             }
             Request::LoadModuleGraph { entry_url, reply } => {
@@ -662,7 +707,7 @@ fn v8_thread_main(
                 REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
                 let result = {
                     v8::scope!(let scope, &mut isolate);
-                    let context = v8::Local::new(scope, &global_context);
+                    let context = v8::Local::new(scope, &main_context);
                     let scope = &mut v8::ContextScope::new(scope, context);
                     load_module_graph_inner(scope, &entry_url, &reply)
                 };
@@ -674,10 +719,26 @@ fn v8_thread_main(
             Request::Dispose => break,
         }
     }
-    // global_context (a v8::Global) must die before the isolate it points into;
-    // both are dropped here, declaration order makes that explicit.
-    drop(global_context);
+    // Every v8::Global must die before the isolate it points into; dropping
+    // them here (before isolate) makes the order explicit.
+    drop(realms);
+    drop(main_context);
     drop(isolate);
+}
+
+// Pick the Global context for a realm id: 0 = main, N = an extra realm (None
+// if it was disposed or never existed). Clones the Global (cheap, refcounted)
+// so the caller can open a scope on &mut isolate without aliasing.
+fn realm_context(
+    main: &v8::Global<v8::Context>,
+    realms: &HashMap<i32, v8::Global<v8::Context>>,
+    realm_id: i32,
+) -> Option<v8::Global<v8::Context>> {
+    if realm_id == 0 {
+        Some(main.clone())
+    } else {
+        realms.get(&realm_id).cloned()
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -695,10 +756,31 @@ struct Shared {
     disposed: bool,
 }
 
+// The channel + isolate handle + shared host-fn registry that drive the one V8
+// thread. A Context and all the Realms it spawns share ONE Core via Arc, so
+// any of them can issue requests and they all see the same attached procs and
+// the same dispose state. Rust's refcount keeps the V8 thread alive until the
+// last wrapper is gone — no GC-mark bookkeeping (mini_racer's Realm has to mark
+// its parent Context by hand; here the type system does it).
+struct Core {
+    shared: Mutex<Shared>,
+    // Shared across realms (host_fn_id indexes this one vector). Mutex (not
+    // RefCell) because realms of one Context may be pumped on different threads.
+    procs: Mutex<Vec<Opaque<Proc>>>,
+}
+
 #[magnus::wrap(class = "RustyRacer::Context")]
 struct Context {
-    shared: Mutex<Shared>,
-    procs: RefCell<Vec<Opaque<Proc>>>,
+    core: Arc<Core>,
+}
+
+// Context#create_realm result: an extra realm (id >= 1) in the same isolate.
+// Its own `disposed` is realm-level; the Core's is context-level.
+#[magnus::wrap(class = "RustyRacer::Realm")]
+struct Realm {
+    core: Arc<Core>,
+    id: i32,
+    disposed: AtomicBool,
 }
 
 // Set true once V8 is initialized; Platform.set_flags! refuses after that
@@ -782,15 +864,19 @@ impl Context {
             .recv()
             .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread failed to boot"))?;
         Ok(Context {
-            shared: Mutex::new(Shared {
-                tx,
-                handle,
-                disposed: false,
+            core: Arc::new(Core {
+                shared: Mutex::new(Shared {
+                    tx,
+                    handle,
+                    disposed: false,
+                }),
+                procs: Mutex::new(Vec::new()),
             }),
-            procs: RefCell::new(Vec::new()),
         })
     }
+}
 
+impl Core {
     fn send(&self, ruby: &Ruby, request: Request) -> Result<(), Error> {
         let shared = self.shared.lock().unwrap();
         if shared.disposed {
@@ -861,7 +947,7 @@ impl Context {
         answer: &Sender<Answer>,
     ) -> Result<JsVal, String> {
         let proc = {
-            let procs = self.procs.borrow();
+            let procs = self.procs.lock().unwrap();
             let opaque = procs.get(host_fn_id).ok_or("unknown host function")?;
             ruby.get_inner(*opaque)
         };
@@ -875,15 +961,11 @@ impl Context {
         ruby_to_jsval(value).map_err(|e| e.to_string())
     }
 
-    fn eval(ruby: &Ruby, rb_self: &Self, source: String) -> Result<Value, Error> {
-        Self::eval_t(ruby, rb_self, source, 0)
-    }
-
-    // Context#call(name, *args). Spike: reuse eval with JSON-injected args. A
+    // Context#call / Realm#call. Spike: reuse eval with JSON-injected args. A
     // real impl would use Function::Call (preserves receiver, non-JSON values);
     // for the supported primitive types this is equivalent and reuses the whole
     // rendezvous / nesting / error path for free.
-    fn call(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
+    fn call(&self, ruby: &Ruby, realm_id: i32, args: &[Value]) -> Result<Value, Error> {
         let Some((name, call_args)) = args.split_first() else {
             return Err(Error::new(
                 ruby.exception_arg_error(),
@@ -898,12 +980,19 @@ impl Context {
             }
             json.push_str(&jsval_to_json(&ruby_to_jsval(*v)?));
         }
-        Self::eval_t(ruby, rb_self, format!("({name})(...[{json}])"), 0)
+        self.eval_t(ruby, realm_id, format!("({name})(...[{json}])"), 0)
     }
 
-    fn eval_t(ruby: &Ruby, rb_self: &Self, source: String, timeout_ms: u64) -> Result<Value, Error> {
+    fn eval_t(
+        &self,
+        ruby: &Ruby,
+        realm_id: i32,
+        source: String,
+        timeout_ms: u64,
+    ) -> Result<Value, Error> {
         // Inside a proc serving a callback? Route as a nested eval through the
-        // suspended V8 frame instead of the main queue (which is busy).
+        // suspended V8 frame instead of the main queue (which is busy). The
+        // nested eval runs in whatever realm that frame is already in.
         let nested = NESTED.with(|n| n.borrow().last().cloned());
         if let Some(answer) = nested {
             let (reply_tx, reply_rx) = channel::<VmReply>();
@@ -913,63 +1002,80 @@ impl Context {
                     reply: reply_tx,
                 })
                 .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread is gone"))?;
-            return rb_self.pump(ruby, reply_rx, None);
+            return self.pump(ruby, reply_rx, None);
         }
 
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        rb_self.send(
+        self.send(
             ruby,
             Request::Eval {
+                realm_id,
                 source,
                 timeout_ms,
                 reply: reply_tx,
             },
         )?;
-        rb_self.pump(ruby, reply_rx, None)
+        self.pump(ruby, reply_rx, None)
     }
 
-    fn attach(ruby: &Ruby, rb_self: &Self, name: String, proc: Proc) -> Result<Value, Error> {
+    fn attach(&self, ruby: &Ruby, realm_id: i32, name: String, proc: Proc) -> Result<Value, Error> {
         let host_fn_id = {
-            let mut procs = rb_self.procs.borrow_mut();
+            let mut procs = self.procs.lock().unwrap();
             procs.push(Opaque::from(proc));
             procs.len() - 1
         };
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        rb_self.send(
+        self.send(
             ruby,
             Request::Attach {
+                realm_id,
                 name,
                 host_fn_id,
                 reply: reply_tx,
             },
         )?;
-        rb_self.pump(ruby, reply_rx, None)
+        self.pump(ruby, reply_rx, None)
     }
 
-    fn reset_realm(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+    fn reset_realm(&self, ruby: &Ruby) -> Result<Value, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        rb_self.send(ruby, Request::Reset { reply: reply_tx })?;
-        rb_self.pump(ruby, reply_rx, None)
+        self.send(ruby, Request::Reset { reply: reply_tx })?;
+        self.pump(ruby, reply_rx, None)
+    }
+
+    // Build a new realm; returns its id (the V8 thread replies with an Int).
+    fn create_realm(&self, ruby: &Ruby) -> Result<i32, Error> {
+        let (reply_tx, reply_rx) = channel::<VmReply>();
+        self.send(ruby, Request::CreateRealm { reply: reply_tx })?;
+        let id = self.pump(ruby, reply_rx, None)?;
+        i32::try_convert(id)
+    }
+
+    fn dispose_realm(&self, ruby: &Ruby, realm_id: i32) -> Result<(), Error> {
+        let (reply_tx, reply_rx) = channel::<VmReply>();
+        self.send(ruby, Request::DisposeRealm { realm_id, reply: reply_tx })?;
+        self.pump(ruby, reply_rx, None).map(|_| ())
     }
 
     // Positional primitive behind the keyword-arg Ruby wrapper in
     // lib/rusty_racer.rb: load_module_graph(entry, resolve:, fetch_batch:).
+    // Main realm only (the module registry lives there).
     fn load_module_graph(
+        &self,
         ruby: &Ruby,
-        rb_self: &Self,
         entry_url: String,
         resolve: Proc,
         fetch_batch: Proc,
     ) -> Result<Value, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        rb_self.send(
+        self.send(
             ruby,
             Request::LoadModuleGraph {
                 entry_url,
                 reply: reply_tx,
             },
         )?;
-        rb_self.pump(ruby, reply_rx, Some((resolve, fetch_batch)))
+        self.pump(ruby, reply_rx, Some((resolve, fetch_batch)))
     }
 
     // Terminate whatever is running. IsolateHandle is Send + refcounted —
@@ -979,8 +1085,8 @@ impl Context {
         shared.handle.terminate_execution();
     }
 
-    fn dispose(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
-        let mut shared = rb_self.shared.lock().unwrap();
+    fn dispose(&self, ruby: &Ruby) -> Result<(), Error> {
+        let mut shared = self.shared.lock().unwrap();
         if shared.disposed {
             return Ok(());
         }
@@ -991,6 +1097,78 @@ impl Context {
         let _ = shared.tx.send(Request::Dispose);
         let _ = ruby;
         Ok(())
+    }
+}
+
+// Thin magnus-method wrappers: a Context drives realm 0; a Realm drives its id.
+impl Context {
+    fn eval(ruby: &Ruby, rb_self: &Self, source: String) -> Result<Value, Error> {
+        rb_self.core.eval_t(ruby, 0, source, 0)
+    }
+    fn eval_t(ruby: &Ruby, rb_self: &Self, source: String, timeout_ms: u64) -> Result<Value, Error> {
+        rb_self.core.eval_t(ruby, 0, source, timeout_ms)
+    }
+    fn call(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
+        rb_self.core.call(ruby, 0, args)
+    }
+    fn attach(ruby: &Ruby, rb_self: &Self, name: String, proc: Proc) -> Result<Value, Error> {
+        rb_self.core.attach(ruby, 0, name, proc)
+    }
+    fn reset_realm(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+        rb_self.core.reset_realm(ruby)
+    }
+    fn create_realm(ruby: &Ruby, rb_self: &Self) -> Result<Realm, Error> {
+        let id = rb_self.core.create_realm(ruby)?;
+        Ok(Realm {
+            core: rb_self.core.clone(),
+            id,
+            disposed: AtomicBool::new(false),
+        })
+    }
+    fn load_module_graph(
+        ruby: &Ruby,
+        rb_self: &Self,
+        entry_url: String,
+        resolve: Proc,
+        fetch_batch: Proc,
+    ) -> Result<Value, Error> {
+        rb_self.core.load_module_graph(ruby, entry_url, resolve, fetch_batch)
+    }
+    fn stop(&self) {
+        self.core.stop();
+    }
+    fn dispose(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
+        rb_self.core.dispose(ruby)
+    }
+}
+
+impl Realm {
+    fn check_live(&self, ruby: &Ruby) -> Result<(), Error> {
+        if self.disposed.load(Ordering::SeqCst) {
+            return Err(Error::new(ruby.exception_runtime_error(), "disposed realm"));
+        }
+        Ok(())
+    }
+    fn eval(ruby: &Ruby, rb_self: &Self, source: String) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        rb_self.core.eval_t(ruby, rb_self.id, source, 0)
+    }
+    fn call(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        rb_self.core.call(ruby, rb_self.id, args)
+    }
+    fn attach(ruby: &Ruby, rb_self: &Self, name: String, proc: Proc) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        rb_self.core.attach(ruby, rb_self.id, name, proc)
+    }
+    fn dispose(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
+        if rb_self.disposed.swap(true, Ordering::SeqCst) {
+            return Ok(()); // already disposed
+        }
+        rb_self.core.dispose_realm(ruby, rb_self.id)
+    }
+    fn disposed(&self) -> bool {
+        self.disposed.load(Ordering::SeqCst)
     }
 }
 
@@ -1224,10 +1402,20 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("call", method!(Context::call, -1))?;
     class.define_method("attach", method!(Context::attach, 2))?;
     class.define_method("reset_realm", method!(Context::reset_realm, 0))?;
+    class.define_method("create_realm", method!(Context::create_realm, 0))?;
     // keyword-arg wrapper Context#load_module_graph lives in lib/rusty_racer.rb
     class.define_method("_load_module_graph", method!(Context::load_module_graph, 3))?;
     class.define_method("stop", method!(Context::stop, 0))?;
     class.define_method("dispose", method!(Context::dispose, 0))?;
+
+    // Context#create_realm returns one of these: an isolated globalThis in the
+    // same isolate, addressed by id (csim's multi-realm model).
+    let realm = module.define_class("Realm", ruby.class_object())?;
+    realm.define_method("eval", method!(Realm::eval, 1))?;
+    realm.define_method("call", method!(Realm::call, -1))?;
+    realm.define_method("attach", method!(Realm::attach, 2))?;
+    realm.define_method("dispose", method!(Realm::dispose, 0))?;
+    realm.define_method("disposed?", method!(Realm::disposed, 0))?;
 
     let platform = module.define_module("Platform")?;
     platform.define_singleton_method("set_flags!", function!(platform_set_flags, -1))?;

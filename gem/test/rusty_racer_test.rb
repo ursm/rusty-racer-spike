@@ -111,6 +111,42 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2, @ctx.eval("1 + 1") # realm usable after reset
   end
 
+  def test_create_realm_is_isolated_from_main_and_siblings
+    a = @ctx.create_realm
+    b = @ctx.create_realm
+    @ctx.eval("globalThis.x = 'main'")
+    a.eval("globalThis.x = 'a'")
+    b.eval("globalThis.x = 'b'")
+    # each realm has its own globalThis
+    assert_equal "main", @ctx.eval("globalThis.x")
+    assert_equal "a", a.eval("globalThis.x")
+    assert_equal "b", b.eval("globalThis.x")
+    # the main realm never saw the realms' globals
+    assert_equal "undefined", a.eval("typeof globalThis.notThere")
+  end
+
+  def test_realm_call_and_attach
+    r = @ctx.create_realm
+    r.eval("function mul(a, b) { return a * b }")
+    assert_equal 12, r.call("mul", 3, 4)
+    r.attach("rubyAdd", proc { |a, b| a + b })
+    assert_equal 30, r.eval("rubyAdd(10, 20)")
+    # the host fn lives only in that realm, not the main one
+    assert_equal "undefined", @ctx.eval("typeof rubyAdd")
+  end
+
+  def test_realm_dispose
+    r = @ctx.create_realm
+    assert_equal false, r.disposed?
+    assert_equal 5, r.eval("2 + 3")
+    r.dispose
+    assert_equal true, r.disposed?
+    assert_raises(::RuntimeError) { r.eval("1") }
+    r.dispose # idempotent
+    # the parent context still works after a realm is disposed
+    assert_equal 2, @ctx.eval("1 + 1")
+  end
+
   def test_load_module_graph_evaluates_whole_graph
     sources = {
       "/app.js" => 'import {a} from "./a.js"; import {b} from "./b.js"; globalThis.RESULT = a + b;',
