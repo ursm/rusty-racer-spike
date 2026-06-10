@@ -551,13 +551,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "rusty_racer_spike"
-version = "0.1.0"
-dependencies = [
- "v8",
-]
-
-[[package]]
 name = "seq-macro"
 version = "0.3.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"

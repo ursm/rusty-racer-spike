@@ -1,6 +1,0 @@
-# Workspace root so rb-sys's `cargo metadata` (run from the gem root by
-# RbSys::ExtensionTask) finds the extension crate. Also detaches the gem from
-# the parent spike workspace (stage1/stage2).
-[workspace]
-members = ["ext/rusty_racer"]
-resolver = "2"

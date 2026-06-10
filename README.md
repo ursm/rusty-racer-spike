@@ -1,51 +1,76 @@
-# rusty-racer-spike
+# rusty_racer
 
-Can bare [rusty_v8](https://crates.io/crates/v8) (crate `v8` v150 = V8 ~15.0)
-carry mini_racer-csim's V8-embedding half? Three probes, ordered by
-architectural risk, all in `src/main.rs` (~330 lines, **one `unsafe`**, written
-against an API a year newer than my C++ knowledge and compiling clean on the
-second attempt).
+Embed [V8](https://v8.dev/) in Ruby, built on [rusty_v8](https://crates.io/crates/v8)
+(the `v8` crate) and [Magnus](https://github.com/matsadler/magnus) via
+[rb-sys](https://github.com/oxidize-rb/rb-sys).
 
-Run: `cargo run --release` · C++ comparison: `ruby bench_cpp.rb` (needs the
-sibling mini_racer checkout built).
+> Early and experimental — the API still moves. A dedicated V8 thread per
+> `Context`, with Ruby threads rendezvousing over channels.
 
-## Results (2026-06-10, Linux x86_64)
+## What it can do
 
-| Probe | Result |
-|---|---|
-| 1. realms — multiple `v8::Context` in ONE isolate, shared security token, cross-realm global read | **works directly** (`Context::new` × N + `set_security_token`). This is the csim model deno_core removed — bare rusty_v8 has no opinion about it |
-| 2. termination — watchdog `terminate_execution()` from another thread via `IsolateHandle`, then recover | **works**; fired at ~50ms, isolate usable after `cancel_terminate_execution()` |
-| 3. load_module_graph slice — 83-module graph, level-walk, batched fetch/resolve, native instantiate via resolver, fresh realm/visit | **works**; mean **144µs/visit** (Rust, in-process closures) vs **894µs/visit** (C++ ext through Ruby, real rendezvous) |
+```ruby
+require "rusty_racer"
 
-### Perf caveat (do not over-read the 6×)
+ctx = RustyRacer::Context.new(timeout_ms: 1000)
 
-The Rust bench calls in-process closures; the C++ number includes ~13 real
-Ruby↔V8 thread roundtrips + wire serde + Ruby block execution (~depth×2
-crossings for a depth-7 graph). A Rust *gem* would pay the same boundary costs
-through Magnus/GVL. Different V8 versions too (15.0 vs libv8-node's 13.6).
-Honest claim: **no perf cliff — the V8 work itself is at least as fast**, and
-the slice's native portion is microseconds either way. The boundary, as
-always, is where the time lives.
+ctx.eval("1 + 1")                        # => 2
+ctx.eval("({a: 1, b: [true, 'x']})")     # => {"a"=>1, "b"=>[true, "x"]}
 
-### Audit-bug classes, structurally re-checked against rusty_v8
+# Call a JS function with marshalled args (BigInt/Date/Map/Set/shared refs
+# all round-trip faithfully).
+ctx.eval("function add(a, b) { return a + b }")
+ctx.call("add", 20, 22)                  # => 42
+ctx.call_void("doSideEffect")            # runs it; never marshals the return
 
-| C++ audit bug (fixed 2026-06-10) | In rusty_v8 v150 |
-|---|---|
-| #63 `Context#stop` UAF on freed `State*` | unrepresentable: `IsolateHandle` is `Send` + refcounted; `terminate_execution()` after isolate death is a safe no-op. Probe 2 moves the handle into a thread |
-| #4/#1004 `Set(...).Check()` process abort under termination | unrepresentable as written: there is no `.Check()`; fallible ops return `#[must_use] Option` — ignoring is a compile error, aborting requires an explicit `.unwrap()` |
-| #1002 snapshot `StartupData` use-after-return | unrepresentable: `CreateParams::snapshot_blob(data)` takes **ownership** and keeps the blob alive with the isolate |
-| #5/#14 dangling realm/state pointers | the registry holds `v8::Global<Module>` (refcounted); `cur().at()`-style dangling-id aborts become `Option` misses |
-| #2 O(N) `module_filename` scan per import edge | the natural Rust shape is the hash map the audit asked for (see `Registry::url_by_hash`) |
+# Ruby callbacks into JS; a raised Ruby exception becomes a JS exception.
+ctx.attach("rubyUpcase", ->(s) { s.upcase })
+ctx.eval("rubyUpcase('hi')")             # => "HI"
 
-### What the spike does NOT show
+# Stack traces: JS errors carry the JS stack as the Ruby backtrace.
+begin
+  ctx.eval("throw new Error('boom')", filename: "app.js")
+rescue RustyRacer::RuntimeError => e
+  e.message     # => "Error: boom"
+  e.backtrace   # => ["app.js:1:7:in '<anonymous>'", ...]
+end
+```
 
-- The Ruby half: Magnus, GVL release, the rendezvous protocol, fork safety,
-  watchdog-vs-GVL — the layer where the hang-class bugs (#11/#12/#13/#16)
-  live. Rust does not structurally fix those; a stage-2 spike (Magnus +
-  `rb_thread_call_without_gvl` + one host-function roundtrip) is the next
-  question.
-- Module resolve callbacks are plain `fn` (no closures) exactly like C++ —
-  state goes through a `thread_local`, so that pattern ports 1:1, it does not
-  improve.
-- `v8::scope!`/`tc_scope!` pinned-scope macros (v150) are unusual but pleasant;
-  borrow errors replaced every scope-discipline footgun the C++ audit found.
+ES modules (the embedder owns the URL→module registry):
+
+```ruby
+dep = ctx.compile_module("export const x = 21;", filename: "/dep.js")
+app = ctx.compile_module('import {x} from "./dep.js"; export const r = x * 2;',
+                         filename: "/app.js")
+app.instantiate { |specifier, referrer| dep if specifier == "./dep.js" }
+app.evaluate
+app.namespace["r"]                       # => 42
+
+# Bytecode cache for cross-process boot:
+blob = ctx.compile_module(src, produce_cache: true).cached_data
+ctx2.compile_module(src, cached_data: blob)   # skips reparse
+```
+
+Also: `Snapshot` (startup blobs), `Context#create_realm` (isolated globals in
+one isolate), `Context#perform_microtask_checkpoint` (manual event-loop
+control — microtasks never auto-drain), `Context#dynamic_import_resolver=`,
+`Platform.set_flags!`.
+
+## Building
+
+The stock `v8` crate prebuilt links as a binary (initial-exec TLS), which a Ruby
+extension's shared object can't use. The extension therefore needs a
+**library-TLS** `librusty_v8.a`. Either:
+
+- point `RUSTY_V8_ARCHIVE` at a prebuilt library-TLS archive, or
+- set `V8_FROM_SOURCE=1` to build V8 from the `denoland/rusty_v8` git tree
+  (large: lots of disk/RAM/time).
+
+```ruby
+# In a consuming Gemfile, while developing:
+gem "rusty_racer", path: "../rusty-racer-spike"
+```
+
+## License
+
+MIT.

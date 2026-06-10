@@ -1,9 +1,5 @@
+# Workspace root so rb-sys's `cargo metadata` (run from the gem root by
+# RbSys::ExtensionTask) finds the extension crate.
 [workspace]
-members = ["stage1", "stage2"]
+members = ["ext/rusty_racer"]
 resolver = "2"
-
-[workspace.dependencies]
-v8 = "150.0.0"
-
-[profile.release]
-debug = true
