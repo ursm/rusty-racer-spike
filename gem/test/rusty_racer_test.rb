@@ -169,7 +169,7 @@ class RustyRacerTest < Minitest::Test
     # audit #3: a late TerminateExecution must not leak into the next request.
     100.times do
       begin
-        @ctx.eval_t("const u = Date.now() + 1; while (Date.now() < u) {}", 1)
+        @ctx.eval_t("{ const u = Date.now() + 1; while (Date.now() < u) {} }", 1)
       rescue RustyRacer::ScriptTerminatedError
         # terminated this round — fine
       end
