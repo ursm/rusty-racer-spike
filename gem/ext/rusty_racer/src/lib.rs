@@ -39,7 +39,17 @@ use std::time::Duration;
 
 use magnus::block::Proc;
 use magnus::value::{Opaque, ReprValue};
-use magnus::{function, method, prelude::*, Error, IntoValue, Ruby, TryConvert, Value};
+use magnus::{function, method, prelude::*, Error, ExceptionClass, IntoValue, Ruby, TryConvert, Value};
+
+// Look up a RustyRacer::<name> exception class at raise time. The classes are
+// defined in lib/rusty_racer.rb (loaded after this extension), so they exist
+// by the time any eval can raise. Falls back to Ruby's RuntimeError.
+fn err_class(ruby: &Ruby, name: &str) -> ExceptionClass {
+    ruby.class_object()
+        .const_get::<_, magnus::RModule>("RustyRacer")
+        .and_then(|m| m.const_get::<_, ExceptionClass>(name))
+        .unwrap_or_else(|_| ruby.exception_runtime_error())
+}
 
 // ---------------------------------------------------------------------------
 // Values crossing threads: plain Rust data. No Ruby allocation off the Ruby
@@ -57,8 +67,9 @@ enum JsVal {
 
 #[derive(Debug)]
 enum VmError {
-    Js(String),
-    Terminated,
+    Parse(String),   // compile-time failure -> RustyRacer::ParseError
+    Runtime(String), // runtime JS exception -> RustyRacer::RuntimeError
+    Terminated,      // watchdog/stop -> RustyRacer::ScriptTerminatedError
 }
 
 // Ruby thread -> V8 thread
@@ -230,17 +241,32 @@ fn throw_js_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
 
 fn run_source(scope: &mut v8::PinScope<'_, '_>, source: &str) -> Result<JsVal, VmError> {
     v8::tc_scope!(let tc, scope);
-    let result = v8::String::new(tc, source)
-        .and_then(|code| v8::Script::compile(tc, code, None))
-        .and_then(|script| script.run(tc));
-    match result {
+    // Compile and run as distinct phases so a compile failure maps to
+    // ParseError and a thrown exception to RuntimeError (csim rescues both).
+    let Some(code) = v8::String::new(tc, source) else {
+        return Err(VmError::Parse("source too large".into()));
+    };
+    let script = match v8::Script::compile(tc, code, None) {
+        Some(script) => script,
+        None if tc.has_terminated() => return Err(VmError::Terminated),
+        None => {
+            let msg = tc
+                .exception()
+                .map(|e| e.to_rust_string_lossy(tc))
+                .unwrap_or_else(|| "parse error".to_string());
+            return Err(VmError::Parse(msg));
+        }
+    };
+    match script.run(tc) {
         Some(value) => Ok(js_to_jsval(tc, value)),
         None if tc.has_terminated() => Err(VmError::Terminated),
-        None => Err(VmError::Js(
-            tc.exception()
+        None => {
+            let msg = tc
+                .exception()
                 .map(|e| e.to_rust_string_lossy(tc))
-                .unwrap_or_else(|| "unexpected failure".to_string()),
-        )),
+                .unwrap_or_else(|| "unexpected failure".to_string());
+            Err(VmError::Runtime(msg))
+        }
     }
 }
 
@@ -320,7 +346,7 @@ fn v8_thread_main(rx: Receiver<Request>, handle_tx: Sender<v8::IsolateHandle>) {
                             global.set(scope, key.into(), function.into());
                             Ok(JsVal::Undefined)
                         }
-                        None => Err(VmError::Js("failed to build function".into())),
+                        None => Err(VmError::Runtime("failed to build function".into())),
                     }
                 };
                 let _ = reply.send(VmReply::Done(outcome));
@@ -400,12 +426,15 @@ impl Context {
             let message = without_gvl(|| reply_rx.recv());
             match message {
                 Ok(VmReply::Done(Ok(val))) => return Ok(jsval_to_ruby(ruby, &val)),
-                Ok(VmReply::Done(Err(VmError::Js(message)))) => {
-                    return Err(Error::new(ruby.exception_runtime_error(), message));
+                Ok(VmReply::Done(Err(VmError::Parse(message)))) => {
+                    return Err(Error::new(err_class(ruby, "ParseError"), message));
+                }
+                Ok(VmReply::Done(Err(VmError::Runtime(message)))) => {
+                    return Err(Error::new(err_class(ruby, "RuntimeError"), message));
                 }
                 Ok(VmReply::Done(Err(VmError::Terminated))) => {
                     return Err(Error::new(
-                        ruby.exception_runtime_error(),
+                        err_class(ruby, "ScriptTerminatedError"),
                         "JavaScript was terminated (timeout or stop)",
                     ));
                 }

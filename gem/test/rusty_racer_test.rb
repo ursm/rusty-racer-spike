@@ -20,8 +20,12 @@ class RustyRacerTest < Minitest::Test
   end
 
   def test_js_exception_becomes_ruby_exception
-    e = assert_raises(::RuntimeError) { @ctx.eval('throw new Error("boom")') }
+    e = assert_raises(RustyRacer::RuntimeError) { @ctx.eval('throw new Error("boom")') }
     assert_includes e.message, "boom"
+  end
+
+  def test_syntax_error_is_parse_error
+    assert_raises(RustyRacer::ParseError) { @ctx.eval("this is not valid js ===") }
   end
 
   def test_other_ruby_threads_progress_during_eval
@@ -53,7 +57,7 @@ class RustyRacerTest < Minitest::Test
   end
 
   def test_timeout_terminates_and_recovers
-    assert_raises(::RuntimeError) { @ctx.eval_t("for(;;){}", 100) }
+    assert_raises(RustyRacer::ScriptTerminatedError) { @ctx.eval_t("for(;;){}", 100) }
     assert_equal 4, @ctx.eval("2 + 2")
   end
 
@@ -62,7 +66,7 @@ class RustyRacerTest < Minitest::Test
     100.times do
       begin
         @ctx.eval_t("const u = Date.now() + 1; while (Date.now() < u) {}", 1)
-      rescue ::RuntimeError
+      rescue RustyRacer::ScriptTerminatedError
         # terminated this round — fine
       end
       assert_equal 1, @ctx.eval("1")
@@ -71,7 +75,7 @@ class RustyRacerTest < Minitest::Test
 
   def test_stop_from_another_thread_then_usable
     stopper = Thread.new { sleep 0.05; @ctx.stop }
-    assert_raises(::RuntimeError) { @ctx.eval("for(;;){}") }
+    assert_raises(RustyRacer::ScriptTerminatedError) { @ctx.eval("for(;;){}") }
     stopper.join
     assert_equal 6, @ctx.eval("3 + 3")
   end
@@ -82,12 +86,14 @@ class RustyRacerTest < Minitest::Test
       c = RustyRacer::Context.new
       worker = Thread.new do
         c.eval("const u = Date.now() + 30; while (Date.now() < u) {}")
-      rescue ::RuntimeError
-        # disposed/terminated mid-run is acceptable; hanging is not
+      rescue StandardError
+        # disposed/terminated mid-run is acceptable (class varies with the
+        # race); hanging is not.
       end
       sleep(rand * 0.03)
       c.dispose
       assert worker.join(5), "worker hung"
+      # post-dispose use raises the plain disposed-context guard, not a JS error
       assert_raises(::RuntimeError) { c.eval("1") }
     end
   end
