@@ -1,0 +1,62 @@
+# M1 — libv8-rusty: build a *library-TLS* librusty_v8.a from the denoland/rusty_v8
+# GIT checkout (V8_FROM_SOURCE defaults to V8_TLS_USED_IN_LIBRARY on linux, and
+# the git tree has the full third_party the crates.io tarball lacks). The gem
+# build then points RUSTY_V8_ARCHIVE at this artifact instead of downloading
+# Deno's bin-TLS prebuilt. Linux x86_64 first; widen later.
+#
+# Heavy + iteration-prone: a full V8 source build needs lots of disk/RAM/time.
+# First run is exploratory — expect to tune disk cleanup, the LLVM version, and
+# the artifact path.
+name: "M1 libv8-rusty (library-TLS librusty_v8.a)"
+on:
+  workflow_dispatch:
+    inputs:
+      rusty_v8_tag:
+        description: "denoland/rusty_v8 git tag to build (must match the gem's v8 crate version)"
+        required: true
+        default: "v150.0.0"
+jobs:
+  build:
+    runs-on: "ubuntu-22.04"
+    timeout-minutes: 180
+    steps:
+      - name: "Free disk space (V8 build is large)"
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+                      /opt/hostedtoolcache/CodeQL /usr/local/.ghcup
+          df -h /
+      - name: "Install build prerequisites"
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3 curl pkg-config libglib2.0-dev lld
+          # rusty_v8 needs libclang 19+ for bindgen; the V8 compiler clang is
+          # auto-downloaded by the build, but bindgen uses the system libclang.
+          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
+          chmod +x /tmp/llvm.sh
+          sudo /tmp/llvm.sh 19
+          sudo apt-get install -y libclang-19-dev clang-19
+      - uses: "dtolnay/rust-toolchain@stable"
+      - name: "Clone rusty_v8 ${{ inputs.rusty_v8_tag }}"
+        run: |
+          git clone --depth 1 --branch "${{ inputs.rusty_v8_tag }}" \
+            --recurse-submodules --shallow-submodules \
+            https://github.com/denoland/rusty_v8
+      - name: "Build from source (library-TLS)"
+        working-directory: rusty_v8
+        env:
+          V8_FROM_SOURCE: "1"
+          LIBCLANG_PATH: "/usr/lib/llvm-19/lib"
+        run: cargo build --release -vv
+      - name: "Stage the static archive"
+        run: |
+          set -x
+          archive="$(find rusty_v8/target/release -name 'librusty_v8*.a' -size +10M | head -1)"
+          test -n "$archive" || { echo "no librusty_v8.a found"; find rusty_v8/target -name '*.a' | head; exit 1; }
+          mkdir -p out
+          cp "$archive" "out/librusty_v8_release_x86_64-unknown-linux-gnu.a"
+          ls -lh out/
+      - uses: "actions/upload-artifact@v4"
+        with:
+          name: "librusty_v8-linux-x64"
+          path: "out/*.a"
+          retention-days: 7
