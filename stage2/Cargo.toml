@@ -1,0 +1,14 @@
+# Stage 2: the Ruby half. A real Ruby extension (cdylib) embedding V8 inline
+# on the calling Ruby thread — no dedicated V8 thread, no rendezvous protocol.
+[package]
+name = "rusty_racer"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+v8 = { workspace = true }
+magnus = "0.8"
+rb-sys = "0.9"

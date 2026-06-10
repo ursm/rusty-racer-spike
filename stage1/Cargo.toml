@@ -1,0 +1,7 @@
+[package]
+name = "rusty_racer_spike"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+v8 = { workspace = true }

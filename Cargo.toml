@@ -1,7 +1,9 @@
-[package]
-name = "rusty_racer_spike"
-version = "0.1.0"
-edition = "2024"
+[workspace]
+members = ["stage1", "stage2"]
+resolver = "2"
 
-[dependencies]
+[workspace.dependencies]
 v8 = "150.0.0"
+
+[profile.release]
+debug = true
