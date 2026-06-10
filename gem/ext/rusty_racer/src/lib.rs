@@ -68,6 +68,9 @@ enum JsVal {
     Int(i64),
     Num(f64),
     Str(String),
+    // JS Date <-> Ruby Time, carried as milliseconds since the Unix epoch
+    // (v8::Date::value_of's unit). mini_racer marshals Date to Time.
+    Date(f64),
     Array(Vec<JsVal>),
     // JS object / Ruby Hash with string keys (mini_racer marshals objects to
     // string-keyed Hashes). Insertion order preserved.
@@ -209,6 +212,12 @@ fn js_to_jsval_d(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>, 
     if value.is_number() {
         return JsVal::Num(value.number_value(scope).unwrap_or(f64::NAN));
     }
+    // Date before the generic object branch (a Date *is* an object).
+    if value.is_date() {
+        if let Ok(date) = v8::Local::<v8::Date>::try_from(value) {
+            return JsVal::Date(date.value_of());
+        }
+    }
     if depth < MAX_MARSHAL_DEPTH && value.is_array() {
         let arr = v8::Local::<v8::Array>::try_from(value).unwrap();
         let mut out = Vec::with_capacity(arr.length() as usize);
@@ -251,6 +260,9 @@ fn jsval_to_js<'s>(scope: &mut v8::PinScope<'s, '_>, val: &JsVal) -> v8::Local<'
         JsVal::Num(n) => v8::Number::new(scope, *n).into(),
         JsVal::Str(s) => v8::String::new(scope, s)
             .map(|s| s.into())
+            .unwrap_or_else(|| v8::undefined(scope).into()),
+        JsVal::Date(ms) => v8::Date::new(scope, *ms)
+            .map(|d| d.into())
             .unwrap_or_else(|| v8::undefined(scope).into()),
         JsVal::Array(items) => {
             let arr = v8::Array::new(scope, items.len() as i32);
@@ -1009,6 +1021,10 @@ fn jsval_to_json(val: &JsVal) -> String {
         JsVal::Num(n) if n.is_finite() => n.to_string(),
         JsVal::Num(_) => "null".to_string(),
         JsVal::Str(s) => json_quote(s),
+        // Not JSON, but this string is injected into a JS expression, so a live
+        // Date constructor round-trips the value (JSON has no date literal).
+        JsVal::Date(ms) if ms.is_finite() => format!("new Date({ms})"),
+        JsVal::Date(_) => "new Date(NaN)".to_string(),
         JsVal::Array(items) => {
             let parts: Vec<String> = items.iter().map(jsval_to_json).collect();
             format!("[{}]", parts.join(","))
@@ -1108,6 +1124,12 @@ fn jsval_to_ruby(ruby: &Ruby, val: &JsVal) -> Value {
         JsVal::Int(i) => (*i).into_value_with(ruby),
         JsVal::Num(n) => (*n).into_value_with(ruby),
         JsVal::Str(s) => s.clone().into_value_with(ruby),
+        // Time.at takes seconds; carry sub-second precision as the Float.
+        JsVal::Date(ms) => ruby
+            .class_object()
+            .const_get::<_, magnus::RClass>("Time")
+            .and_then(|t| t.funcall::<_, _, Value>("at", (*ms / 1000.0,)))
+            .unwrap_or_else(|_| ruby.qnil().as_value()),
         JsVal::Array(items) => {
             let arr = ruby.ary_new();
             for it in items {
@@ -1143,6 +1165,15 @@ fn ruby_to_jsval_d(val: Value, depth: u32) -> Result<JsVal, Error> {
     }
     if val.eql(ruby.qfalse()).unwrap_or(false) {
         return Ok(JsVal::Bool(false));
+    }
+    // Ruby Time -> JS Date. Must precede the numeric checks: magnus's
+    // i64/f64 TryConvert coerces a Time via to_i/to_f, so it would otherwise
+    // marshal as a bare epoch number. Time#to_f is epoch seconds; Date wants ms.
+    if let Ok(time_class) = ruby.class_object().const_get::<_, magnus::RClass>("Time") {
+        if val.is_kind_of(time_class) {
+            let sec = val.funcall::<_, _, f64>("to_f", ())?;
+            return Ok(JsVal::Date(sec * 1000.0));
+        }
     }
     // Integer/Float/String try_convert are type-strict (Err on a mismatch).
     if let Ok(i) = i64::try_convert(val) {

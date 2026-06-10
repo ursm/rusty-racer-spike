@@ -89,6 +89,20 @@ class RustyRacerTest < Minitest::Test
     assert_equal "string", @ctx.call("kind", "hi")
   end
 
+  def test_date_marshals_to_time
+    # JS Date -> Ruby Time
+    t = @ctx.eval('new Date("2021-01-02T03:04:05.000Z")')
+    assert_kind_of Time, t
+    assert_equal Time.utc(2021, 1, 2, 3, 4, 5).to_i, t.to_i
+    # Ruby Time -> JS Date -> back, through call args
+    @ctx.eval("function year(d) { return d.getUTCFullYear() }")
+    assert_equal 2021, @ctx.call("year", Time.utc(2021, 6, 1))
+    # round-trip identity (to the second)
+    now = Time.utc(2022, 3, 4, 5, 6, 7)
+    @ctx.eval("function echo(x) { return x }")
+    assert_equal now.to_i, @ctx.call("echo", now).to_i
+  end
+
   def test_reset_realm_clears_globals
     @ctx.eval("globalThis.x = 41")
     assert_equal 41, @ctx.eval("globalThis.x")
