@@ -873,6 +873,10 @@ fn install_host_namespace(isolate: &mut v8::Isolate, ctx: &v8::Global<v8::Contex
 // its default context. Runs entirely on the calling (Ruby) thread: the
 // OwnedIsolate is a local, never stored in a Send wrapper, so the !Send dedicated
 // -thread rule doesn't apply. |base| warms an existing blob further.
+//
+// NB: unlike Eval there is no watchdog here and the GVL is held throughout, so
+// |code| must be trusted setup — an infinite loop would freeze the whole Ruby
+// VM. Snapshot/warmup code is author-controlled, so that's an accepted tradeoff.
 fn build_snapshot(code: &str, base: Option<Vec<u8>>) -> Result<Vec<u8>, String> {
     init_v8();
     let mut creator = match base {
@@ -966,7 +970,7 @@ impl Core {
         loop {
             let message = without_gvl(|| reply_rx.recv());
             match message {
-                Ok(VmReply::Done(Ok(val))) => return Ok(jsval_to_ruby(ruby, &val)),
+                Ok(VmReply::Done(Ok(val))) => return jsval_to_ruby(ruby, &val),
                 Ok(VmReply::Done(Err(e))) => return Err(vm_err(ruby, e)),
                 Ok(VmReply::ModuleGraphDone(Ok(urls))) => {
                     return Ok(module_graph_result(ruby, &urls));
@@ -1016,7 +1020,11 @@ impl Core {
             let opaque = procs.get(host_fn_id).ok_or("unknown host function")?;
             ruby.get_inner(*opaque)
         };
-        let ruby_args: Vec<Value> = args.iter().map(|v| jsval_to_ruby(ruby, v)).collect();
+        let ruby_args: Vec<Value> = args
+            .iter()
+            .map(|v| jsval_to_ruby(ruby, v))
+            .collect::<Result<_, Error>>()
+            .map_err(|e| e.to_string())?;
         NESTED.with(|n| n.borrow_mut().push(answer.clone()));
         let result: Result<Value, Error> = proc.call(ruby_args.as_slice());
         NESTED.with(|n| {
@@ -1230,7 +1238,11 @@ impl Realm {
         if rb_self.disposed.swap(true, Ordering::SeqCst) {
             return Ok(()); // already disposed
         }
-        rb_self.core.dispose_realm(ruby, rb_self.id)
+        // Best-effort: if the parent Context was disposed first, the realm went
+        // down with the V8 thread, so a failed DisposeRealm send is success,
+        // not an error — disposing a realm must stay idempotent and quiet.
+        let _ = rb_self.core.dispose_realm(ruby, rb_self.id);
+        Ok(())
     }
     fn disposed(&self) -> bool {
         self.disposed.load(Ordering::SeqCst)
@@ -1404,23 +1416,28 @@ fn marshal_urls(ret: Value, n: usize) -> Vec<Option<String>> {
         .collect()
 }
 
-fn jsval_to_ruby(ruby: &Ruby, val: &JsVal) -> Value {
-    match val {
+fn jsval_to_ruby(ruby: &Ruby, val: &JsVal) -> Result<Value, Error> {
+    Ok(match val {
         JsVal::Undefined | JsVal::Null => ruby.qnil().as_value(),
         JsVal::Bool(b) => (*b).into_value_with(ruby),
         JsVal::Int(i) => (*i).into_value_with(ruby),
         JsVal::Num(n) => (*n).into_value_with(ruby),
         JsVal::Str(s) => s.clone().into_value_with(ruby),
-        // Time.at takes seconds; carry sub-second precision as the Float.
-        JsVal::Date(ms) => ruby
-            .class_object()
-            .const_get::<_, magnus::RClass>("Time")
-            .and_then(|t| t.funcall::<_, _, Value>("at", (*ms / 1000.0,)))
-            .unwrap_or_else(|_| ruby.qnil().as_value()),
+        // Time.at takes seconds; carry sub-second precision as the Float. An
+        // invalid Date (value_of NaN) raises RangeError, matching csim's
+        // des_date — never a silent nil.
+        JsVal::Date(ms) => {
+            if !ms.is_finite() {
+                return Err(Error::new(ruby.exception_range_error(), "invalid Date"));
+            }
+            ruby.class_object()
+                .const_get::<_, magnus::RClass>("Time")?
+                .funcall::<_, _, Value>("at", (*ms / 1000.0,))?
+        }
         JsVal::Array(items) => {
             let arr = ruby.ary_new();
             for it in items {
-                let _ = arr.push(jsval_to_ruby(ruby, it));
+                let _ = arr.push(jsval_to_ruby(ruby, it)?);
             }
             arr.as_value()
         }
@@ -1428,11 +1445,11 @@ fn jsval_to_ruby(ruby: &Ruby, val: &JsVal) -> Value {
         JsVal::Obj(entries) => {
             let h = ruby.hash_new();
             for (k, it) in entries {
-                let _ = h.aset(k.as_str(), jsval_to_ruby(ruby, it));
+                let _ = h.aset(k.as_str(), jsval_to_ruby(ruby, it)?);
             }
             h.as_value()
         }
-    }
+    })
 }
 
 fn ruby_to_jsval(val: Value) -> Result<JsVal, Error> {

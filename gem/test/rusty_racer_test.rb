@@ -103,6 +103,11 @@ class RustyRacerTest < Minitest::Test
     assert_equal now.to_i, @ctx.call("echo", now).to_i
   end
 
+  def test_invalid_date_raises_not_silent_nil
+    # parity with csim's des_date: a non-finite Date is a RangeError, not nil.
+    assert_raises(RangeError) { @ctx.eval('new Date("not a date")') }
+  end
+
   def test_reset_realm_clears_globals
     @ctx.eval("globalThis.x = 41")
     assert_equal 41, @ctx.eval("globalThis.x")
