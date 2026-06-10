@@ -262,20 +262,31 @@ struct JsSeen {
     map: HashMap<i32, Vec<(v8::Global<v8::Object>, u32)>>,
 }
 
-// Either the new id assigned to a first-seen object, or the existing id of one
-// already emitted (caller emits Ref(existing) and does not recurse).
-fn js_seen(
+// Decide how to emit a container object: Ok(id) = first sighting, register it
+// and recurse; Err(jsval) = emit this directly and stop (a Ref to an already-
+// seen object, or a truncated Str at the depth backstop). Centralising this in
+// one place keeps the four container arms (array/object/map/set) in lockstep —
+// and crucially orders the checks so a depth-truncated object is NEVER assigned
+// an id (which would leave a sibling Ref dangling).
+fn js_container_id(
     scope: &mut v8::PinScope<'_, '_>,
     seen: &mut JsSeen,
+    value: v8::Local<v8::Value>,
     obj: v8::Local<v8::Object>,
-) -> Result<u32, u32> {
+    depth: u32,
+) -> Result<u32, JsVal> {
     let hash = obj.get_identity_hash().get();
     if let Some(bucket) = seen.map.get(&hash) {
         for (g, id) in bucket {
             if v8::Local::new(scope, g) == obj {
-                return Err(*id);
+                return Err(JsVal::Ref(*id));
             }
         }
+    }
+    // First sighting but too deep: truncate WITHOUT registering, so no later
+    // Ref can target a container that was never emitted.
+    if depth >= MAX_MARSHAL_DEPTH {
+        return Err(JsVal::Str(value.to_rust_string_lossy(scope)));
     }
     let id = seen.next_id;
     seen.next_id += 1;
@@ -326,12 +337,9 @@ fn js_to_jsval_d(
     // Map/Set before the generic object branch (both are objects).
     if value.is_map() {
         let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
-        let id = match js_seen(scope, seen, obj) {
-            Err(existing) => return JsVal::Ref(existing),
-            Ok(_) if depth >= MAX_MARSHAL_DEPTH => {
-                return JsVal::Str(value.to_rust_string_lossy(scope));
-            }
+        let id = match js_container_id(scope, seen, value, obj, depth) {
             Ok(id) => id,
+            Err(jsval) => return jsval,
         };
         let map = v8::Local::<v8::Map>::try_from(value).unwrap();
         let arr = map.as_array(scope); // [k0, v0, k1, v1, ...]
@@ -349,12 +357,9 @@ fn js_to_jsval_d(
     }
     if value.is_set() {
         let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
-        let id = match js_seen(scope, seen, obj) {
-            Err(existing) => return JsVal::Ref(existing),
-            Ok(_) if depth >= MAX_MARSHAL_DEPTH => {
-                return JsVal::Str(value.to_rust_string_lossy(scope));
-            }
+        let id = match js_container_id(scope, seen, value, obj, depth) {
             Ok(id) => id,
+            Err(jsval) => return jsval,
         };
         let set = v8::Local::<v8::Set>::try_from(value).unwrap();
         let arr = set.as_array(scope);
@@ -367,12 +372,9 @@ fn js_to_jsval_d(
     }
     if value.is_array() {
         let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
-        let id = match js_seen(scope, seen, obj) {
-            Err(existing) => return JsVal::Ref(existing),
-            Ok(_) if depth >= MAX_MARSHAL_DEPTH => {
-                return JsVal::Str(value.to_rust_string_lossy(scope));
-            }
+        let id = match js_container_id(scope, seen, value, obj, depth) {
             Ok(id) => id,
+            Err(jsval) => return jsval,
         };
         let arr = v8::Local::<v8::Array>::try_from(value).unwrap();
         let mut items = Vec::with_capacity(arr.length() as usize);
@@ -388,12 +390,9 @@ fn js_to_jsval_d(
     // their toString (the spike's primitive escape hatch).
     if value.is_object() && !value.is_function() {
         let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
-        let id = match js_seen(scope, seen, obj) {
-            Err(existing) => return JsVal::Ref(existing),
-            Ok(_) if depth >= MAX_MARSHAL_DEPTH => {
-                return JsVal::Str(value.to_rust_string_lossy(scope));
-            }
+        let id = match js_container_id(scope, seen, value, obj, depth) {
             Ok(id) => id,
+            Err(jsval) => return jsval,
         };
         if let Some(names) = obj.get_own_property_names(scope, Default::default()) {
             let mut entries = Vec::with_capacity(names.length() as usize);
@@ -1500,7 +1499,43 @@ fn json_quote(s: &str) -> String {
 }
 
 // JSON encoding for Context#call's argument injection (now incl. array/object).
+// Index every container by id so jsval_to_json can expand a Ref back into its
+// target. A JS expression literal can re-state a shared subtree (by repeating
+// it) but cannot express a true cycle, so we expand shared/acyclic refs and
+// only fall back to null when a Ref points at an ancestor still being emitted.
+fn index_jsval<'a>(val: &'a JsVal, index: &mut HashMap<u32, &'a JsVal>) {
+    match val {
+        JsVal::Array { id, items } => {
+            index.insert(*id, val);
+            items.iter().for_each(|v| index_jsval(v, index));
+        }
+        JsVal::Obj { id, entries } => {
+            index.insert(*id, val);
+            entries.iter().for_each(|(_, v)| index_jsval(v, index));
+        }
+        JsVal::Map { id, pairs } => {
+            index.insert(*id, val);
+            pairs.iter().for_each(|(k, v)| {
+                index_jsval(k, index);
+                index_jsval(v, index);
+            });
+        }
+        JsVal::Set { id, items } => {
+            index.insert(*id, val);
+            items.iter().for_each(|v| index_jsval(v, index));
+        }
+        _ => {}
+    }
+}
+
 fn jsval_to_json(val: &JsVal) -> String {
+    let mut index = HashMap::new();
+    index_jsval(val, &mut index);
+    let mut active = HashSet::new();
+    jsval_to_json_d(val, &index, &mut active)
+}
+
+fn jsval_to_json_d(val: &JsVal, index: &HashMap<u32, &JsVal>, active: &mut HashSet<u32>) -> String {
     match val {
         JsVal::Undefined | JsVal::Null => "null".to_string(),
         JsVal::Bool(b) => b.to_string(),
@@ -1518,31 +1553,54 @@ fn jsval_to_json(val: &JsVal) -> String {
         // Date constructor round-trips the value (JSON has no date literal).
         JsVal::Date(ms) if ms.is_finite() => format!("new Date({ms})"),
         JsVal::Date(_) => "new Date(NaN)".to_string(),
-        JsVal::Array { items, .. } => {
-            let parts: Vec<String> = items.iter().map(jsval_to_json).collect();
+        JsVal::Array { id, items } => {
+            active.insert(*id);
+            let parts: Vec<String> = items.iter().map(|v| jsval_to_json_d(v, index, active)).collect();
+            active.remove(id);
             format!("[{}]", parts.join(","))
         }
-        JsVal::Obj { entries, .. } => {
+        JsVal::Obj { id, entries } => {
+            active.insert(*id);
             let parts: Vec<String> = entries
                 .iter()
-                .map(|(k, v)| format!("{}:{}", json_quote(k), jsval_to_json(v)))
+                .map(|(k, v)| format!("{}:{}", json_quote(k), jsval_to_json_d(v, index, active)))
                 .collect();
+            active.remove(id);
             format!("{{{}}}", parts.join(","))
         }
-        JsVal::Map { pairs, .. } => {
+        JsVal::Map { id, pairs } => {
+            active.insert(*id);
             let parts: Vec<String> = pairs
                 .iter()
-                .map(|(k, v)| format!("[{},{}]", jsval_to_json(k), jsval_to_json(v)))
+                .map(|(k, v)| {
+                    format!(
+                        "[{},{}]",
+                        jsval_to_json_d(k, index, active),
+                        jsval_to_json_d(v, index, active)
+                    )
+                })
                 .collect();
+            active.remove(id);
             format!("new Map([{}])", parts.join(","))
         }
-        JsVal::Set { items, .. } => {
-            let parts: Vec<String> = items.iter().map(jsval_to_json).collect();
+        JsVal::Set { id, items } => {
+            active.insert(*id);
+            let parts: Vec<String> = items.iter().map(|v| jsval_to_json_d(v, index, active)).collect();
+            active.remove(id);
             format!("new Set([{}])", parts.join(","))
         }
-        // call-arg injection is a JSON-shaped literal, which can't express
-        // shared/cyclic references; a Ref degrades to null (rare for call args).
-        JsVal::Ref(_) => "null".to_string(),
+        // Shared (acyclic) ref: expand its target so the value isn't lost. A ref
+        // back to a container still being emitted is a true cycle, which a JS
+        // literal can't express -> null (rare for call args).
+        JsVal::Ref(id) => {
+            if active.contains(id) {
+                "null".to_string()
+            } else if let Some(target) = index.get(id) {
+                jsval_to_json_d(target, index, active)
+            } else {
+                "null".to_string()
+            }
+        }
     }
 }
 
@@ -1750,20 +1808,27 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
             return Ok(JsVal::Date(sec * 1000.0));
         }
     }
-    // Integer/Float/String try_convert are type-strict (Err on a mismatch).
-    if let Ok(i) = i64::try_convert(val) {
-        return Ok(JsVal::Int(i));
-    }
-    // An Integer that didn't fit i64 is a bignum -> JS BigInt (exact), not a
-    // lossy f64. magnus::Integer accepts any Ruby Integer.
-    if magnus::Integer::try_convert(val).is_ok() {
-        let abs: Value = val.funcall("abs", ())?;
-        let hex: String = abs.funcall("to_s", (16i64,))?;
-        let negative = val.funcall::<_, _, bool>("negative?", ())?;
-        return Ok(JsVal::BigInt {
-            negative,
-            words: hex_to_words(&hex),
-        });
+    // Integer. A JS Number is an f64, so only integers exactly representable
+    // there (|n| <= 2^53) become Int/Number; anything larger (the rest of the
+    // i64 range AND true bignums) becomes a BigInt so no precision is lost.
+    // Use a strict Integer type check, NOT magnus::Integer::try_convert, which
+    // coerces a Float / to_int object — that would turn e.g. 1e300 into a BigInt
+    // instead of a Number.
+    if let Ok(int_class) = ruby.class_object().const_get::<_, magnus::RClass>("Integer") {
+        if val.is_kind_of(int_class) {
+            if let Ok(i) = i64::try_convert(val) {
+                if i.unsigned_abs() <= (1u64 << 53) {
+                    return Ok(JsVal::Int(i));
+                }
+            }
+            let abs: Value = val.funcall("abs", ())?;
+            let hex: String = abs.funcall("to_s", (16i64,))?;
+            let negative = val.funcall::<_, _, bool>("negative?", ())?;
+            return Ok(JsVal::BigInt {
+                negative,
+                words: hex_to_words(&hex),
+            });
+        }
     }
     if let Ok(n) = f64::try_convert(val) {
         return Ok(JsVal::Num(n));
@@ -1774,13 +1839,10 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
     // Ruby Set -> JS Set. Before the Array/Hash checks (a Set is neither).
     if let Ok(set_class) = ruby.class_object().const_get::<_, magnus::RClass>("Set") {
         if val.is_kind_of(set_class) {
-            if let Some(r) = rb_seen(seen, val)? {
-                return Ok(r);
-            }
-            if depth >= MAX_MARSHAL_DEPTH {
-                return Ok(JsVal::Str(val.funcall::<_, _, String>("to_s", ())?));
-            }
-            let id = rb_assign(seen, val)?;
+            let id = match rb_container_id(seen, val, depth)? {
+                RbId::New(id) => id,
+                RbId::Reuse(jv) => return Ok(jv),
+            };
             let arr: RArray = val.funcall("to_a", ())?;
             let mut items = Vec::with_capacity(arr.len());
             for i in 0..arr.len() {
@@ -1791,13 +1853,10 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
         }
     }
     if let Ok(arr) = RArray::try_convert(val) {
-        if let Some(r) = rb_seen(seen, val)? {
-            return Ok(r);
-        }
-        if depth >= MAX_MARSHAL_DEPTH {
-            return Ok(JsVal::Str(val.funcall::<_, _, String>("to_s", ())?));
-        }
-        let id = rb_assign(seen, val)?;
+        let id = match rb_container_id(seen, val, depth)? {
+            RbId::New(id) => id,
+            RbId::Reuse(jv) => return Ok(jv),
+        };
         let mut items = Vec::with_capacity(arr.len());
         for i in 0..arr.len() {
             let el: Value = arr.entry::<Value>(i as isize)?;
@@ -1806,13 +1865,10 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
         return Ok(JsVal::Array { id, items });
     }
     if let Ok(hash) = RHash::try_convert(val) {
-        if let Some(r) = rb_seen(seen, val)? {
-            return Ok(r);
-        }
-        if depth >= MAX_MARSHAL_DEPTH {
-            return Ok(JsVal::Str(val.funcall::<_, _, String>("to_s", ())?));
-        }
-        let id = rb_assign(seen, val)?;
+        let id = match rb_container_id(seen, val, depth)? {
+            RbId::New(id) => id,
+            RbId::Reuse(jv) => return Ok(jv),
+        };
         let entries = RefCell::new(Vec::new());
         hash.foreach(|k: Value, v: Value| {
             // String/Symbol keys -> String; anything else via to_s.
@@ -1833,19 +1889,26 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
     ))
 }
 
-// If this Ruby object was already emitted, return its Ref; else None. Separate
-// from rb_assign so the depth backstop can run between the check and the insert.
-fn rb_seen(seen: &RbSeen, val: Value) -> Result<Option<JsVal>, Error> {
-    let oid = val.funcall::<_, _, usize>("object_id", ())?;
-    Ok(seen.map.get(&oid).map(|id| JsVal::Ref(*id)))
+enum RbId {
+    New(u32),
+    Reuse(JsVal),
 }
 
-fn rb_assign(seen: &mut RbSeen, val: Value) -> Result<u32, Error> {
+// Ruby-side mirror of js_container_id: New(id) to register and recurse, or
+// Reuse(jsval) to emit directly (a Ref to an already-seen object, or a
+// depth-truncated Str). Computes object_id once.
+fn rb_container_id(seen: &mut RbSeen, val: Value, depth: u32) -> Result<RbId, Error> {
     let oid = val.funcall::<_, _, usize>("object_id", ())?;
+    if let Some(id) = seen.map.get(&oid) {
+        return Ok(RbId::Reuse(JsVal::Ref(*id)));
+    }
+    if depth >= MAX_MARSHAL_DEPTH {
+        return Ok(RbId::Reuse(JsVal::Str(val.funcall::<_, _, String>("to_s", ())?)));
+    }
     let id = seen.next_id;
     seen.next_id += 1;
     seen.map.insert(oid, id);
-    Ok(id)
+    Ok(RbId::New(id))
 }
 
 #[magnus::init]

@@ -119,6 +119,29 @@ class RustyRacerTest < Minitest::Test
 
     # small ints stay JS numbers (not bigint)
     assert_equal false, @ctx.call("isBig", 42)
+    # integers beyond Number's exact range (2**53) become BigInt even within
+    # i64, so precision is never lost (regression guard)
+    assert_equal true, @ctx.call("isBig", 2**60)
+    assert_equal 2**60 + 1, @ctx.call("echo", 2**60 + 1)
+    # 2**53 itself is still exactly representable -> stays a Number
+    assert_equal false, @ctx.call("isBig", 2**53)
+  end
+
+  def test_large_float_stays_number_not_bigint
+    # a Float must not be coerced to Integer/BigInt (strict Integer typing)
+    @ctx.eval("function kind(x) { return typeof x }")
+    assert_equal "number", @ctx.call("kind", 1e300)
+    assert_equal 1e300, @ctx.call("echo", 1e300) if @ctx.eval("typeof echo") == "function"
+    @ctx.eval("function echo2(x) { return x }")
+    assert_in_delta 1e300, @ctx.call("echo2", 1e300), 0.0
+  end
+
+  def test_shared_acyclic_call_arg_not_lost
+    # regression: a shared (acyclic) substructure in a call arg must survive the
+    # JSON-shaped injection by being expanded, not dropped to null.
+    shared = {"v" => 1}
+    @ctx.eval("function bv(x) { return x.b && x.b.v }")
+    assert_equal 1, @ctx.call("bv", {"a" => shared, "b" => shared})
   end
 
   def test_js_map_marshals_to_ruby_hash
