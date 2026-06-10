@@ -103,6 +103,24 @@ class RustyRacerTest < Minitest::Test
     assert_equal now.to_i, @ctx.call("echo", now).to_i
   end
 
+  def test_bigint_marshals_to_integer_without_precision_loss
+    # JS BigInt -> Ruby Integer (well beyond Float's 2**53 exact range)
+    assert_equal 2**53 + 1, @ctx.eval("BigInt(2)**53n + 1n")
+    assert_equal(-(2**70), @ctx.eval("-(2n**70n)"))
+    big = 123456789012345678901234567890
+    assert_equal big, @ctx.eval("123456789012345678901234567890n")
+
+    # Ruby Integer -> JS: a bignum becomes a BigInt, not a lossy Number
+    @ctx.eval("function isBig(x) { return typeof x === 'bigint' }")
+    assert_equal true, @ctx.call("isBig", 2**80)
+    @ctx.eval("function echo(x) { return x }")
+    assert_equal big, @ctx.call("echo", big)
+    assert_equal(-big, @ctx.call("echo", -big))
+
+    # small ints stay JS numbers (not bigint)
+    assert_equal false, @ctx.call("isBig", 42)
+  end
+
   def test_invalid_date_raises_not_silent_nil
     # parity with csim's des_date: a non-finite Date is a RangeError, not nil.
     assert_raises(RangeError) { @ctx.eval('new Date("not a date")') }

@@ -68,6 +68,11 @@ enum JsVal {
     Int(i64),
     Num(f64),
     Str(String),
+    // Arbitrary-precision integer (JS BigInt <-> Ruby Integer). Carried as V8's
+    // word representation: sign + little-endian u64 limbs. Both ends speak this
+    // natively (V8 BigInt words; Ruby Integer via a hex string), so no value is
+    // truncated — unlike routing a big int through f64.
+    BigInt { negative: bool, words: Vec<u64> },
     // JS Date <-> Ruby Time, carried as milliseconds since the Unix epoch
     // (v8::Date::value_of's unit). mini_racer marshals Date to Time.
     Date(f64),
@@ -205,6 +210,38 @@ thread_local! {
     static REPLY_STACK: RefCell<Vec<Sender<VmReply>>> = const { RefCell::new(Vec::new()) };
 }
 
+// Little-endian u64 limbs -> big-endian hex magnitude (no sign, no "0x"). The
+// shared currency between V8 BigInt words and Ruby Integer(str, 16).
+fn words_to_hex(words: &[u64]) -> String {
+    let mut hex = String::new();
+    for w in words.iter().rev() {
+        if hex.is_empty() {
+            hex.push_str(&format!("{w:x}")); // top limb: no leading zeros
+        } else {
+            hex.push_str(&format!("{w:016x}")); // lower limbs: full width
+        }
+    }
+    if hex.is_empty() {
+        hex.push('0');
+    }
+    hex
+}
+
+// Big-endian hex magnitude -> little-endian u64 limbs (inverse of words_to_hex).
+fn hex_to_words(hex: &str) -> Vec<u64> {
+    let mut words = Vec::new();
+    let mut end = hex.len();
+    while end > 0 {
+        let start = end.saturating_sub(16);
+        words.push(u64::from_str_radix(&hex[start..end], 16).unwrap_or(0));
+        end = start;
+    }
+    if words.is_empty() {
+        words.push(0);
+    }
+    words
+}
+
 fn js_to_jsval(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> JsVal {
     js_to_jsval_d(scope, value, 0)
 }
@@ -224,6 +261,13 @@ fn js_to_jsval_d(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>, 
     }
     if value.is_number() {
         return JsVal::Num(value.number_value(scope).unwrap_or(f64::NAN));
+    }
+    if value.is_big_int() {
+        if let Ok(bi) = v8::Local::<v8::BigInt>::try_from(value) {
+            let mut words = vec![0u64; bi.word_count()];
+            let (negative, _) = bi.to_words_array(&mut words);
+            return JsVal::BigInt { negative, words };
+        }
     }
     // Date before the generic object branch (a Date *is* an object).
     if value.is_date() {
@@ -273,6 +317,9 @@ fn jsval_to_js<'s>(scope: &mut v8::PinScope<'s, '_>, val: &JsVal) -> v8::Local<'
         JsVal::Num(n) => v8::Number::new(scope, *n).into(),
         JsVal::Str(s) => v8::String::new(scope, s)
             .map(|s| s.into())
+            .unwrap_or_else(|| v8::undefined(scope).into()),
+        JsVal::BigInt { negative, words } => v8::BigInt::new_from_words(scope, *negative, words)
+            .map(|b| b.into())
             .unwrap_or_else(|| v8::undefined(scope).into()),
         JsVal::Date(ms) => v8::Date::new(scope, *ms)
             .map(|d| d.into())
@@ -1320,6 +1367,12 @@ fn jsval_to_json(val: &JsVal) -> String {
         JsVal::Num(n) if n.is_finite() => n.to_string(),
         JsVal::Num(_) => "null".to_string(),
         JsVal::Str(s) => json_quote(s),
+        // Injected into a JS expression (not real JSON): BigInt accepts a hex
+        // string, so this round-trips arbitrary precision exactly.
+        JsVal::BigInt { negative, words } => {
+            let sign = if *negative { "-" } else { "" };
+            format!("{sign}BigInt(\"0x{}\")", words_to_hex(words))
+        }
         // Not JSON, but this string is injected into a JS expression, so a live
         // Date constructor round-trips the value (JSON has no date literal).
         JsVal::Date(ms) if ms.is_finite() => format!("new Date({ms})"),
@@ -1423,6 +1476,18 @@ fn jsval_to_ruby(ruby: &Ruby, val: &JsVal) -> Result<Value, Error> {
         JsVal::Int(i) => (*i).into_value_with(ruby),
         JsVal::Num(n) => (*n).into_value_with(ruby),
         JsVal::Str(s) => s.clone().into_value_with(ruby),
+        // Reconstruct the Ruby Integer from the hex magnitude (arbitrary
+        // precision); negate via Ruby so bignums stay exact.
+        JsVal::BigInt { negative, words } => {
+            let mag: Value = ruby
+                .str_new(&words_to_hex(words))
+                .funcall("to_i", (16i64,))?;
+            if *negative {
+                mag.funcall("-@", ())?
+            } else {
+                mag
+            }
+        }
         // Time.at takes seconds; carry sub-second precision as the Float. An
         // invalid Date (value_of NaN) raises RangeError, matching csim's
         // des_date — never a silent nil.
@@ -1482,6 +1547,17 @@ fn ruby_to_jsval_d(val: Value, depth: u32) -> Result<JsVal, Error> {
     // Integer/Float/String try_convert are type-strict (Err on a mismatch).
     if let Ok(i) = i64::try_convert(val) {
         return Ok(JsVal::Int(i));
+    }
+    // An Integer that didn't fit i64 is a bignum -> JS BigInt (exact), not a
+    // lossy f64. magnus::Integer accepts any Ruby Integer.
+    if magnus::Integer::try_convert(val).is_ok() {
+        let abs: Value = val.funcall("abs", ())?;
+        let hex: String = abs.funcall("to_s", (16i64,))?;
+        let negative = val.funcall::<_, _, bool>("negative?", ())?;
+        return Ok(JsVal::BigInt {
+            negative,
+            words: hex_to_words(&hex),
+        });
     }
     if let Ok(n) = f64::try_convert(val) {
         return Ok(JsVal::Num(n));
