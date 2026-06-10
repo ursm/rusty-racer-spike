@@ -43,11 +43,27 @@ module RustyRacer
     def load_module_graph(entry_url, resolve:, fetch_batch:)
       _load_module_graph(entry_url, resolve, fetch_batch)
     end
+
+    # Compile an ES module; returns a RustyRacer::Module to instantiate/evaluate.
+    def compile_module(source, filename: '<compile_module>')
+      _compile_module(source, filename)
+    end
   end
 
   class Realm
     def eval(source, filename: '<eval>')
       _eval(source, filename)
+    end
+  end
+
+  class Module
+    # instantiate { |specifier, referrer_url| dependency_module } — the block
+    # resolves each import to an already-compiled Module. Returns self.
+    def instantiate(&block)
+      raise ArgumentError, 'instantiate requires a resolver block' unless block
+
+      _instantiate(block)
+      self
     end
   end
 end

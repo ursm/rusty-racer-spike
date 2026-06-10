@@ -417,6 +417,66 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2, @ctx.eval("1 + 1")
   end
 
+  def test_es_module_compile_instantiate_evaluate
+    dep = @ctx.compile_module("export const x = 21;", filename: "/dep.js")
+    app = @ctx.compile_module(
+      'import {x} from "./dep.js"; export const result = x * 2; globalThis.RAN = result;',
+      filename: "/app.js"
+    )
+    # the resolve block maps each import to an already-compiled Module
+    app.instantiate do |specifier, referrer_url|
+      assert_equal "/app.js", referrer_url
+      specifier == "./dep.js" ? dep : nil
+    end
+    app.evaluate
+    assert_equal 42, @ctx.eval("globalThis.RAN")
+    # module namespaces expose exports
+    assert_equal 42, app.namespace["result"]
+    assert_equal 21, dep.namespace["x"]
+  end
+
+  def test_es_module_unresolved_import_raises
+    app = @ctx.compile_module('import {x} from "./missing.js";', filename: "/app.js")
+    assert_raises(RustyRacer::RuntimeError) { app.instantiate { |_spec, _ref| nil } }
+  end
+
+  def test_es_module_syntax_error_is_parse_error
+    assert_raises(RustyRacer::ParseError) { @ctx.compile_module("import from", filename: "/bad.js") }
+  end
+
+  def test_es_module_namespace_before_instantiate_raises_not_aborts
+    # guard against V8 CHECK-aborting the process on an un-instantiated module
+    m = @ctx.compile_module("export const a = 1;")
+    assert_raises(RustyRacer::RuntimeError) { m.namespace }
+    assert_raises(RustyRacer::RuntimeError) { m.evaluate }
+  end
+
+  def test_es_module_top_level_throw_surfaces
+    m = @ctx.compile_module('throw new Error("boom in module");', filename: "/t.js")
+    m.instantiate { |_s, _r| nil }
+    e = assert_raises(RustyRacer::RuntimeError) { m.evaluate }
+    assert_includes e.message, "boom in module"
+  end
+
+  def test_es_module_resolver_raise_propagates
+    app = @ctx.compile_module('import {x} from "./dep.js";', filename: "/app.js")
+    e = assert_raises(ArgumentError) { app.instantiate { |_s, _r| raise ArgumentError, "resolver boom" } }
+    assert_includes e.message, "resolver boom"
+  end
+
+  def test_es_module_resolver_wrong_type_raises
+    app = @ctx.compile_module('import {x} from "./dep.js";', filename: "/app.js")
+    assert_raises(TypeError) { app.instantiate { |_s, _r| 42 } }
+  end
+
+  def test_es_module_dispose
+    m = @ctx.compile_module("export const a = 1;")
+    assert_equal false, m.disposed?
+    m.dispose
+    assert_equal true, m.disposed?
+    assert_raises(::RuntimeError) { m.evaluate }
+  end
+
   def test_load_module_graph_evaluates_whole_graph
     sources = {
       "/app.js" => 'import {a} from "./a.js"; import {b} from "./b.js"; globalThis.RESULT = a + b;',

@@ -166,6 +166,33 @@ enum Request {
         entry_url: String,
         reply: Sender<VmReply>,
     },
+    // Thin ES-module primitives (V8's raw compile/instantiate/evaluate). The
+    // embedder owns the url->Module registry and the resolve policy; the binding
+    // just exposes the steps. A compiled module is addressed by an id (like a
+    // realm) since V8 handles can't cross to the Ruby thread.
+    CompileModule {
+        source: String,
+        filename: String,
+        reply: Sender<VmReply>,
+    },
+    // instantiate: V8 walks imports, calling back to the Ruby resolve block
+    // (carried by pump) per edge via VmReply::ResolveModule.
+    InstantiateModule {
+        module_id: i32,
+        reply: Sender<VmReply>,
+    },
+    EvaluateModule {
+        module_id: i32,
+        reply: Sender<VmReply>,
+    },
+    ModuleNamespace {
+        module_id: i32,
+        reply: Sender<VmReply>,
+    },
+    DisposeModule {
+        module_id: i32,
+        reply: Sender<VmReply>,
+    },
     Dispose,
 }
 
@@ -193,6 +220,13 @@ enum VmReply {
         edges: Vec<(String, String)>,
         answer: Sender<Answer>,
     },
+    // instantiate's per-edge resolve: ask the Ruby resolve block for the module
+    // that |specifier| (imported by |referrer_url|) refers to.
+    ResolveModule {
+        specifier: String,
+        referrer_url: String,
+        answer: Sender<Answer>,
+    },
 }
 
 // Ruby thread -> the V8 thread suspended inside a callback / batch round-trip
@@ -215,6 +249,8 @@ enum Answer {
     FetchResult(Vec<Option<String>>),
     // per-edge resolved URL (None = unresolved)
     ResolveResult(Vec<Option<String>>),
+    // the resolve block's answer: the dependency module's id (None = unresolved).
+    ModuleId(Option<i32>),
 }
 
 // ---------------------------------------------------------------------------
@@ -574,9 +610,11 @@ fn host_fn_callback(
                 let outcome = call_function(scope, &name, &args, void);
                 let _ = reply.send(VmReply::Done(outcome));
             }
-            Ok(Answer::FetchResult(_)) | Ok(Answer::ResolveResult(_)) => {
-                // Module-graph answers can't arrive on a host-fn channel.
-                throw_js_error(scope, "unexpected module-graph answer in host callback");
+            Ok(Answer::FetchResult(_))
+            | Ok(Answer::ResolveResult(_))
+            | Ok(Answer::ModuleId(_)) => {
+                // Module(-graph) answers can't arrive on a host-fn channel.
+                throw_js_error(scope, "unexpected module answer in host callback");
                 return;
             }
             Err(_) => {
@@ -825,6 +863,62 @@ fn resolve_module<'s>(
             .map(|(_, u)| u.clone())?;
         let url = r.edges.get(&(ref_url, spec))?;
         Some(v8::Local::new(scope, r.by_url.get(url)?))
+    })
+}
+
+// Registry for the thin compile_module/instantiate API: each compiled module is
+// addressed by an id, with its url kept for the resolve round-trip and a
+// hash bucket to map a referrer Local<Module> back to its id.
+#[derive(Default)]
+struct ModuleReg {
+    by_id: HashMap<i32, (v8::Global<v8::Module>, String)>,
+    by_hash: HashMap<i32, Vec<(v8::Global<v8::Module>, i32)>>,
+    next_id: i32,
+}
+
+thread_local! {
+    static MODULES: RefCell<ModuleReg> = RefCell::new(ModuleReg::default());
+}
+
+// V8 calls this per import edge during InstantiateModule. Maps the referrer to
+// its url, round-trips to the Ruby resolve block (carried on REPLY_STACK), and
+// returns the module the block named. Blocks the V8 thread on the answer, just
+// like host_fn_callback.
+fn resolve_imported<'s>(
+    context: v8::Local<'s, v8::Context>,
+    specifier: v8::Local<'s, v8::String>,
+    _import_attributes: v8::Local<'s, v8::FixedArray>,
+    referrer: v8::Local<'s, v8::Module>,
+) -> Option<v8::Local<'s, v8::Module>> {
+    v8::callback_scope!(unsafe scope, context);
+    let spec = specifier.to_rust_string_lossy(scope);
+    let ref_url = MODULES.with(|m| {
+        let m = m.borrow();
+        let hash = referrer.get_identity_hash().get();
+        m.by_hash
+            .get(&hash)?
+            .iter()
+            .find(|(g, _)| v8::Local::new(scope, g) == referrer)
+            .and_then(|(_, id)| m.by_id.get(id).map(|(_, u)| u.clone()))
+    })?;
+    let reply = REPLY_STACK.with(|s| s.borrow().last().cloned())?;
+    let (atx, arx) = channel();
+    reply
+        .send(VmReply::ResolveModule {
+            specifier: spec,
+            referrer_url: ref_url,
+            answer: atx,
+        })
+        .ok()?;
+    let dep_id = match arx.recv() {
+        Ok(Answer::ModuleId(Some(id))) => id,
+        _ => return None,
+    };
+    MODULES.with(|m| {
+        m.borrow()
+            .by_id
+            .get(&dep_id)
+            .map(|(g, _)| v8::Local::new(scope, g))
     })
 }
 
@@ -1122,6 +1216,11 @@ fn v8_thread_main(
                 };
                 main_context = fresh;
                 REGISTRY.with(|r| r.borrow_mut().clear());
+                MODULES.with(|m| {
+                    let mut m = m.borrow_mut();
+                    m.by_id.clear();
+                    m.by_hash.clear();
+                });
                 if let Some(ref name) = host_namespace {
                     install_host_namespace(&mut isolate, &main_context, name);
                 }
@@ -1161,6 +1260,189 @@ fn v8_thread_main(
                     s.borrow_mut().pop();
                 });
                 let _ = reply.send(VmReply::ModuleGraphDone(result));
+            }
+            Request::CompileModule {
+                source,
+                filename,
+                reply,
+            } => {
+                let outcome = {
+                    v8::scope!(let scope, &mut isolate);
+                    let context = v8::Local::new(scope, &main_context);
+                    let scope = &mut v8::ContextScope::new(scope, context);
+                    v8::tc_scope!(let tc, scope);
+                    match v8::String::new(tc, &source) {
+                        None => Err(VmError::Runtime("module source too large".into())),
+                        Some(code) => {
+                            let origin = module_origin(tc, &filename);
+                            let mut src = v8::script_compiler::Source::new(code, Some(&origin));
+                            match v8::script_compiler::compile_module(tc, &mut src) {
+                                Some(module) => {
+                                    let id = MODULES.with(|m| {
+                                        let mut m = m.borrow_mut();
+                                        let id = m.next_id;
+                                        m.next_id += 1;
+                                        let hash = module.get_identity_hash().get();
+                                        let g = v8::Global::new(tc, module);
+                                        m.by_id.insert(id, (g.clone(), filename.clone()));
+                                        m.by_hash.entry(hash).or_default().push((g, id));
+                                        id
+                                    });
+                                    Ok(JsVal::Int(id as i64))
+                                }
+                                None if tc.has_terminated() => Err(VmError::Terminated),
+                                // A module compile failure is a parse error
+                                // (compile-time), not a thrown exception.
+                                None => {
+                                    let msg = tc
+                                        .exception()
+                                        .map(|e| e.to_rust_string_lossy(tc))
+                                        .unwrap_or_else(|| "module parse error".to_string());
+                                    let message = tc.message();
+                                    let res = message
+                                        .and_then(|m| m.get_script_resource_name(tc))
+                                        .filter(|v| v.is_string())
+                                        .map(|v| v.to_rust_string_lossy(tc))
+                                        .unwrap_or_else(|| filename.clone());
+                                    let loc = match message.and_then(|m| m.get_line_number(tc)) {
+                                        Some(line) => format!(" at {res}:{line}"),
+                                        None => format!(" at {res}"),
+                                    };
+                                    Err(VmError::Parse(format!("{msg}{loc}")))
+                                }
+                            }
+                        }
+                    }
+                };
+                let _ = reply.send(VmReply::Done(outcome));
+            }
+            Request::InstantiateModule { module_id, reply } => {
+                // REPLY_STACK so resolve_imported can round-trip per import edge.
+                REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
+                let outcome = {
+                    v8::scope!(let scope, &mut isolate);
+                    let context = v8::Local::new(scope, &main_context);
+                    let scope = &mut v8::ContextScope::new(scope, context);
+                    match MODULES.with(|m| m.borrow().by_id.get(&module_id).map(|(g, _)| g.clone())) {
+                        None => Err(VmError::Runtime("unknown module".into())),
+                        Some(g) => {
+                            let module = v8::Local::new(scope, &g);
+                            v8::tc_scope!(let tc, scope);
+                            match module.instantiate_module(tc, resolve_imported) {
+                                Some(true) => Ok(JsVal::Undefined),
+                                _ if tc.has_terminated() => Err(VmError::Terminated),
+                                _ => {
+                                    let exc = tc.exception();
+                                    let stack = tc.stack_trace();
+                                    Err(capture_js_error(tc, exc, stack))
+                                }
+                            }
+                        }
+                    }
+                };
+                REPLY_STACK.with(|s| {
+                    s.borrow_mut().pop();
+                });
+                let _ = reply.send(VmReply::Done(outcome));
+            }
+            Request::EvaluateModule { module_id, reply } => {
+                // Top-level module code may call host fns -> REPLY_STACK.
+                REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
+                let outcome = {
+                    v8::scope!(let scope, &mut isolate);
+                    let context = v8::Local::new(scope, &main_context);
+                    let scope = &mut v8::ContextScope::new(scope, context);
+                    match MODULES.with(|m| m.borrow().by_id.get(&module_id).map(|(g, _)| g.clone())) {
+                        None => Err(VmError::Runtime("unknown module".into())),
+                        Some(g) => {
+                            let module = v8::Local::new(scope, &g);
+                            // V8 CHECK-aborts the process if evaluate runs on a
+                            // module that isn't exactly Instantiated, so guard
+                            // status explicitly rather than crash.
+                            match module.get_status() {
+                                v8::ModuleStatus::Errored => {
+                                    Err(VmError::JsError {
+                                        message: module
+                                            .get_exception()
+                                            .to_rust_string_lossy(scope),
+                                        backtrace: vec![],
+                                    })
+                                }
+                                v8::ModuleStatus::Evaluated => Ok(JsVal::Undefined),
+                                v8::ModuleStatus::Instantiated => {
+                                    v8::tc_scope!(let tc, scope);
+                                    match module.evaluate(tc) {
+                                        // evaluate returns a Promise; a synchronous
+                                        // top-level throw yields a *rejected*
+                                        // promise (not None), so check it — else the
+                                        // error is silently lost. A pending (TLA) or
+                                        // fulfilled promise is left for the embedder
+                                        // to drain (explicit microtask policy).
+                                        Some(value) => match v8::Local::<v8::Promise>::try_from(value) {
+                                            Ok(p) if p.state() == v8::PromiseState::Rejected => {
+                                                let reason = p.result(tc);
+                                                Err(VmError::JsError {
+                                                    message: reason.to_rust_string_lossy(tc),
+                                                    backtrace: vec![],
+                                                })
+                                            }
+                                            _ => Ok(JsVal::Undefined),
+                                        },
+                                        None if tc.has_terminated() => Err(VmError::Terminated),
+                                        None => {
+                                            let exc = tc.exception();
+                                            let stack = tc.stack_trace();
+                                            Err(capture_js_error(tc, exc, stack))
+                                        }
+                                    }
+                                }
+                                _ => Err(VmError::Runtime(
+                                    "module must be instantiated before evaluate".into(),
+                                )),
+                            }
+                        }
+                    }
+                };
+                REPLY_STACK.with(|s| {
+                    s.borrow_mut().pop();
+                });
+                let _ = reply.send(VmReply::Done(outcome));
+            }
+            Request::ModuleNamespace { module_id, reply } => {
+                let outcome = {
+                    v8::scope!(let scope, &mut isolate);
+                    let context = v8::Local::new(scope, &main_context);
+                    let scope = &mut v8::ContextScope::new(scope, context);
+                    match MODULES.with(|m| m.borrow().by_id.get(&module_id).map(|(g, _)| g.clone())) {
+                        None => Err(VmError::Runtime("unknown module".into())),
+                        Some(g) => {
+                            let module = v8::Local::new(scope, &g);
+                            // get_module_namespace CHECK-aborts unless the module
+                            // is at least Instantiated.
+                            match module.get_status() {
+                                v8::ModuleStatus::Uninstantiated
+                                | v8::ModuleStatus::Instantiating => Err(VmError::Runtime(
+                                    "module must be instantiated before namespace".into(),
+                                )),
+                                _ => {
+                                    let ns = module.get_module_namespace();
+                                    Ok(js_to_jsval(scope, ns))
+                                }
+                            }
+                        }
+                    }
+                };
+                let _ = reply.send(VmReply::Done(outcome));
+            }
+            Request::DisposeModule { module_id, reply } => {
+                MODULES.with(|m| {
+                    let mut m = m.borrow_mut();
+                    m.by_id.remove(&module_id);
+                    for bucket in m.by_hash.values_mut() {
+                        bucket.retain(|(_, id)| *id != module_id);
+                    }
+                });
+                let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
             }
             Request::Dispose => break,
         }
@@ -1237,6 +1519,14 @@ struct Realm {
 #[magnus::wrap(class = "RustyRacer::Snapshot")]
 struct Snapshot {
     blob: RefCell<Vec<u8>>,
+}
+
+// Context#compile_module result: a handle to a V8 module (by id, like Realm).
+#[magnus::wrap(class = "RustyRacer::Module")]
+struct JsModule {
+    core: Arc<Core>,
+    module_id: i32,
+    disposed: AtomicBool,
 }
 
 // Set true once V8 is initialized; Platform.set_flags! refuses after that
@@ -1461,6 +1751,7 @@ impl Core {
         ruby: &Ruby,
         reply_rx: Receiver<VmReply>,
         loader: Option<(Proc, Proc)>,
+        module_resolve: Option<Proc>,
     ) -> Result<Value, Error> {
         loop {
             let message = without_gvl(|| reply_rx.recv());
@@ -1492,6 +1783,31 @@ impl Core {
                         None => vec![None; edges.len()],
                     };
                     let _ = answer.send(Answer::ResolveResult(r));
+                }
+                Ok(VmReply::ResolveModule {
+                    specifier,
+                    referrer_url,
+                    answer,
+                }) => {
+                    match &module_resolve {
+                        Some(resolve) => {
+                            match resolve_module_via_ruby(self, *resolve, &specifier, &referrer_url) {
+                                Ok(id) => {
+                                    let _ = answer.send(Answer::ModuleId(id));
+                                }
+                                // Unblock the V8 thread (import fails to resolve),
+                                // then propagate the resolver's real error instead
+                                // of masking it as "module not found".
+                                Err(e) => {
+                                    let _ = answer.send(Answer::ModuleId(None));
+                                    return Err(e);
+                                }
+                            }
+                        }
+                        None => {
+                            let _ = answer.send(Answer::ModuleId(None));
+                        }
+                    }
                 }
                 Err(_) => {
                     return Err(Error::new(
@@ -1561,7 +1877,7 @@ impl Core {
                     reply: reply_tx,
                 })
                 .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread is gone"))?;
-            return self.pump(ruby, reply_rx, None);
+            return self.pump(ruby, reply_rx, None, None);
         }
 
         let (reply_tx, reply_rx) = channel::<VmReply>();
@@ -1576,7 +1892,7 @@ impl Core {
                 reply: reply_tx,
             },
         )?;
-        self.pump(ruby, reply_rx, None)
+        self.pump(ruby, reply_rx, None, None)
     }
 
     fn drain_microtasks(&self, ruby: &Ruby) -> Result<Value, Error> {
@@ -1588,7 +1904,7 @@ impl Core {
                 reply: reply_tx,
             },
         )?;
-        self.pump(ruby, reply_rx, None)
+        self.pump(ruby, reply_rx, None, None)
     }
 
     fn eval_t(
@@ -1612,7 +1928,7 @@ impl Core {
                     reply: reply_tx,
                 })
                 .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread is gone"))?;
-            return self.pump(ruby, reply_rx, None);
+            return self.pump(ruby, reply_rx, None, None);
         }
 
         let (reply_tx, reply_rx) = channel::<VmReply>();
@@ -1626,7 +1942,7 @@ impl Core {
                 reply: reply_tx,
             },
         )?;
-        self.pump(ruby, reply_rx, None)
+        self.pump(ruby, reply_rx, None, None)
     }
 
     fn attach(&self, ruby: &Ruby, realm_id: i32, name: String, proc: Proc) -> Result<Value, Error> {
@@ -1645,27 +1961,27 @@ impl Core {
                 reply: reply_tx,
             },
         )?;
-        self.pump(ruby, reply_rx, None)
+        self.pump(ruby, reply_rx, None, None)
     }
 
     fn reset_realm(&self, ruby: &Ruby) -> Result<Value, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
         self.send(ruby, Request::Reset { reply: reply_tx })?;
-        self.pump(ruby, reply_rx, None)
+        self.pump(ruby, reply_rx, None, None)
     }
 
     // Build a new realm; returns its id (the V8 thread replies with an Int).
     fn create_realm(&self, ruby: &Ruby) -> Result<i32, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
         self.send(ruby, Request::CreateRealm { reply: reply_tx })?;
-        let id = self.pump(ruby, reply_rx, None)?;
+        let id = self.pump(ruby, reply_rx, None, None)?;
         i32::try_convert(id)
     }
 
     fn dispose_realm(&self, ruby: &Ruby, realm_id: i32) -> Result<(), Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
         self.send(ruby, Request::DisposeRealm { realm_id, reply: reply_tx })?;
-        self.pump(ruby, reply_rx, None).map(|_| ())
+        self.pump(ruby, reply_rx, None, None).map(|_| ())
     }
 
     // Positional primitive behind the keyword-arg Ruby wrapper in
@@ -1686,7 +2002,50 @@ impl Core {
                 reply: reply_tx,
             },
         )?;
-        self.pump(ruby, reply_rx, Some((resolve, fetch_batch)))
+        self.pump(ruby, reply_rx, Some((resolve, fetch_batch)), None)
+    }
+
+    // Thin ESM primitives. compile_module returns the new module's id.
+    fn compile_module(&self, ruby: &Ruby, source: String, filename: String) -> Result<i32, Error> {
+        let (reply_tx, reply_rx) = channel::<VmReply>();
+        self.send(
+            ruby,
+            Request::CompileModule {
+                source,
+                filename,
+                reply: reply_tx,
+            },
+        )?;
+        i32::try_convert(self.pump(ruby, reply_rx, None, None)?)
+    }
+
+    // instantiate carries the resolve block to pump so resolve_imported can ask
+    // it per import edge. The block must return an *already-compiled* Module (or
+    // nil): the V8 thread is parked inside InstantiateModule awaiting the answer,
+    // so compiling/instantiating lazily from within the block would deadlock the
+    // main request queue. csim pre-compiles and the block just looks up.
+    fn instantiate_module(&self, ruby: &Ruby, module_id: i32, resolve: Proc) -> Result<Value, Error> {
+        let (reply_tx, reply_rx) = channel::<VmReply>();
+        self.send(ruby, Request::InstantiateModule { module_id, reply: reply_tx })?;
+        self.pump(ruby, reply_rx, None, Some(resolve))
+    }
+
+    fn evaluate_module(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
+        let (reply_tx, reply_rx) = channel::<VmReply>();
+        self.send(ruby, Request::EvaluateModule { module_id, reply: reply_tx })?;
+        self.pump(ruby, reply_rx, None, None)
+    }
+
+    fn module_namespace(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
+        let (reply_tx, reply_rx) = channel::<VmReply>();
+        self.send(ruby, Request::ModuleNamespace { module_id, reply: reply_tx })?;
+        self.pump(ruby, reply_rx, None, None)
+    }
+
+    fn dispose_module(&self, ruby: &Ruby, module_id: i32) -> Result<(), Error> {
+        let (reply_tx, reply_rx) = channel::<VmReply>();
+        self.send(ruby, Request::DisposeModule { module_id, reply: reply_tx })?;
+        self.pump(ruby, reply_rx, None, None).map(|_| ())
     }
 
     // Terminate whatever is running. IsolateHandle is Send + refcounted —
@@ -1759,6 +2118,19 @@ impl Context {
         fetch_batch: Proc,
     ) -> Result<Value, Error> {
         rb_self.core.load_module_graph(ruby, entry_url, resolve, fetch_batch)
+    }
+    fn compile_module(
+        ruby: &Ruby,
+        rb_self: &Self,
+        source: String,
+        filename: String,
+    ) -> Result<JsModule, Error> {
+        let id = rb_self.core.compile_module(ruby, source, filename)?;
+        Ok(JsModule {
+            core: rb_self.core.clone(),
+            module_id: id,
+            disposed: AtomicBool::new(false),
+        })
     }
     fn stop(&self) {
         self.core.stop();
@@ -1853,6 +2225,39 @@ impl Snapshot {
 
     fn size(&self) -> usize {
         self.blob.borrow().len()
+    }
+}
+
+impl JsModule {
+    fn check_live(&self, ruby: &Ruby) -> Result<(), Error> {
+        if self.disposed.load(Ordering::SeqCst) {
+            return Err(Error::new(ruby.exception_runtime_error(), "disposed module"));
+        }
+        Ok(())
+    }
+    // _instantiate(resolver): resolver is the Ruby block (passed as a Proc by
+    // the lib wrapper). resolver.(specifier, referrer_url) must return a Module.
+    fn instantiate(ruby: &Ruby, rb_self: &Self, resolver: Proc) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        rb_self.core.instantiate_module(ruby, rb_self.module_id, resolver)
+    }
+    fn evaluate(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        rb_self.core.evaluate_module(ruby, rb_self.module_id)
+    }
+    fn namespace(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        rb_self.core.module_namespace(ruby, rb_self.module_id)
+    }
+    fn dispose(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
+        if rb_self.disposed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let _ = rb_self.core.dispose_module(ruby, rb_self.module_id);
+        Ok(())
+    }
+    fn disposed(&self) -> bool {
+        self.disposed.load(Ordering::SeqCst)
     }
 }
 
@@ -1951,6 +2356,40 @@ fn marshal_urls(ret: Value, n: usize) -> Vec<Option<String>> {
             }
         })
         .collect()
+}
+
+// instantiate's resolve block returns a RustyRacer::Module (or nil for a
+// genuinely-unresolved import); pull its module_id so the V8 thread can look up
+// the V8 module. Verifies the module belongs to THIS Context (core identity),
+// since module ids are per-V8-thread and a foreign id would alias a local one.
+// A raised block propagates as Err (not silently swallowed into "not found").
+fn resolve_module_via_ruby(
+    core: &Core,
+    resolve: Proc,
+    specifier: &str,
+    referrer_url: &str,
+) -> Result<Option<i32>, Error> {
+    let ruby = Ruby::get().unwrap();
+    let ret: Value = resolve.call((specifier, referrer_url))?;
+    if ret.is_nil() {
+        return Ok(None); // legitimately unresolved
+    }
+    let obj = magnus::typed_data::Obj::<JsModule>::try_convert(ret).map_err(|_| {
+        Error::new(
+            ruby.exception_type_error(),
+            "module resolver must return a RustyRacer::Module or nil",
+        )
+    })?;
+    if !std::ptr::eq(Arc::as_ptr(&obj.core), core as *const Core) {
+        return Err(Error::new(
+            ruby.exception_runtime_error(),
+            "module resolver returned a Module from a different Context",
+        ));
+    }
+    if obj.disposed.load(Ordering::SeqCst) {
+        return Ok(None);
+    }
+    Ok(Some(obj.module_id))
 }
 
 fn jsval_to_ruby(ruby: &Ruby, val: &JsVal) -> Result<Value, Error> {
@@ -2203,6 +2642,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("create_realm", method!(Context::create_realm, 0))?;
     // keyword-arg wrapper Context#load_module_graph lives in lib/rusty_racer.rb
     class.define_method("_load_module_graph", method!(Context::load_module_graph, 3))?;
+    // keyword-arg wrapper Context#compile_module(source, filename:) in lib.
+    class.define_method("_compile_module", method!(Context::compile_module, 2))?;
     class.define_method("stop", method!(Context::stop, 0))?;
     class.define_method("dispose", method!(Context::dispose, 0))?;
 
@@ -2227,6 +2668,14 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     snapshot.define_method("warmup!", method!(Snapshot::warmup, 1))?;
     snapshot.define_method("dump", method!(Snapshot::dump, 0))?;
     snapshot.define_method("size", method!(Snapshot::size, 0))?;
+
+    // Thin ES-module handle: Context#compile_module -> instantiate/evaluate.
+    let jsmodule = module.define_class("Module", ruby.class_object())?;
+    jsmodule.define_method("_instantiate", method!(JsModule::instantiate, 1))?;
+    jsmodule.define_method("evaluate", method!(JsModule::evaluate, 0))?;
+    jsmodule.define_method("namespace", method!(JsModule::namespace, 0))?;
+    jsmodule.define_method("dispose", method!(JsModule::dispose, 0))?;
+    jsmodule.define_method("disposed?", method!(JsModule::disposed, 0))?;
 
     let platform = module.define_module("Platform")?;
     platform.define_singleton_method("set_flags!", function!(platform_set_flags, -1))?;
