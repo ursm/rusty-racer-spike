@@ -194,12 +194,33 @@ enum Request {
         module_id: i32,
         reply: Sender<VmReply>,
     },
+    // Classic <script> primitives (V8 ScriptCompiler::CompileUnboundScript): an
+    // unbound script, compiled in a context, runnable repeatedly, with the same
+    // bytecode-cache options as modules. Addressed by id like a module.
+    CompileScript {
+        context_id: i32,
+        source: String,
+        filename: String,
+        cached_data: Option<Vec<u8>>,
+        produce_cache: bool,
+        reply: Sender<VmReply>,
+    },
+    // Bind the script to its context and run it; returns the completion value.
+    RunScript {
+        script_id: i32,
+        timeout_ms: u64,
+        reply: Sender<VmReply>,
+    },
+    DisposeScript {
+        script_id: i32,
+        reply: Sender<VmReply>,
+    },
     Dispose,
 }
 
 // compile_module result: the module's id plus any produced bytecode cache and
 // whether a supplied cache was rejected.
-struct CompiledModule {
+struct Compiled {
     id: i32,
     cached_data: Option<Vec<u8>>,
     cache_rejected: bool,
@@ -208,8 +229,9 @@ struct CompiledModule {
 // V8 thread -> the Ruby thread that is waiting on this request
 enum VmReply {
     Done(Result<JsVal, VmError>),
-    // compile_module's richer reply (id + produced cache + cache_rejected).
-    ModuleCompiled(Result<CompiledModule, VmError>),
+    // compile_module / compile's richer reply (id + produced cache + rejected).
+    ModuleCompiled(Result<Compiled, VmError>),
+    ScriptCompiled(Result<Compiled, VmError>),
     // JS called host fn |id|; run the proc and send the answer back.
     Callback {
         host_fn_id: usize,
@@ -831,8 +853,18 @@ struct ModuleReg {
     next_id: i32,
 }
 
+// Classic compiled scripts: id -> (unbound script, owning context id). An
+// UnboundScript is context-independent, but we run it in the context it was
+// compiled in (and reset/dispose of that context drops it).
+#[derive(Default)]
+struct ScriptReg {
+    by_id: HashMap<i32, (v8::Global<v8::UnboundScript>, i32)>,
+    next_id: i32,
+}
+
 thread_local! {
     static MODULES: RefCell<ModuleReg> = RefCell::new(ModuleReg::default());
+    static SCRIPTS: RefCell<ScriptReg> = RefCell::new(ScriptReg::default());
     // The context id the V8 thread is currently executing JS in. Set by the
     // handlers that enter a context (eval/call/instantiate/evaluate) so the
     // import callbacks can reject a module from a *different* context — V8
@@ -840,9 +872,9 @@ thread_local! {
     static CURRENT_CTX: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
 }
 
-// Drop every module compiled in `context_id` from the registry (its v8::Context
-// is going away — on reset or dispose — so the module handles are now dead).
-fn drop_context_modules(context_id: i32) {
+// Drop every module AND script compiled in `context_id` (its v8::Context is
+// going away — on reset or dispose — so those handles are now dead).
+fn drop_context_artifacts(context_id: i32) {
     MODULES.with(|m| {
         let mut m = m.borrow_mut();
         let dead: Vec<i32> = m
@@ -858,6 +890,19 @@ fn drop_context_modules(context_id: i32) {
             }
         }
     });
+    SCRIPTS.with(|s| {
+        s.borrow_mut().by_id.retain(|_, (_, cid)| *cid != context_id);
+    });
+}
+
+// A script's (unbound handle, owning context id), for running it in that context.
+fn script_handle(script_id: i32) -> Option<(v8::Global<v8::UnboundScript>, i32)> {
+    SCRIPTS.with(|s| {
+        s.borrow()
+            .by_id
+            .get(&script_id)
+            .map(|(g, cid)| (g.clone(), *cid))
+    })
 }
 
 // V8 calls this per import edge during InstantiateModule. Maps the referrer to
@@ -1192,7 +1237,7 @@ fn v8_thread_main(
                     contexts.insert(context_id, fresh);
                 }
                 // Drop modules bound to this context — their realm just changed.
-                drop_context_modules(context_id);
+                drop_context_artifacts(context_id);
                 let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
             }
             Request::CreateContext { reply } => {
@@ -1215,7 +1260,7 @@ fn v8_thread_main(
                 contexts.remove(&context_id);
                 // Reclaim the modules compiled in it (else they leak until
                 // isolate teardown).
-                drop_context_modules(context_id);
+                drop_context_artifacts(context_id);
                 let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
             }
             Request::CompileModule {
@@ -1286,7 +1331,7 @@ fn v8_thread_main(
                                         m.by_hash.entry(hash).or_default().push((g, id));
                                         id
                                     });
-                                    Ok(CompiledModule {
+                                    Ok(Compiled {
                                         id,
                                         cached_data: produced,
                                         cache_rejected,
@@ -1452,6 +1497,139 @@ fn v8_thread_main(
                 });
                 let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
             }
+            Request::CompileScript {
+                context_id,
+                source,
+                filename,
+                cached_data,
+                produce_cache,
+                reply,
+            } => {
+                let outcome = match context_for(&main_context, &contexts, context_id) {
+                    None => Err(VmError::Runtime("context disposed or unknown".into())),
+                    Some(cx) => {
+                        v8::scope!(let scope, &mut isolate);
+                        let context = v8::Local::new(scope, &cx);
+                        let scope = &mut v8::ContextScope::new(scope, context);
+                        v8::tc_scope!(let tc, scope);
+                        match v8::String::new(tc, &source) {
+                            None => Err(VmError::Runtime("script source too large".into())),
+                            Some(code) => {
+                                let origin = script_origin(tc, &filename);
+                                let (mut src, opts) = match &cached_data {
+                                    Some(bytes) => (
+                                        v8::script_compiler::Source::new_with_cached_data(
+                                            code,
+                                            Some(&origin),
+                                            v8::script_compiler::CachedData::new(bytes),
+                                        ),
+                                        v8::script_compiler::CompileOptions::ConsumeCodeCache,
+                                    ),
+                                    None => (
+                                        v8::script_compiler::Source::new(code, Some(&origin)),
+                                        v8::script_compiler::CompileOptions::NoCompileOptions,
+                                    ),
+                                };
+                                match v8::script_compiler::compile_unbound_script(
+                                    tc,
+                                    &mut src,
+                                    opts,
+                                    v8::script_compiler::NoCacheReason::NoReason,
+                                ) {
+                                    Some(unbound) => {
+                                        let cache_rejected = cached_data.is_some()
+                                            && src.get_cached_data().is_some_and(|c| c.rejected());
+                                        let produced = if produce_cache {
+                                            unbound.create_code_cache().map(|c| c.to_vec())
+                                        } else {
+                                            None
+                                        };
+                                        let id = SCRIPTS.with(|s| {
+                                            let mut s = s.borrow_mut();
+                                            let id = s.next_id;
+                                            s.next_id += 1;
+                                            let g = v8::Global::new(tc, unbound);
+                                            s.by_id.insert(id, (g, context_id));
+                                            id
+                                        });
+                                        Ok(Compiled {
+                                            id,
+                                            cached_data: produced,
+                                            cache_rejected,
+                                        })
+                                    }
+                                    None if tc.has_terminated() => Err(VmError::Terminated),
+                                    // Compile failure = a parse error (with location).
+                                    None => {
+                                        let msg = tc
+                                            .exception()
+                                            .map(|e| e.to_rust_string_lossy(tc))
+                                            .unwrap_or_else(|| "script parse error".to_string());
+                                        let message = tc.message();
+                                        let res = message
+                                            .and_then(|m| m.get_script_resource_name(tc))
+                                            .filter(|v| v.is_string())
+                                            .map(|v| v.to_rust_string_lossy(tc))
+                                            .unwrap_or_else(|| filename.clone());
+                                        let loc = match message.and_then(|m| m.get_line_number(tc)) {
+                                            Some(line) => format!(" at {res}:{line}"),
+                                            None => format!(" at {res}"),
+                                        };
+                                        Err(VmError::Parse(format!("{msg}{loc}")))
+                                    }
+                                }
+                            }
+                        }
+                    }
+                };
+                let _ = reply.send(VmReply::ScriptCompiled(outcome));
+            }
+            Request::RunScript {
+                script_id,
+                timeout_ms,
+                reply,
+            } => {
+                // REPLY_STACK so a host fn the script calls routes back, like Eval.
+                REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
+                let (cancel_tx, watchdog) = start_watchdog(isolate.thread_safe_handle(), timeout_ms);
+                let outcome = match script_handle(script_id) {
+                    None => Err(VmError::Runtime("unknown script".into())),
+                    Some((g, cid)) => match context_for(&main_context, &contexts, cid) {
+                        None => Err(VmError::Runtime("script's context is gone".into())),
+                        Some(cx) => {
+                            CURRENT_CTX.with(|c| c.set(cid));
+                            v8::scope!(let scope, &mut isolate);
+                            let context = v8::Local::new(scope, &cx);
+                            let scope = &mut v8::ContextScope::new(scope, context);
+                            let unbound = v8::Local::new(scope, &g);
+                            let script = unbound.bind_to_current_context(scope);
+                            v8::tc_scope!(let tc, scope);
+                            match script.run(tc) {
+                                Some(value) => Ok(js_to_jsval(tc, value)),
+                                None if tc.has_terminated() => Err(VmError::Terminated),
+                                None => {
+                                    let exc = tc.exception();
+                                    let stack = tc.stack_trace();
+                                    Err(capture_js_error(tc, exc, stack))
+                                }
+                            }
+                        }
+                    },
+                };
+                if finish_watchdog(cancel_tx, watchdog) {
+                    isolate.cancel_terminate_execution();
+                }
+                REPLY_STACK.with(|s| {
+                    s.borrow_mut().pop();
+                });
+                let _ = reply.send(VmReply::Done(outcome));
+            }
+            Request::DisposeScript { script_id, reply } => {
+                SCRIPTS.with(|s| {
+                    s.borrow_mut().by_id.remove(&script_id);
+                });
+                let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
+            }
             Request::Dispose => break,
         }
     }
@@ -1548,7 +1726,7 @@ struct Snapshot {
     blob: RefCell<Vec<u8>>,
 }
 
-// Context#compile_module result: a handle to a V8 module (by id, like Realm).
+// Context#compile_module result: a handle to a V8 module (by id).
 #[magnus::wrap(class = "RustyRacer::Module")]
 struct JsModule {
     core: Arc<Core>,
@@ -1556,6 +1734,16 @@ struct JsModule {
     disposed: AtomicBool,
     // Bytecode cache produced at compile (produce_cache:), and whether a
     // supplied cache was rejected — exposed as #cached_data / #cache_rejected?.
+    cached_data: Option<Vec<u8>>,
+    cache_rejected: bool,
+}
+
+// Context#compile result: a handle to a classic compiled script (by id).
+#[magnus::wrap(class = "RustyRacer::Script")]
+struct Script {
+    core: Arc<Core>,
+    script_id: i32,
+    disposed: AtomicBool,
     cached_data: Option<Vec<u8>>,
     cache_rejected: bool,
 }
@@ -1575,14 +1763,19 @@ fn init_v8() {
     });
 }
 
+// RustyRacer.cached_data_version_tag -> Integer (V8's CachedData version tag).
+fn cached_data_version_tag() -> u32 {
+    v8::script_compiler::cached_data_version_tag()
+}
+
 // RustyRacer::Platform.set_flags!(*flags, **kwargs): symbol/string -> --flag,
-// hash entry -> --key=value. Must run before the first Context.new.
+// hash entry -> --key=value. Must run before the first Isolate.new.
 fn platform_set_flags(args: &[Value]) -> Result<(), Error> {
     let ruby = Ruby::get().unwrap();
     if V8_INITED.load(Ordering::SeqCst) {
         return Err(Error::new(
             err_class(&ruby, "PlatformAlreadyInitialized"),
-            "the V8 platform is already initialized; set flags before the first Context.new",
+            "the V8 platform is already initialized; set flags before the first Isolate.new",
         ));
     }
     let mut flags = String::new();
@@ -1590,8 +1783,13 @@ fn platform_set_flags(args: &[Value]) -> Result<(), Error> {
         if let Ok(h) = RHash::try_convert(*a) {
             h.foreach(|k: Value, v: Value| {
                 let ks = k.funcall::<_, _, String>("to_s", ())?;
-                let vs = v.funcall::<_, _, String>("to_s", ())?;
-                flags.push_str(&format!(" --{ks}={vs}"));
+                // A nil value means a bare boolean flag (--key), not --key=.
+                if v.is_nil() {
+                    flags.push_str(&format!(" --{ks}"));
+                } else {
+                    let vs = v.funcall::<_, _, String>("to_s", ())?;
+                    flags.push_str(&format!(" --{ks}={vs}"));
+                }
                 Ok(magnus::r_hash::ForEach::Continue)
             })?;
         } else {
@@ -1789,8 +1987,8 @@ impl Core {
             match message {
                 Ok(VmReply::Done(Ok(val))) => return jsval_to_ruby(ruby, &val),
                 Ok(VmReply::Done(Err(e))) => return Err(vm_err(ruby, e)),
-                // compile_module receives this directly, never via pump.
-                Ok(VmReply::ModuleCompiled(_)) => {
+                // compile_module / compile receive these directly, never via pump.
+                Ok(VmReply::ModuleCompiled(_)) | Ok(VmReply::ScriptCompiled(_)) => {
                     return Err(Error::new(
                         ruby.exception_runtime_error(),
                         "unexpected compile reply",
@@ -2046,7 +2244,7 @@ impl Core {
         filename: String,
         cached_data: Option<Vec<u8>>,
         produce_cache: bool,
-    ) -> Result<CompiledModule, Error> {
+    ) -> Result<Compiled, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
         self.send(
             ruby,
@@ -2097,6 +2295,57 @@ impl Core {
     fn dispose_module(&self, ruby: &Ruby, module_id: i32) -> Result<(), Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
         self.send(ruby, Request::DisposeModule { module_id, reply: reply_tx })?;
+        self.pump(ruby, reply_rx, None).map(|_| ())
+    }
+
+    // Classic script: compile (no host callbacks -> direct recv), run, dispose.
+    fn compile_script(
+        &self,
+        ruby: &Ruby,
+        context_id: i32,
+        source: String,
+        filename: String,
+        cached_data: Option<Vec<u8>>,
+        produce_cache: bool,
+    ) -> Result<Compiled, Error> {
+        let (reply_tx, reply_rx) = channel::<VmReply>();
+        self.send(
+            ruby,
+            Request::CompileScript {
+                context_id,
+                source,
+                filename,
+                cached_data,
+                produce_cache,
+                reply: reply_tx,
+            },
+        )?;
+        match without_gvl(|| reply_rx.recv()) {
+            Ok(VmReply::ScriptCompiled(Ok(cs))) => Ok(cs),
+            Ok(VmReply::ScriptCompiled(Err(e))) => Err(vm_err(ruby, e)),
+            _ => Err(Error::new(
+                ruby.exception_runtime_error(),
+                "V8 thread went away mid-compile",
+            )),
+        }
+    }
+
+    fn run_script(&self, ruby: &Ruby, script_id: i32) -> Result<Value, Error> {
+        let (reply_tx, reply_rx) = channel::<VmReply>();
+        self.send(
+            ruby,
+            Request::RunScript {
+                script_id,
+                timeout_ms: self.default_timeout_ms,
+                reply: reply_tx,
+            },
+        )?;
+        self.pump(ruby, reply_rx, None)
+    }
+
+    fn dispose_script(&self, ruby: &Ruby, script_id: i32) -> Result<(), Error> {
+        let (reply_tx, reply_rx) = channel::<VmReply>();
+        self.send(ruby, Request::DisposeScript { script_id, reply: reply_tx })?;
         self.pump(ruby, reply_rx, None).map(|_| ())
     }
 
@@ -2171,6 +2420,11 @@ impl Isolate {
 
 // Context = a v8::Context (realm): eval/call/attach/compile_module run here.
 impl Context {
+    // Stable id within the isolate (0 = the default context). Lets an embedder
+    // track which realm a Context is.
+    fn id(&self) -> i32 {
+        self.id
+    }
     fn check_live(&self, ruby: &Ruby) -> Result<(), Error> {
         // id 0's lifetime is the isolate's; extras also track their own dispose.
         if self.disposed.load(Ordering::SeqCst) || self.core.is_disposed() {
@@ -2220,27 +2474,7 @@ impl Context {
         produce_cache: bool,
     ) -> Result<JsModule, Error> {
         rb_self.check_live(ruby)?;
-        // A bytecode cache is raw bytes; refuse a non-binary string so a cache
-        // file read without 'rb' (silently transcoded) fails loudly instead of
-        // being consumed as garbage and rejected with no signal.
-        let cache_in = match cached_data {
-            Some(s) => {
-                let enc: String = s
-                    .funcall::<_, _, Value>("encoding", ())?
-                    .funcall("to_s", ())?;
-                if enc != "ASCII-8BIT" {
-                    let cls = ruby
-                        .class_object()
-                        .const_get::<_, ExceptionClass>("EncodingError")?;
-                    return Err(Error::new(
-                        cls,
-                        format!("cached_data must be ASCII-8BIT (binary), got {enc}"),
-                    ));
-                }
-                Some(unsafe { s.as_slice() }.to_vec())
-            }
-            None => None,
-        };
+        let cache_in = binary_bytes(ruby, cached_data)?;
         let cm = rb_self
             .core
             .compile_module(ruby, rb_self.id, source, filename, cache_in, produce_cache)?;
@@ -2250,6 +2484,29 @@ impl Context {
             disposed: AtomicBool::new(false),
             cached_data: cm.cached_data,
             cache_rejected: cm.cache_rejected,
+        })
+    }
+    // compile(source, filename:, cached_data:, produce_cache:) -> Script: a
+    // classic <script>. Same cache semantics as compile_module.
+    fn compile(
+        ruby: &Ruby,
+        rb_self: &Self,
+        source: String,
+        filename: String,
+        cached_data: Option<magnus::RString>,
+        produce_cache: bool,
+    ) -> Result<Script, Error> {
+        rb_self.check_live(ruby)?;
+        let cache_in = binary_bytes(ruby, cached_data)?;
+        let cs = rb_self
+            .core
+            .compile_script(ruby, rb_self.id, source, filename, cache_in, produce_cache)?;
+        Ok(Script {
+            core: rb_self.core.clone(),
+            script_id: cs.id,
+            disposed: AtomicBool::new(false),
+            cached_data: cs.cached_data,
+            cache_rejected: cs.cache_rejected,
         })
     }
     fn dispose(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
@@ -2355,6 +2612,64 @@ impl JsModule {
     }
     fn disposed(&self) -> bool {
         self.disposed.load(Ordering::SeqCst)
+    }
+}
+
+impl Script {
+    fn check_live(&self, ruby: &Ruby) -> Result<(), Error> {
+        if self.disposed.load(Ordering::SeqCst) {
+            return Err(Error::new(ruby.exception_runtime_error(), "disposed script"));
+        }
+        Ok(())
+    }
+    // Run the (already-compiled) script and return its completion value. A
+    // thrown exception is a RuntimeError; a timeout/stop a ScriptTerminatedError.
+    fn run(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        rb_self.core.run_script(ruby, rb_self.script_id)
+    }
+    fn cached_data(ruby: &Ruby, rb_self: &Self) -> Value {
+        match &rb_self.cached_data {
+            Some(bytes) => ruby.str_from_slice(bytes).as_value(),
+            None => ruby.qnil().as_value(),
+        }
+    }
+    fn cache_rejected(&self) -> bool {
+        self.cache_rejected
+    }
+    fn dispose(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
+        if rb_self.disposed.swap(true, Ordering::SeqCst) {
+            return Ok(());
+        }
+        let _ = rb_self.core.dispose_script(ruby, rb_self.script_id);
+        Ok(())
+    }
+    fn disposed(&self) -> bool {
+        self.disposed.load(Ordering::SeqCst)
+    }
+}
+
+// Read a Ruby cached_data arg as raw bytes, refusing a non-binary string so a
+// cache file read without 'rb' (silently transcoded) fails loudly rather than
+// being consumed as garbage and rejected with no signal.
+fn binary_bytes(ruby: &Ruby, cached_data: Option<magnus::RString>) -> Result<Option<Vec<u8>>, Error> {
+    match cached_data {
+        None => Ok(None),
+        Some(s) => {
+            let enc: String = s
+                .funcall::<_, _, Value>("encoding", ())?
+                .funcall("to_s", ())?;
+            if enc != "ASCII-8BIT" {
+                let cls = ruby
+                    .class_object()
+                    .const_get::<_, ExceptionClass>("EncodingError")?;
+                return Err(Error::new(
+                    cls,
+                    format!("cached_data must be ASCII-8BIT (binary), got {enc}"),
+                ));
+            }
+            Ok(Some(unsafe { s.as_slice() }.to_vec()))
+        }
     }
 }
 
@@ -2682,10 +2997,20 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     context.define_method("call_void", method!(Context::call_void, -1))?;
     context.define_method("attach", method!(Context::attach, 2))?;
     context.define_method("reset", method!(Context::reset, 0))?;
-    // keyword-arg wrapper Context#compile_module(source, filename:, ...) in lib.
+    context.define_method("id", method!(Context::id, 0))?;
+    // keyword-arg wrappers Context#compile_module / #compile (source, ...) in lib.
     context.define_method("_compile_module", method!(Context::compile_module, 4))?;
+    context.define_method("_compile", method!(Context::compile, 4))?;
     context.define_method("dispose", method!(Context::dispose, 0))?;
     context.define_method("disposed?", method!(Context::disposed, 0))?;
+
+    // Classic compiled script: Context#compile -> #run / #cached_data.
+    let script = module.define_class("Script", ruby.class_object())?;
+    script.define_method("run", method!(Script::run, 0))?;
+    script.define_method("cached_data", method!(Script::cached_data, 0))?;
+    script.define_method("cache_rejected?", method!(Script::cache_rejected, 0))?;
+    script.define_method("dispose", method!(Script::dispose, 0))?;
+    script.define_method("disposed?", method!(Script::disposed, 0))?;
 
     // V8 startup blob: Snapshot.new(code) -> Isolate.new(snapshot:).
     let snapshot = module.define_class("Snapshot", ruby.class_object())?;
@@ -2707,5 +3032,12 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
 
     let platform = module.define_module("Platform")?;
     platform.define_singleton_method("set_flags!", function!(platform_set_flags, -1))?;
+
+    // Version tag for keying cross-process bytecode caches; changes when the V8
+    // version/flags change so a stale cache can be discarded (avoids SEGV).
+    module.define_singleton_method(
+        "cached_data_version_tag",
+        function!(cached_data_version_tag, 0),
+    )?;
     Ok(())
 }

@@ -12,6 +12,71 @@ class RustyRacerTest < Minitest::Test
     @ctx = @iso.context
   end
 
+  def test_classic_script_compile_run
+    s = @ctx.compile("globalThis.X = 40; X + 2", filename: "/inline.js")
+    assert_equal 42, s.run
+    assert_equal 40, @ctx.eval("globalThis.X")
+    assert_equal 42, s.run # re-runnable
+  end
+
+  def test_classic_script_top_level_lexical_visible_to_later_eval
+    # const/let/class at script top level must persist for later evals/scripts
+    # (shared global lexical environment) — load-bearing for csim.
+    @ctx.compile("const SHARED = 7;").run
+    assert_equal 7, @ctx.eval("SHARED")
+  end
+
+  def test_classic_script_parse_error_is_parse_error
+    assert_raises(RustyRacer::ParseError) { @ctx.compile("function (", filename: "/bad.js") }
+  end
+
+  def test_classic_script_runtime_error_is_runtime_error
+    s = @ctx.compile('throw new Error("scriptboom")', filename: "/t.js")
+    e = assert_raises(RustyRacer::RuntimeError) { s.run }
+    assert_includes e.message, "scriptboom"
+  end
+
+  def test_classic_script_bytecode_cache_round_trip
+    src = "(() => 1 + 2)()"
+    blob = @ctx.compile(src, filename: "/c.js", produce_cache: true).cached_data
+    refute_nil blob
+    assert_equal Encoding::ASCII_8BIT, blob.encoding
+
+    iso2 = RustyRacer::Isolate.new
+    s = iso2.context.compile(src, filename: "/c.js", cached_data: blob)
+    assert_equal false, s.cache_rejected?
+    assert_equal 3, s.run
+  end
+
+  def test_classic_script_run_honours_timeout
+    iso = RustyRacer::Isolate.new(timeout_ms: 50)
+    s = iso.context.compile("for(;;){}", filename: "/spin.js")
+    assert_raises(RustyRacer::ScriptTerminatedError) { s.run }
+    assert_equal 2, iso.context.eval("1 + 1") # isolate still usable
+  end
+
+  def test_classic_script_dispose
+    s = @ctx.compile("1")
+    assert_equal false, s.disposed?
+    s.dispose
+    assert_equal true, s.disposed?
+    assert_raises(::RuntimeError) { s.run }
+  end
+
+  def test_cached_data_version_tag
+    tag = RustyRacer.cached_data_version_tag
+    assert_kind_of Integer, tag
+    assert_operator tag, :!=, 0
+  end
+
+  def test_context_has_stable_id
+    assert_equal 0, @ctx.id # the default context
+    a = @iso.create_context
+    b = @iso.create_context
+    assert_operator a.id, :>, 0
+    refute_equal a.id, b.id
+  end
+
   def test_eval_roundtrip
     assert_equal 2, @ctx.eval("1 + 1")
     assert_equal 3.0, @ctx.eval("1.5 * 2")

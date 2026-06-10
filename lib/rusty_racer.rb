@@ -44,6 +44,12 @@ module RustyRacer
       _eval(source, timeout_ms, filename)
     end
 
+    # Compile a classic <script>; returns a RustyRacer::Script to #run.
+    # cached_data:/produce_cache: are the bytecode cache (see #compile_module).
+    def compile(source, filename: '<compile>', cached_data: nil, produce_cache: false)
+      _compile(source, filename, cached_data, produce_cache)
+    end
+
     # Compile an ES module; returns a RustyRacer::Module to instantiate/evaluate.
     # cached_data: a binary bytecode cache to consume (skip reparse); the result
     # reports #cache_rejected? if stale. produce_cache: collect a fresh cache,
