@@ -1,0 +1,19 @@
+# Standalone (detached from the spike workspace) so it builds as a normal gem
+# extension. The cdylib is the Ruby extension; V8 is baked in (a from-source V8
+# build links library-TLS on linux, so the .so loads fine — no separate
+# libv8-rusty needed under the cibuildgem native-per-platform model).
+[package]
+name = "rusty_racer"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+magnus = "0.8"
+rb-sys = "0.9"
+v8 = "150.0.0"
+
+[workspace]
