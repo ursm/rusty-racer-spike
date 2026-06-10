@@ -29,12 +29,14 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y python3 curl pkg-config libglib2.0-dev lld
-          # rusty_v8 needs libclang 19+ for bindgen; the V8 compiler clang is
-          # auto-downloaded by the build, but bindgen uses the system libclang.
+          # bindgen parses V8's bundled libc++ headers with the SYSTEM libclang
+          # (the V8 *compiler* clang is auto-downloaded separately). V8 15.0's
+          # libc++ requires "Clang 21 and later" — libclang 19 fails bindgen
+          # with "reference to unresolved using declaration". Use LLVM 21.
           wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
           chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 19
-          sudo apt-get install -y libclang-19-dev clang-19
+          sudo /tmp/llvm.sh 21
+          sudo apt-get install -y libclang-21-dev clang-21
       - uses: "dtolnay/rust-toolchain@stable"
       - name: "Clone rusty_v8 ${{ inputs.rusty_v8_tag }}"
         run: |
@@ -45,7 +47,7 @@ jobs:
         working-directory: rusty_v8
         env:
           V8_FROM_SOURCE: "1"
-          LIBCLANG_PATH: "/usr/lib/llvm-19/lib"
+          LIBCLANG_PATH: "/usr/lib/llvm-21/lib"
         run: cargo build --release -vv
       - name: "Stage the static archive"
         run: |
