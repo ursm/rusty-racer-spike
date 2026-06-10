@@ -115,6 +115,15 @@ enum Request {
         timeout_ms: u64,
         reply: Sender<VmReply>,
     },
+    // Resolve a dotted function path on globalThis and invoke it with marshalled
+    // args (v8::Function::call), preserving the holder as `this`. Distinct from
+    // Eval so args keep full type/identity fidelity instead of a JSON literal.
+    Call {
+        realm_id: i32,
+        name: String,
+        args: Vec<JsVal>,
+        reply: Sender<VmReply>,
+    },
     Attach {
         realm_id: i32,
         name: String,
@@ -176,6 +185,12 @@ enum Answer {
     // the proc's Ruby body called ctx.eval — serve it re-entrantly
     NestedEval {
         source: String,
+        reply: Sender<VmReply>,
+    },
+    // the proc's Ruby body called ctx.call — serve it re-entrantly
+    NestedCall {
+        name: String,
+        args: Vec<JsVal>,
         reply: Sender<VmReply>,
     },
     // per-URL module source (None = fetch failed / 404)
@@ -536,6 +551,11 @@ fn host_fn_callback(
                 let outcome = run_source(scope, &source);
                 let _ = reply.send(VmReply::Done(outcome));
             }
+            Ok(Answer::NestedCall { name, args, reply }) => {
+                // ruby -> js -> ruby calls ctx.call -> js: invoke re-entrantly.
+                let outcome = call_function(scope, &name, &args);
+                let _ = reply.send(VmReply::Done(outcome));
+            }
             Ok(Answer::FetchResult(_)) | Ok(Answer::ResolveResult(_)) => {
                 // Module-graph answers can't arrive on a host-fn channel.
                 throw_js_error(scope, "unexpected module-graph answer in host callback");
@@ -582,6 +602,60 @@ fn run_source(scope: &mut v8::PinScope<'_, '_>, source: &str) -> Result<JsVal, V
                 .exception()
                 .map(|e| e.to_rust_string_lossy(tc))
                 .unwrap_or_else(|| "unexpected failure".to_string());
+            Err(VmError::Runtime(msg))
+        }
+    }
+}
+
+// Resolve a dotted property path on globalThis to a function and invoke it via
+// v8::Function::call, with the property's holder as `this` (so `a.b.f` gets the
+// right receiver). Args/result marshal through the ref-preserving paths.
+fn call_function(
+    scope: &mut v8::PinScope<'_, '_>,
+    name: &str,
+    args: &[JsVal],
+) -> Result<JsVal, VmError> {
+    v8::tc_scope!(let tc, scope);
+    let context = tc.get_current_context();
+    let global = context.global(tc);
+    let mut recv: v8::Local<v8::Value> = global.into();
+    let mut target: v8::Local<v8::Value> = global.into();
+    for part in name.split('.') {
+        let Some(obj) = target.to_object(tc) else {
+            // The holder of `part` (a preceding segment) was null/undefined, so
+            // there's nothing to read `part` from — name the holder, not `part`.
+            return Err(VmError::Runtime(format!(
+                "`{name}`: cannot read `{part}` (a preceding path segment is not an object)"
+            )));
+        };
+        let Some(key) = v8::String::new(tc, part) else {
+            return Err(VmError::Runtime("property name too large".into()));
+        };
+        let Some(next) = obj.get(tc, key.into()) else {
+            if tc.has_terminated() {
+                return Err(VmError::Terminated);
+            }
+            let msg = tc
+                .exception()
+                .map(|e| e.to_rust_string_lossy(tc))
+                .unwrap_or_else(|| format!("cannot read `{part}` of `{name}`"));
+            return Err(VmError::Runtime(msg));
+        };
+        recv = target;
+        target = next;
+    }
+    let Ok(func) = v8::Local::<v8::Function>::try_from(target) else {
+        return Err(VmError::Runtime(format!("`{name}` is not a function")));
+    };
+    let argv: Vec<v8::Local<v8::Value>> = args.iter().map(|a| jsval_to_js(tc, a)).collect();
+    match func.call(tc, recv, &argv) {
+        Some(value) => Ok(js_to_jsval(tc, value)),
+        None if tc.has_terminated() => Err(VmError::Terminated),
+        None => {
+            let msg = tc
+                .exception()
+                .map(|e| e.to_rust_string_lossy(tc))
+                .unwrap_or_else(|| "call failed".to_string());
             Err(VmError::Runtime(msg))
         }
     }
@@ -828,6 +902,29 @@ fn v8_thread_main(
                     isolate.cancel_terminate_execution();
                 }
 
+                REPLY_STACK.with(|s| {
+                    s.borrow_mut().pop();
+                });
+                let _ = reply.send(VmReply::Done(outcome));
+            }
+            Request::Call {
+                realm_id,
+                name,
+                args,
+                reply,
+            } => {
+                // REPLY_STACK so a host fn invoked by the called function routes
+                // back to this request's waiter, exactly like Eval.
+                REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
+                let outcome = match realm_context(&main_context, &realms, realm_id) {
+                    Some(ctx) => {
+                        v8::scope!(let scope, &mut isolate);
+                        let context = v8::Local::new(scope, &ctx);
+                        let scope = &mut v8::ContextScope::new(scope, context);
+                        call_function(scope, &name, &args)
+                    }
+                    None => Err(VmError::Runtime("realm disposed or unknown".into())),
+                };
                 REPLY_STACK.with(|s| {
                     s.borrow_mut().pop();
                 });
@@ -1233,14 +1330,40 @@ impl Core {
             ));
         };
         let name = String::try_convert(*name)?;
-        let mut json = String::new();
-        for (i, v) in call_args.iter().enumerate() {
-            if i > 0 {
-                json.push(',');
-            }
-            json.push_str(&jsval_to_json(&ruby_to_jsval(*v)?));
+        let jsargs: Vec<JsVal> = call_args
+            .iter()
+            .map(|v| ruby_to_jsval(*v))
+            .collect::<Result<_, _>>()?;
+
+        // Inside a proc serving a callback? Route through the suspended frame so
+        // we don't deadlock on the busy main queue (mirrors eval_t). Like nested
+        // eval, the nested call runs in the suspended frame's realm — a nested
+        // realm.call targeting a *different* realm than that frame is not
+        // supported (the common same-realm re-entry is correct).
+        let nested = NESTED.with(|n| n.borrow().last().cloned());
+        if let Some(answer) = nested {
+            let (reply_tx, reply_rx) = channel::<VmReply>();
+            answer
+                .send(Answer::NestedCall {
+                    name,
+                    args: jsargs,
+                    reply: reply_tx,
+                })
+                .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread is gone"))?;
+            return self.pump(ruby, reply_rx, None);
         }
-        self.eval_t(ruby, realm_id, format!("({name})(...[{json}])"), 0)
+
+        let (reply_tx, reply_rx) = channel::<VmReply>();
+        self.send(
+            ruby,
+            Request::Call {
+                realm_id,
+                name,
+                args: jsargs,
+                reply: reply_tx,
+            },
+        )?;
+        self.pump(ruby, reply_rx, None)
     }
 
     fn eval_t(
@@ -1477,130 +1600,6 @@ impl Snapshot {
 
     fn size(&self) -> usize {
         self.blob.borrow().len()
-    }
-}
-
-fn json_quote(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
-}
-
-// JSON encoding for Context#call's argument injection (now incl. array/object).
-// Index every container by id so jsval_to_json can expand a Ref back into its
-// target. A JS expression literal can re-state a shared subtree (by repeating
-// it) but cannot express a true cycle, so we expand shared/acyclic refs and
-// only fall back to null when a Ref points at an ancestor still being emitted.
-fn index_jsval<'a>(val: &'a JsVal, index: &mut HashMap<u32, &'a JsVal>) {
-    match val {
-        JsVal::Array { id, items } => {
-            index.insert(*id, val);
-            items.iter().for_each(|v| index_jsval(v, index));
-        }
-        JsVal::Obj { id, entries } => {
-            index.insert(*id, val);
-            entries.iter().for_each(|(_, v)| index_jsval(v, index));
-        }
-        JsVal::Map { id, pairs } => {
-            index.insert(*id, val);
-            pairs.iter().for_each(|(k, v)| {
-                index_jsval(k, index);
-                index_jsval(v, index);
-            });
-        }
-        JsVal::Set { id, items } => {
-            index.insert(*id, val);
-            items.iter().for_each(|v| index_jsval(v, index));
-        }
-        _ => {}
-    }
-}
-
-fn jsval_to_json(val: &JsVal) -> String {
-    let mut index = HashMap::new();
-    index_jsval(val, &mut index);
-    let mut active = HashSet::new();
-    jsval_to_json_d(val, &index, &mut active)
-}
-
-fn jsval_to_json_d(val: &JsVal, index: &HashMap<u32, &JsVal>, active: &mut HashSet<u32>) -> String {
-    match val {
-        JsVal::Undefined | JsVal::Null => "null".to_string(),
-        JsVal::Bool(b) => b.to_string(),
-        JsVal::Int(i) => i.to_string(),
-        JsVal::Num(n) if n.is_finite() => n.to_string(),
-        JsVal::Num(_) => "null".to_string(),
-        JsVal::Str(s) => json_quote(s),
-        // Injected into a JS expression (not real JSON): BigInt accepts a hex
-        // string, so this round-trips arbitrary precision exactly.
-        JsVal::BigInt { negative, words } => {
-            let sign = if *negative { "-" } else { "" };
-            format!("{sign}BigInt(\"0x{}\")", words_to_hex(words))
-        }
-        // Not JSON, but this string is injected into a JS expression, so a live
-        // Date constructor round-trips the value (JSON has no date literal).
-        JsVal::Date(ms) if ms.is_finite() => format!("new Date({ms})"),
-        JsVal::Date(_) => "new Date(NaN)".to_string(),
-        JsVal::Array { id, items } => {
-            active.insert(*id);
-            let parts: Vec<String> = items.iter().map(|v| jsval_to_json_d(v, index, active)).collect();
-            active.remove(id);
-            format!("[{}]", parts.join(","))
-        }
-        JsVal::Obj { id, entries } => {
-            active.insert(*id);
-            let parts: Vec<String> = entries
-                .iter()
-                .map(|(k, v)| format!("{}:{}", json_quote(k), jsval_to_json_d(v, index, active)))
-                .collect();
-            active.remove(id);
-            format!("{{{}}}", parts.join(","))
-        }
-        JsVal::Map { id, pairs } => {
-            active.insert(*id);
-            let parts: Vec<String> = pairs
-                .iter()
-                .map(|(k, v)| {
-                    format!(
-                        "[{},{}]",
-                        jsval_to_json_d(k, index, active),
-                        jsval_to_json_d(v, index, active)
-                    )
-                })
-                .collect();
-            active.remove(id);
-            format!("new Map([{}])", parts.join(","))
-        }
-        JsVal::Set { id, items } => {
-            active.insert(*id);
-            let parts: Vec<String> = items.iter().map(|v| jsval_to_json_d(v, index, active)).collect();
-            active.remove(id);
-            format!("new Set([{}])", parts.join(","))
-        }
-        // Shared (acyclic) ref: expand its target so the value isn't lost. A ref
-        // back to a container still being emitted is a true cycle, which a JS
-        // literal can't express -> null (rare for call args).
-        JsVal::Ref(id) => {
-            if active.contains(id) {
-                "null".to_string()
-            } else if let Some(target) = index.get(id) {
-                jsval_to_json_d(target, index, active)
-            } else {
-                "null".to_string()
-            }
-        }
     }
 }
 

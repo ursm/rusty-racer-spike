@@ -15,5 +15,3 @@ crate-type = ["cdylib"]
 magnus = "0.8"
 rb-sys = "0.9"
 v8 = "150.0.0"
-
-[workspace]

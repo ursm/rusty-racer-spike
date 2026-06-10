@@ -16,7 +16,7 @@ Gem::Specification.new do |spec|
   # Drives cibuildgem's Ruby matrix; csim targets >= 3.3.
   spec.required_ruby_version = ">= 3.3"
 
-  spec.files = Dir["lib/**/*.rb", "ext/**/*.{rs,toml,rb,lock}", "README.md"]
+  spec.files = Dir["lib/**/*.rb", "ext/**/*.{rs,toml,rb,lock}", "Cargo.toml", "README.md"]
   spec.require_paths = ["lib"]
   spec.extensions    = ["ext/rusty_racer/extconf.rb"]
 

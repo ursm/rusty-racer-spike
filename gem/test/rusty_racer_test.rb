@@ -137,11 +137,36 @@ class RustyRacerTest < Minitest::Test
   end
 
   def test_shared_acyclic_call_arg_not_lost
-    # regression: a shared (acyclic) substructure in a call arg must survive the
-    # JSON-shaped injection by being expanded, not dropped to null.
+    # a shared (acyclic) substructure in a call arg must survive, not drop to null
     shared = {"v" => 1}
     @ctx.eval("function bv(x) { return x.b && x.b.v }")
     assert_equal 1, @ctx.call("bv", {"a" => shared, "b" => shared})
+  end
+
+  def test_call_preserves_arg_identity_within_one_arg
+    # Function::call marshals args faithfully, so within a single arg a shared
+    # object stays one object (===), not two copies.
+    shared = {"v" => 1}
+    @ctx.eval("function sameRef(x) { return x.a === x.b }")
+    assert_equal true, @ctx.call("sameRef", {"a" => shared, "b" => shared})
+  end
+
+  def test_call_resolves_dotted_path_with_receiver
+    @ctx.eval("globalThis.math = { base: 100, addBase(x) { return this.base + x } }")
+    # dotted path resolves math.addBase and uses `math` as `this`
+    assert_equal 105, @ctx.call("math.addBase", 5)
+  end
+
+  def test_call_passes_bigint_arg_without_loss
+    @ctx.eval("function inc(x) { return x + 1n }")
+    assert_equal 2**70 + 1, @ctx.call("inc", 2**70)
+  end
+
+  def test_call_unknown_name_raises_not_injects
+    # name is resolved as a property path, never eval'd, so a bogus/injection-y
+    # name cannot execute code — it just fails to resolve to a function.
+    assert_raises(RustyRacer::RuntimeError) { @ctx.call("no.such.fn") }
+    assert_raises(RustyRacer::RuntimeError) { @ctx.call("(()=>42)") }
   end
 
   def test_js_map_marshals_to_ruby_hash
@@ -166,8 +191,8 @@ class RustyRacerTest < Minitest::Test
     assert_equal true, @ctx.eval("getSet().has(2)")
   end
 
-  def test_ruby_set_round_trips_through_call_injection
-    # Context#call arg injection emits `new Set([...])` for a Ruby Set
+  def test_ruby_set_passes_through_call_as_js_set
+    # a Ruby Set passed via Context#call arrives as a real JS Set
     @ctx.eval("function hasIt(s, x) { return s instanceof Set && s.has(x) }")
     assert_equal true, @ctx.call("hasIt", Set[1, 2, 3], 2)
   end
@@ -189,9 +214,8 @@ class RustyRacerTest < Minitest::Test
   end
 
   def test_cycle_preserved_ruby_to_js
-    # build a cyclic Ruby Hash, hand it to JS via a host fn return (the faithful
-    # marshalling path), prove JS sees the cycle. (Context#call args go through
-    # a JSON-shaped injection that cannot express refs — a known simplification.)
+    # build a cyclic Ruby Hash, hand it to JS via a host fn return, prove JS
+    # sees the cycle (the ref table reconstructs identity on the V8 side).
     cyclic = {}
     cyclic["self"] = cyclic
     @ctx.attach("getCyclic", proc { cyclic })
