@@ -206,6 +206,13 @@ enum VmReply {
         referrer_url: String,
         answer: Sender<Answer>,
     },
+    // JS did import(specifier): ask the Context's dynamic_import_resolver for an
+    // already-loaded module to fulfil the import() promise.
+    DynamicImport {
+        specifier: String,
+        referrer_url: String,
+        answer: Sender<Answer>,
+    },
 }
 
 // Ruby thread -> the V8 thread suspended inside a callback / batch round-trip
@@ -851,6 +858,82 @@ fn resolve_imported<'s>(
     })
 }
 
+// V8 calls this for a JS `import(specifier)`. Returns a Promise fulfilled with
+// the resolved module's namespace (or rejected). Round-trips to the Context's
+// dynamic_import_resolver over the current request's reply channel (REPLY_STACK)
+// — so import() only works inside an eval/call. As with instantiate, the
+// resolver must return an *already-loaded* module (compiling lazily from the
+// resolver would deadlock the parked V8 thread).
+fn dynamic_import_cb<'s>(
+    scope: &mut v8::PinScope<'s, '_>,
+    _host_defined_options: v8::Local<'s, v8::Data>,
+    resource_name: v8::Local<'s, v8::Value>,
+    specifier: v8::Local<'s, v8::String>,
+    _import_attributes: v8::Local<'s, v8::FixedArray>,
+) -> Option<v8::Local<'s, v8::Promise>> {
+    let resolver = v8::PromiseResolver::new(scope)?;
+    let promise = resolver.get_promise(scope);
+    let reject = |scope: &mut v8::PinScope<'s, '_>, msg: &str| {
+        if let Some(s) = v8::String::new(scope, msg) {
+            let e = v8::Exception::error(scope, s);
+            resolver.reject(scope, e);
+        }
+    };
+    let spec = specifier.to_rust_string_lossy(scope);
+    let referrer = resource_name.to_rust_string_lossy(scope);
+    let reply = match REPLY_STACK.with(|s| s.borrow().last().cloned()) {
+        Some(r) => r,
+        None => {
+            reject(scope, "import() is only available during eval/call");
+            return Some(promise);
+        }
+    };
+    let (atx, arx) = channel();
+    if reply
+        .send(VmReply::DynamicImport {
+            specifier: spec,
+            referrer_url: referrer,
+            answer: atx,
+        })
+        .is_err()
+    {
+        reject(scope, "dynamic import caller went away");
+        return Some(promise);
+    }
+    match arx.recv() {
+        Ok(Answer::ModuleId(Some(id))) => {
+            let g = MODULES.with(|m| m.borrow().by_id.get(&id).map(|(g, _)| g.clone()));
+            match g {
+                // The module must be at least instantiated to read its namespace
+                // (get_module_namespace CHECK-aborts otherwise).
+                Some(g) => {
+                    let module = v8::Local::new(scope, &g);
+                    match module.get_status() {
+                        // Only a fully-evaluated module has live exports; resolve
+                        // with its namespace.
+                        v8::ModuleStatus::Evaluated => {
+                            let ns = module.get_module_namespace();
+                            resolver.resolve(scope, ns);
+                        }
+                        // A module that threw during evaluation rejects with its
+                        // own exception, not a stale namespace.
+                        v8::ModuleStatus::Errored => {
+                            let exc = module.get_exception();
+                            resolver.reject(scope, exc);
+                        }
+                        // Not yet evaluated: its namespace bindings are in TDZ, so
+                        // reject rather than hand back an object that throws on use.
+                        _ => reject(scope, "dynamically imported module is not evaluated"),
+                    }
+                }
+                None => reject(scope, "resolved module not found"),
+            }
+        }
+        _ => reject(scope, "import() was not resolved to a module"),
+    }
+    Some(promise)
+}
+
 // Per-request watchdog, split so neither half borrows the isolate (it runs off
 // a Send IsolateHandle): start before running JS, finish after. Joining before
 // the reply and cancelling unconditionally if it fired keeps a late
@@ -900,6 +983,8 @@ fn v8_thread_main(
     // run only on perform_microtask_checkpoint / the host-namespace
     // drainMicrotasks — the embedder owns the event loop (no real timers/loop).
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
+    // JS import() routes here; rejects unless a dynamic_import_resolver is set.
+    isolate.set_host_import_module_dynamically_callback(dynamic_import_cb);
     let _ = handle_tx.send(isolate.thread_safe_handle());
     // mut: reset_realm swaps this for a fresh Context in the same warm isolate.
     let mut main_context = {
@@ -1299,6 +1384,9 @@ struct Core {
     // Default per-eval/call timeout (ms); 0 = none. eval_t's explicit timeout
     // overrides it. Guards against an in-V8 infinite loop without a watchdog.
     default_timeout_ms: u64,
+    // Set by Context#dynamic_import_resolver=; called for a JS import() to map
+    // (specifier, referrer) to an already-loaded Module.
+    dynamic_import_resolver: Mutex<Option<Opaque<Proc>>>,
 }
 
 #[magnus::wrap(class = "RustyRacer::Context")]
@@ -1526,6 +1614,7 @@ impl Context {
                 }),
                 procs: Mutex::new(Vec::new()),
                 default_timeout_ms: timeout_ms,
+                dynamic_import_resolver: Mutex::new(None),
             }),
         })
     }
@@ -1583,6 +1672,39 @@ impl Core {
                                 Err(e) => {
                                     let _ = answer.send(Answer::ModuleId(None));
                                     return Err(e);
+                                }
+                            }
+                        }
+                        None => {
+                            let _ = answer.send(Answer::ModuleId(None));
+                        }
+                    }
+                }
+                Ok(VmReply::DynamicImport {
+                    specifier,
+                    referrer_url,
+                    answer,
+                }) => {
+                    // Read the Context's dynamic_import_resolver (set via the
+                    // setter); reuse the same Module-id resolution as instantiate.
+                    let resolver = {
+                        let guard = self.dynamic_import_resolver.lock().unwrap();
+                        guard.map(|o| ruby.get_inner(o))
+                    };
+                    match resolver {
+                        Some(proc) => {
+                            match resolve_module_via_ruby(self, proc, &specifier, &referrer_url) {
+                                Ok(id) => {
+                                    let _ = answer.send(Answer::ModuleId(id));
+                                }
+                                // import() happens mid-eval; a raising resolver
+                                // must only reject the import() promise, NOT abort
+                                // the surrounding eval (whose Done reply is still
+                                // coming). Unblock V8 and keep pumping — the
+                                // import() rejects generically (unlike instantiate,
+                                // which is its own request and may propagate Err).
+                                Err(_) => {
+                                    let _ = answer.send(Answer::ModuleId(None));
                                 }
                             }
                         }
@@ -1809,6 +1931,10 @@ impl Core {
         self.pump(ruby, reply_rx, None).map(|_| ())
     }
 
+    fn set_dynamic_import_resolver(&self, proc: Proc) {
+        *self.dynamic_import_resolver.lock().unwrap() = Some(Opaque::from(proc));
+    }
+
     // Terminate whatever is running. IsolateHandle is Send + refcounted —
     // safe at ANY time, even racing disposal (audit #63 without a stop_mtx).
     fn stop(&self) {
@@ -1883,6 +2009,10 @@ impl Context {
             module_id: id,
             disposed: AtomicBool::new(false),
         })
+    }
+    // Context#dynamic_import_resolver = ->(specifier, referrer_url) { module }.
+    fn set_dynamic_import_resolver(rb_self: &Self, proc: Proc) {
+        rb_self.core.set_dynamic_import_resolver(proc);
     }
     fn stop(&self) {
         self.core.stop();
@@ -2327,6 +2457,11 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("create_realm", method!(Context::create_realm, 0))?;
     // keyword-arg wrapper Context#compile_module(source, filename:) in lib.
     class.define_method("_compile_module", method!(Context::compile_module, 2))?;
+    // lib keeps the proc in an ivar (GC liveness) and calls this primitive.
+    class.define_method(
+        "_set_dynamic_import_resolver",
+        method!(Context::set_dynamic_import_resolver, 1),
+    )?;
     class.define_method("stop", method!(Context::stop, 0))?;
     class.define_method("dispose", method!(Context::dispose, 0))?;
 

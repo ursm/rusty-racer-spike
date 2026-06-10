@@ -469,6 +469,28 @@ class RustyRacerTest < Minitest::Test
     assert_raises(TypeError) { app.instantiate { |_s, _r| 42 } }
   end
 
+  def test_dynamic_import_resolves_to_a_loaded_module
+    # pre-load the dependency (compile + instantiate + evaluate)
+    dep = @ctx.compile_module("export const v = 7;", filename: "/dep.js")
+    dep.instantiate { |_s, _r| nil }
+    dep.evaluate
+    @ctx.dynamic_import_resolver = ->(specifier, _referrer) { specifier == "/dep.js" ? dep : nil }
+
+    @ctx.eval(<<~JS, filename: "/main.js")
+      globalThis.OUT = null;
+      import("/dep.js").then(m => { globalThis.OUT = m.v });
+    JS
+    assert_nil @ctx.eval("globalThis.OUT") # pending until drained (explicit policy)
+    @ctx.perform_microtask_checkpoint
+    assert_equal 7, @ctx.eval("globalThis.OUT")
+  end
+
+  def test_dynamic_import_without_resolver_rejects
+    @ctx.eval('globalThis.ERR = null; import("/x.js").catch(e => { globalThis.ERR = String(e) });')
+    @ctx.perform_microtask_checkpoint
+    assert_match(/import|not|resolved/i, @ctx.eval("globalThis.ERR"))
+  end
+
   def test_es_module_dispose
     m = @ctx.compile_module("export const a = 1;")
     assert_equal false, m.disposed?

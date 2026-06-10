@@ -41,6 +41,14 @@ module RustyRacer
     def compile_module(source, filename: '<compile_module>')
       _compile_module(source, filename)
     end
+
+    # ->(specifier, referrer_url) { already-loaded Module } for JS import().
+    # Held in an ivar so the proc stays alive for the Context's lifetime (the
+    # native side only keeps a weak handle).
+    def dynamic_import_resolver=(resolver)
+      @dynamic_import_resolver = resolver
+      _set_dynamic_import_resolver(resolver)
+    end
   end
 
   class Realm
