@@ -1,5 +1,7 @@
 # frozen_string_literal: true
 
+require "set" # JS Set <-> Ruby Set marshalling needs the stdlib Set constant
+
 require_relative "rusty_racer/version"
 
 # Load the compiled extension (defines RustyRacer::Context). rb-sys names the

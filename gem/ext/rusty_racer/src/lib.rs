@@ -83,6 +83,11 @@ enum JsVal {
     Array { id: u32, items: Vec<JsVal> },
     // JS object / Ruby Hash with string keys. Insertion order preserved.
     Obj { id: u32, entries: Vec<(String, JsVal)> },
+    // JS Map <-> Ruby Hash. Keys are arbitrary values (not just strings), so
+    // this is distinct from Obj. Insertion order preserved.
+    Map { id: u32, pairs: Vec<(JsVal, JsVal)> },
+    // JS Set <-> Ruby Set (stdlib).
+    Set { id: u32, items: Vec<JsVal> },
     // Back-reference to an already-emitted container (preserves identity; makes
     // cycles representable instead of truncating at a depth cap).
     Ref(u32),
@@ -318,6 +323,48 @@ fn js_to_jsval_d(
             return JsVal::Date(date.value_of());
         }
     }
+    // Map/Set before the generic object branch (both are objects).
+    if value.is_map() {
+        let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
+        let id = match js_seen(scope, seen, obj) {
+            Err(existing) => return JsVal::Ref(existing),
+            Ok(_) if depth >= MAX_MARSHAL_DEPTH => {
+                return JsVal::Str(value.to_rust_string_lossy(scope));
+            }
+            Ok(id) => id,
+        };
+        let map = v8::Local::<v8::Map>::try_from(value).unwrap();
+        let arr = map.as_array(scope); // [k0, v0, k1, v1, ...]
+        let mut pairs = Vec::with_capacity((arr.length() / 2) as usize);
+        let mut i = 0;
+        while i + 1 < arr.length() {
+            let k = arr.get_index(scope, i).unwrap_or_else(|| v8::undefined(scope).into());
+            let v = arr.get_index(scope, i + 1).unwrap_or_else(|| v8::undefined(scope).into());
+            let kj = js_to_jsval_d(scope, k, seen, depth + 1);
+            let vj = js_to_jsval_d(scope, v, seen, depth + 1);
+            pairs.push((kj, vj));
+            i += 2;
+        }
+        return JsVal::Map { id, pairs };
+    }
+    if value.is_set() {
+        let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
+        let id = match js_seen(scope, seen, obj) {
+            Err(existing) => return JsVal::Ref(existing),
+            Ok(_) if depth >= MAX_MARSHAL_DEPTH => {
+                return JsVal::Str(value.to_rust_string_lossy(scope));
+            }
+            Ok(id) => id,
+        };
+        let set = v8::Local::<v8::Set>::try_from(value).unwrap();
+        let arr = set.as_array(scope);
+        let mut items = Vec::with_capacity(arr.length() as usize);
+        for i in 0..arr.length() {
+            let el = arr.get_index(scope, i).unwrap_or_else(|| v8::undefined(scope).into());
+            items.push(js_to_jsval_d(scope, el, seen, depth + 1));
+        }
+        return JsVal::Set { id, items };
+    }
     if value.is_array() {
         let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
         let id = match js_seen(scope, seen, obj) {
@@ -413,6 +460,25 @@ fn jsval_to_js_d<'s>(
                 obj.set(scope, key.into(), v);
             }
             obj.into()
+        }
+        JsVal::Map { id, pairs } => {
+            let map = v8::Map::new(scope);
+            built.insert(*id, map.into());
+            for (k, v) in pairs {
+                let kk = jsval_to_js_d(scope, k, built);
+                let vv = jsval_to_js_d(scope, v, built);
+                map.set(scope, kk, vv);
+            }
+            map.into()
+        }
+        JsVal::Set { id, items } => {
+            let set = v8::Set::new(scope);
+            built.insert(*id, set.into());
+            for it in items {
+                let v = jsval_to_js_d(scope, it, built);
+                set.add(scope, v);
+            }
+            set.into()
         }
         JsVal::Ref(id) => built
             .get(id)
@@ -1463,6 +1529,17 @@ fn jsval_to_json(val: &JsVal) -> String {
                 .collect();
             format!("{{{}}}", parts.join(","))
         }
+        JsVal::Map { pairs, .. } => {
+            let parts: Vec<String> = pairs
+                .iter()
+                .map(|(k, v)| format!("[{},{}]", jsval_to_json(k), jsval_to_json(v)))
+                .collect();
+            format!("new Map([{}])", parts.join(","))
+        }
+        JsVal::Set { items, .. } => {
+            let parts: Vec<String> = items.iter().map(jsval_to_json).collect();
+            format!("new Set([{}])", parts.join(","))
+        }
         // call-arg injection is a JSON-shaped literal, which can't express
         // shared/cyclic references; a Ref degrades to null (rare for call args).
         JsVal::Ref(_) => "null".to_string(),
@@ -1605,6 +1682,31 @@ fn jsval_to_ruby_d(
             }
             h.as_value()
         }
+        // JS Map -> Ruby Hash (arbitrary marshalled keys, not just strings).
+        JsVal::Map { id, pairs } => {
+            let h = ruby.hash_new();
+            built.insert(*id, h.as_value());
+            for (k, v) in pairs {
+                let kk = jsval_to_ruby_d(ruby, k, built)?;
+                let vv = jsval_to_ruby_d(ruby, v, built)?;
+                let _ = h.aset(kk, vv);
+            }
+            h.as_value()
+        }
+        // JS Set -> Ruby Set (stdlib); build empty then add so a cyclic Set
+        // (a Set containing itself) resolves through the Ref table.
+        JsVal::Set { id, items } => {
+            let set: Value = ruby
+                .class_object()
+                .const_get::<_, magnus::RClass>("Set")?
+                .funcall("new", ())?;
+            built.insert(*id, set);
+            for it in items {
+                let v = jsval_to_ruby_d(ruby, it, built)?;
+                let _: Value = set.funcall("add", (v,))?;
+            }
+            set
+        }
         JsVal::Ref(id) => built
             .get(id)
             .copied()
@@ -1668,6 +1770,25 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
     }
     if let Ok(s) = String::try_convert(val) {
         return Ok(JsVal::Str(s));
+    }
+    // Ruby Set -> JS Set. Before the Array/Hash checks (a Set is neither).
+    if let Ok(set_class) = ruby.class_object().const_get::<_, magnus::RClass>("Set") {
+        if val.is_kind_of(set_class) {
+            if let Some(r) = rb_seen(seen, val)? {
+                return Ok(r);
+            }
+            if depth >= MAX_MARSHAL_DEPTH {
+                return Ok(JsVal::Str(val.funcall::<_, _, String>("to_s", ())?));
+            }
+            let id = rb_assign(seen, val)?;
+            let arr: RArray = val.funcall("to_a", ())?;
+            let mut items = Vec::with_capacity(arr.len());
+            for i in 0..arr.len() {
+                let el: Value = arr.entry::<Value>(i as isize)?;
+                items.push(ruby_to_jsval_d(el, seen, depth + 1)?);
+            }
+            return Ok(JsVal::Set { id, items });
+        }
     }
     if let Ok(arr) = RArray::try_convert(val) {
         if let Some(r) = rb_seen(seen, val)? {

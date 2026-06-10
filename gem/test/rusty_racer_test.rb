@@ -121,6 +121,34 @@ class RustyRacerTest < Minitest::Test
     assert_equal false, @ctx.call("isBig", 42)
   end
 
+  def test_js_map_marshals_to_ruby_hash
+    h = @ctx.eval('new Map([["a", 1], [2, "two"], ["nested", {x: 9}]])')
+    assert_kind_of Hash, h
+    assert_equal 1, h["a"]
+    assert_equal "two", h[2]            # non-string key preserved
+    assert_equal({"x" => 9}, h["nested"])
+  end
+
+  def test_js_set_marshals_to_ruby_set
+    s = @ctx.eval('new Set([1, 2, 2, 3])')
+    assert_kind_of Set, s
+    assert_equal Set[1, 2, 3], s
+  end
+
+  def test_ruby_set_marshals_to_js_set
+    @ctx.attach("getSet", proc { Set[1, 2, 3] })
+    assert_equal "object", @ctx.eval("typeof getSet()")
+    assert_equal true, @ctx.eval("getSet() instanceof Set")
+    assert_equal 3, @ctx.eval("getSet().size")
+    assert_equal true, @ctx.eval("getSet().has(2)")
+  end
+
+  def test_ruby_set_round_trips_through_call_injection
+    # Context#call arg injection emits `new Set([...])` for a Ruby Set
+    @ctx.eval("function hasIt(s, x) { return s instanceof Set && s.has(x) }")
+    assert_equal true, @ctx.call("hasIt", Set[1, 2, 3], 2)
+  end
+
   def test_shared_reference_preserved_js_to_ruby
     # one object referenced twice stays one object on the Ruby side
     h = @ctx.eval('const x = {v: 1}; ({a: x, b: x})')
