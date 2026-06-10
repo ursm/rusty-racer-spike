@@ -31,7 +31,7 @@
 // GVL-released channel waits pass no unblock function.
 
 use std::cell::RefCell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -160,12 +160,6 @@ enum Request {
         realm_id: i32,
         reply: Sender<VmReply>,
     },
-    // load_module_graph: walk the static import graph on the V8 thread,
-    // round-tripping fetch/resolve batches to Ruby, then instantiate + evaluate.
-    LoadModuleGraph {
-        entry_url: String,
-        reply: Sender<VmReply>,
-    },
     // Thin ES-module primitives (V8's raw compile/instantiate/evaluate). The
     // embedder owns the url->Module registry and the resolve policy; the binding
     // just exposes the steps. A compiled module is addressed by an id (like a
@@ -199,25 +193,10 @@ enum Request {
 // V8 thread -> the Ruby thread that is waiting on this request
 enum VmReply {
     Done(Result<JsVal, VmError>),
-    // load_module_graph result: the URLs newly compiled this load (csim builds
-    // its {modules: [...]} from these), or an error.
-    ModuleGraphDone(Result<Vec<String>, VmError>),
     // JS called host fn |id|; run the proc and send the answer back.
     Callback {
         host_fn_id: usize,
         args: Vec<JsVal>,
-        answer: Sender<Answer>,
-    },
-    // Module-graph fetch batch: ask Ruby's fetch_batch proc for these URLs'
-    // sources (one round-trip per graph level).
-    FetchBatch {
-        urls: Vec<String>,
-        answer: Sender<Answer>,
-    },
-    // Module-graph resolve batch: ask Ruby's resolve proc to map these
-    // (specifier, referrer) edges to URLs.
-    ResolveBatch {
-        edges: Vec<(String, String)>,
         answer: Sender<Answer>,
     },
     // instantiate's per-edge resolve: ask the Ruby resolve block for the module
@@ -245,10 +224,6 @@ enum Answer {
         void: bool,
         reply: Sender<VmReply>,
     },
-    // per-URL module source (None = fetch failed / 404)
-    FetchResult(Vec<Option<String>>),
-    // per-edge resolved URL (None = unresolved)
-    ResolveResult(Vec<Option<String>>),
     // the resolve block's answer: the dependency module's id (None = unresolved).
     ModuleId(Option<i32>),
 }
@@ -610,10 +585,8 @@ fn host_fn_callback(
                 let outcome = call_function(scope, &name, &args, void);
                 let _ = reply.send(VmReply::Done(outcome));
             }
-            Ok(Answer::FetchResult(_))
-            | Ok(Answer::ResolveResult(_))
-            | Ok(Answer::ModuleId(_)) => {
-                // Module(-graph) answers can't arrive on a host-fn channel.
+            Ok(Answer::ModuleId(_)) => {
+                // A module-resolve answer can't arrive on a host-fn channel.
                 throw_js_error(scope, "unexpected module answer in host callback");
                 return;
             }
@@ -812,58 +785,14 @@ fn call_function(
 }
 
 // ---------------------------------------------------------------------------
-// Module graph (csim's load_module_graph): stage1's level-walk, but the fetch
-// and resolve batches round-trip to Ruby over the rendezvous (like host fns)
-// instead of in-process closures. The registry is a per-V8-thread thread_local
-// (one isolate per thread); reset_realm clears it.
+// ES modules: V8's raw compile/instantiate/evaluate steps, with the embedder
+// owning the url->Module registry (MODULES) and the resolve policy.
 // ---------------------------------------------------------------------------
-#[derive(Default)]
-struct Registry {
-    by_url: HashMap<String, v8::Global<v8::Module>>,
-    url_by_hash: HashMap<i32, Vec<(v8::Global<v8::Module>, String)>>,
-    edges: HashMap<(String, String), String>,
-}
-
-impl Registry {
-    fn clear(&mut self) {
-        self.by_url.clear();
-        self.url_by_hash.clear();
-        self.edges.clear();
-    }
-}
-
-thread_local! {
-    static REGISTRY: RefCell<Registry> = RefCell::new(Registry::default());
-}
-
 fn module_origin<'s>(scope: &v8::PinScope<'s, '_>, url: &str) -> v8::ScriptOrigin<'s> {
     let name = v8::String::new(scope, url).unwrap();
     v8::ScriptOrigin::new(
         scope, name.into(), 0, 0, false, -1, None, false, false, /*is_module*/ true, None,
     )
-}
-
-// V8 calls this per import edge during InstantiateModule. Pure registry lookup.
-fn resolve_module<'s>(
-    context: v8::Local<'s, v8::Context>,
-    specifier: v8::Local<'s, v8::String>,
-    _import_attributes: v8::Local<'s, v8::FixedArray>,
-    referrer: v8::Local<'s, v8::Module>,
-) -> Option<v8::Local<'s, v8::Module>> {
-    v8::callback_scope!(unsafe scope, context);
-    let spec = specifier.to_rust_string_lossy(scope);
-    REGISTRY.with(|r| {
-        let r = r.borrow();
-        let hash = referrer.get_identity_hash().get();
-        let ref_url = r
-            .url_by_hash
-            .get(&hash)?
-            .iter()
-            .find(|(g, _)| v8::Local::new(scope, g) == referrer)
-            .map(|(_, u)| u.clone())?;
-        let url = r.edges.get(&(ref_url, spec))?;
-        Some(v8::Local::new(scope, r.by_url.get(url)?))
-    })
 }
 
 // Registry for the thin compile_module/instantiate API: each compiled module is
@@ -920,118 +849,6 @@ fn resolve_imported<'s>(
             .get(&dep_id)
             .map(|(g, _)| v8::Local::new(scope, g))
     })
-}
-
-// Round-trip a batch to Ruby; blocks the V8 thread until the answer arrives
-// (exactly like host_fn_callback). The reply Sender is the current request's.
-fn ruby_fetch(reply: &Sender<VmReply>, urls: &[String]) -> Option<Vec<Option<String>>> {
-    let (atx, arx) = channel();
-    reply
-        .send(VmReply::FetchBatch { urls: urls.to_vec(), answer: atx })
-        .ok()?;
-    match arx.recv() {
-        Ok(Answer::FetchResult(v)) => Some(v),
-        _ => None,
-    }
-}
-
-fn ruby_resolve(reply: &Sender<VmReply>, edges: &[(String, String)]) -> Option<Vec<Option<String>>> {
-    let (atx, arx) = channel();
-    reply
-        .send(VmReply::ResolveBatch { edges: edges.to_vec(), answer: atx })
-        .ok()?;
-    match arx.recv() {
-        Ok(Answer::ResolveResult(v)) => Some(v),
-        _ => None,
-    }
-}
-
-// Walk + instantiate + evaluate. Runs on the V8 thread inside the realm's
-// ContextScope. Returns the URLs newly compiled this load.
-fn load_module_graph_inner(
-    scope: &mut v8::PinScope<'_, '_>,
-    entry_url: &str,
-    reply: &Sender<VmReply>,
-) -> Result<Vec<String>, VmError> {
-    let mut to_fetch: Vec<String> = Vec::new();
-    if !REGISTRY.with(|r| r.borrow().by_url.contains_key(entry_url)) {
-        to_fetch.push(entry_url.to_string());
-    }
-    let mut seen: HashSet<String> = to_fetch.iter().cloned().collect();
-    let mut new_urls: Vec<String> = Vec::new();
-
-    while !to_fetch.is_empty() {
-        let fetched = ruby_fetch(reply, &to_fetch)
-            .ok_or_else(|| VmError::Runtime("fetch_batch callback failed".into()))?;
-
-        let mut level_edges: Vec<(String, String)> = Vec::new(); // (specifier, referrer)
-        for (url, source) in to_fetch.iter().zip(fetched) {
-            // None = fetch failed (404): leave uncompiled; a static import of
-            // it then fails at instantiate, which is ESM-correct.
-            let Some(source) = source else { continue };
-            let code =
-                v8::String::new(scope, &source).ok_or_else(|| VmError::Runtime("source alloc".into()))?;
-            let origin = module_origin(scope, url);
-            let mut src = v8::script_compiler::Source::new(code, Some(&origin));
-            let module = v8::script_compiler::compile_module(scope, &mut src)
-                .ok_or_else(|| VmError::Parse(format!("compile failed: {url}")))?;
-            REGISTRY.with(|r| {
-                let mut r = r.borrow_mut();
-                let hash = module.get_identity_hash().get();
-                let g = v8::Global::new(scope, module);
-                r.by_url.insert(url.clone(), g.clone());
-                r.url_by_hash.entry(hash).or_default().push((g, url.clone()));
-            });
-            new_urls.push(url.clone());
-            let requests = module.get_module_requests();
-            for i in 0..requests.length() {
-                let req: v8::Local<v8::ModuleRequest> =
-                    requests.get(scope, i).unwrap().try_into().unwrap();
-                let spec = req.get_specifier().to_rust_string_lossy(scope);
-                level_edges.push((spec, url.clone()));
-            }
-        }
-
-        to_fetch.clear();
-        if level_edges.is_empty() {
-            continue;
-        }
-        let resolved = ruby_resolve(reply, &level_edges)
-            .ok_or_else(|| VmError::Runtime("resolve callback failed".into()))?;
-        for ((spec, referrer), url) in level_edges.into_iter().zip(resolved) {
-            let Some(url) = url else { continue };
-            REGISTRY.with(|r| {
-                r.borrow_mut().edges.insert((referrer, spec), url.clone());
-            });
-            let registered = REGISTRY.with(|r| r.borrow().by_url.contains_key(&url));
-            if !registered && seen.insert(url.clone()) {
-                to_fetch.push(url);
-            }
-        }
-    }
-
-    let entry = REGISTRY
-        .with(|r| r.borrow().by_url.get(entry_url).cloned())
-        .ok_or_else(|| VmError::Runtime(format!("entry module not loaded: {entry_url}")))?;
-    let entry = v8::Local::new(scope, &entry);
-    if entry
-        .instantiate_module(scope, resolve_module)
-        .filter(|&ok| ok)
-        .is_none()
-    {
-        return Err(VmError::Runtime(format!("instantiate failed: {entry_url}")));
-    }
-    let value = entry
-        .evaluate(scope)
-        .ok_or_else(|| VmError::Runtime("module evaluation failed".into()))?;
-    scope.perform_microtask_checkpoint();
-    if let Ok(promise) = v8::Local::<v8::Promise>::try_from(value) {
-        if promise.state() == v8::PromiseState::Rejected {
-            let reason = promise.result(scope);
-            return Err(VmError::Runtime(reason.to_rust_string_lossy(scope)));
-        }
-    }
-    Ok(new_urls)
 }
 
 // Per-request watchdog, split so neither half borrows the isolate (it runs off
@@ -1215,7 +1032,6 @@ fn v8_thread_main(
                     v8::Global::new(scope, context)
                 };
                 main_context = fresh;
-                REGISTRY.with(|r| r.borrow_mut().clear());
                 MODULES.with(|m| {
                     let mut m = m.borrow_mut();
                     m.by_id.clear();
@@ -1245,21 +1061,6 @@ fn v8_thread_main(
                 // never wrapped as a Realm, so this only ever frees extras.
                 realms.remove(&realm_id);
                 let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
-            }
-            Request::LoadModuleGraph { entry_url, reply } => {
-                // REPLY_STACK so a module's top-level code calling an attached
-                // host fn routes back to this request's waiter, just like Eval.
-                REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
-                let result = {
-                    v8::scope!(let scope, &mut isolate);
-                    let context = v8::Local::new(scope, &main_context);
-                    let scope = &mut v8::ContextScope::new(scope, context);
-                    load_module_graph_inner(scope, &entry_url, &reply)
-                };
-                REPLY_STACK.with(|s| {
-                    s.borrow_mut().pop();
-                });
-                let _ = reply.send(VmReply::ModuleGraphDone(result));
             }
             Request::CompileModule {
                 source,
@@ -1742,15 +1543,14 @@ impl Core {
             .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread is gone"))
     }
 
-    // Wait for this request's reply, serving host-fn callbacks and module-graph
-    // fetch/resolve batches as they arrive. The recv waits release the GVL; the
-    // Ruby procs run with it held. |loader| carries load_module_graph's
-    // (resolve, fetch) procs; other ops pass None.
+    // Wait for this request's reply, serving host-fn callbacks and the
+    // instantiate resolve round-trip as they arrive. The recv waits release the
+    // GVL; the Ruby procs run with it held. |module_resolve| carries
+    // Module#instantiate's resolve block; other ops pass None.
     fn pump(
         &self,
         ruby: &Ruby,
         reply_rx: Receiver<VmReply>,
-        loader: Option<(Proc, Proc)>,
         module_resolve: Option<Proc>,
     ) -> Result<Value, Error> {
         loop {
@@ -1758,10 +1558,6 @@ impl Core {
             match message {
                 Ok(VmReply::Done(Ok(val))) => return jsval_to_ruby(ruby, &val),
                 Ok(VmReply::Done(Err(e))) => return Err(vm_err(ruby, e)),
-                Ok(VmReply::ModuleGraphDone(Ok(urls))) => {
-                    return Ok(module_graph_result(ruby, &urls));
-                }
-                Ok(VmReply::ModuleGraphDone(Err(e))) => return Err(vm_err(ruby, e)),
                 Ok(VmReply::Callback {
                     host_fn_id,
                     args,
@@ -1769,20 +1565,6 @@ impl Core {
                 }) => {
                     let result = self.call_proc(ruby, host_fn_id, &args, &answer);
                     let _ = answer.send(Answer::Result(result));
-                }
-                Ok(VmReply::FetchBatch { urls, answer }) => {
-                    let r = match &loader {
-                        Some((_, fetch)) => fetch_via_ruby(ruby, *fetch, &urls),
-                        None => vec![None; urls.len()],
-                    };
-                    let _ = answer.send(Answer::FetchResult(r));
-                }
-                Ok(VmReply::ResolveBatch { edges, answer }) => {
-                    let r = match &loader {
-                        Some((resolve, _)) => resolve_via_ruby(ruby, *resolve, &edges),
-                        None => vec![None; edges.len()],
-                    };
-                    let _ = answer.send(Answer::ResolveResult(r));
                 }
                 Ok(VmReply::ResolveModule {
                     specifier,
@@ -1877,7 +1659,7 @@ impl Core {
                     reply: reply_tx,
                 })
                 .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread is gone"))?;
-            return self.pump(ruby, reply_rx, None, None);
+            return self.pump(ruby, reply_rx, None);
         }
 
         let (reply_tx, reply_rx) = channel::<VmReply>();
@@ -1892,7 +1674,7 @@ impl Core {
                 reply: reply_tx,
             },
         )?;
-        self.pump(ruby, reply_rx, None, None)
+        self.pump(ruby, reply_rx, None)
     }
 
     fn drain_microtasks(&self, ruby: &Ruby) -> Result<Value, Error> {
@@ -1904,7 +1686,7 @@ impl Core {
                 reply: reply_tx,
             },
         )?;
-        self.pump(ruby, reply_rx, None, None)
+        self.pump(ruby, reply_rx, None)
     }
 
     fn eval_t(
@@ -1928,7 +1710,7 @@ impl Core {
                     reply: reply_tx,
                 })
                 .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread is gone"))?;
-            return self.pump(ruby, reply_rx, None, None);
+            return self.pump(ruby, reply_rx, None);
         }
 
         let (reply_tx, reply_rx) = channel::<VmReply>();
@@ -1942,7 +1724,7 @@ impl Core {
                 reply: reply_tx,
             },
         )?;
-        self.pump(ruby, reply_rx, None, None)
+        self.pump(ruby, reply_rx, None)
     }
 
     fn attach(&self, ruby: &Ruby, realm_id: i32, name: String, proc: Proc) -> Result<Value, Error> {
@@ -1961,48 +1743,27 @@ impl Core {
                 reply: reply_tx,
             },
         )?;
-        self.pump(ruby, reply_rx, None, None)
+        self.pump(ruby, reply_rx, None)
     }
 
     fn reset_realm(&self, ruby: &Ruby) -> Result<Value, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
         self.send(ruby, Request::Reset { reply: reply_tx })?;
-        self.pump(ruby, reply_rx, None, None)
+        self.pump(ruby, reply_rx, None)
     }
 
     // Build a new realm; returns its id (the V8 thread replies with an Int).
     fn create_realm(&self, ruby: &Ruby) -> Result<i32, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
         self.send(ruby, Request::CreateRealm { reply: reply_tx })?;
-        let id = self.pump(ruby, reply_rx, None, None)?;
+        let id = self.pump(ruby, reply_rx, None)?;
         i32::try_convert(id)
     }
 
     fn dispose_realm(&self, ruby: &Ruby, realm_id: i32) -> Result<(), Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
         self.send(ruby, Request::DisposeRealm { realm_id, reply: reply_tx })?;
-        self.pump(ruby, reply_rx, None, None).map(|_| ())
-    }
-
-    // Positional primitive behind the keyword-arg Ruby wrapper in
-    // lib/rusty_racer.rb: load_module_graph(entry, resolve:, fetch_batch:).
-    // Main realm only (the module registry lives there).
-    fn load_module_graph(
-        &self,
-        ruby: &Ruby,
-        entry_url: String,
-        resolve: Proc,
-        fetch_batch: Proc,
-    ) -> Result<Value, Error> {
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.send(
-            ruby,
-            Request::LoadModuleGraph {
-                entry_url,
-                reply: reply_tx,
-            },
-        )?;
-        self.pump(ruby, reply_rx, Some((resolve, fetch_batch)), None)
+        self.pump(ruby, reply_rx, None).map(|_| ())
     }
 
     // Thin ESM primitives. compile_module returns the new module's id.
@@ -2016,7 +1777,7 @@ impl Core {
                 reply: reply_tx,
             },
         )?;
-        i32::try_convert(self.pump(ruby, reply_rx, None, None)?)
+        i32::try_convert(self.pump(ruby, reply_rx, None)?)
     }
 
     // instantiate carries the resolve block to pump so resolve_imported can ask
@@ -2027,25 +1788,25 @@ impl Core {
     fn instantiate_module(&self, ruby: &Ruby, module_id: i32, resolve: Proc) -> Result<Value, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
         self.send(ruby, Request::InstantiateModule { module_id, reply: reply_tx })?;
-        self.pump(ruby, reply_rx, None, Some(resolve))
+        self.pump(ruby, reply_rx, Some(resolve))
     }
 
     fn evaluate_module(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
         self.send(ruby, Request::EvaluateModule { module_id, reply: reply_tx })?;
-        self.pump(ruby, reply_rx, None, None)
+        self.pump(ruby, reply_rx, None)
     }
 
     fn module_namespace(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
         self.send(ruby, Request::ModuleNamespace { module_id, reply: reply_tx })?;
-        self.pump(ruby, reply_rx, None, None)
+        self.pump(ruby, reply_rx, None)
     }
 
     fn dispose_module(&self, ruby: &Ruby, module_id: i32) -> Result<(), Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
         self.send(ruby, Request::DisposeModule { module_id, reply: reply_tx })?;
-        self.pump(ruby, reply_rx, None, None).map(|_| ())
+        self.pump(ruby, reply_rx, None).map(|_| ())
     }
 
     // Terminate whatever is running. IsolateHandle is Send + refcounted —
@@ -2109,15 +1870,6 @@ impl Context {
             id,
             disposed: AtomicBool::new(false),
         })
-    }
-    fn load_module_graph(
-        ruby: &Ruby,
-        rb_self: &Self,
-        entry_url: String,
-        resolve: Proc,
-        fetch_batch: Proc,
-    ) -> Result<Value, Error> {
-        rb_self.core.load_module_graph(ruby, entry_url, resolve, fetch_batch)
     }
     fn compile_module(
         ruby: &Ruby,
@@ -2289,73 +2041,6 @@ fn js_runtime_error(ruby: &Ruby, message: String, backtrace: Vec<String>) -> Err
         Some(e) => Error::from(e),
         None => Error::new(class, message),
     }
-}
-
-// csim's result shape: { modules: [{ url:, cache_rejected: }, ...] }. No
-// cached_data in the spike, so cache_rejected is always false.
-fn module_graph_result(ruby: &Ruby, urls: &[String]) -> Value {
-    let mods = ruby.ary_new();
-    for u in urls {
-        let h = ruby.hash_new();
-        let _ = h.aset(ruby.to_symbol("url"), u.as_str());
-        let _ = h.aset(ruby.to_symbol("cache_rejected"), false);
-        let _ = mods.push(h);
-    }
-    let result = ruby.hash_new();
-    let _ = result.aset(ruby.to_symbol("modules"), mods);
-    result.as_value()
-}
-
-// Call Ruby's fetch_batch proc with the URL list; marshal back per-URL source.
-// A raised proc or wrong shape yields None for that slot (the walk then treats
-// it as a 404 — spike behaviour; a real impl would propagate the error).
-fn fetch_via_ruby(_ruby: &Ruby, fetch: Proc, urls: &[String]) -> Vec<Option<String>> {
-    match fetch.call::<_, Value>((urls.to_vec(),)) {
-        Ok(ret) => marshal_fetch(ret, urls.len()),
-        Err(_) => vec![None; urls.len()],
-    }
-}
-
-fn marshal_fetch(ret: Value, n: usize) -> Vec<Option<String>> {
-    let Ok(arr) = RArray::try_convert(ret) else {
-        return vec![None; n];
-    };
-    (0..n)
-        .map(|i| {
-            let el: Value = arr.entry::<Value>(i as isize).ok()?;
-            if el.is_nil() {
-                return None;
-            }
-            // csim: each element is [source, cached_data] or a bare source.
-            if let Ok(pair) = RArray::try_convert(el) {
-                return pair.entry::<String>(0).ok();
-            }
-            String::try_convert(el).ok()
-        })
-        .collect()
-}
-
-fn resolve_via_ruby(_ruby: &Ruby, resolve: Proc, edges: &[(String, String)]) -> Vec<Option<String>> {
-    match resolve.call::<_, Value>((edges.to_vec(),)) {
-        Ok(ret) => marshal_urls(ret, edges.len()),
-        Err(_) => vec![None; edges.len()],
-    }
-}
-
-fn marshal_urls(ret: Value, n: usize) -> Vec<Option<String>> {
-    let Ok(arr) = RArray::try_convert(ret) else {
-        return vec![None; n];
-    };
-    (0..n)
-        .map(|i| {
-            let el: Value = arr.entry::<Value>(i as isize).ok()?;
-            if el.is_nil() {
-                None
-            } else {
-                String::try_convert(el).ok()
-            }
-        })
-        .collect()
 }
 
 // instantiate's resolve block returns a RustyRacer::Module (or nil for a
@@ -2640,8 +2325,6 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("attach", method!(Context::attach, 2))?;
     class.define_method("reset_realm", method!(Context::reset_realm, 0))?;
     class.define_method("create_realm", method!(Context::create_realm, 0))?;
-    // keyword-arg wrapper Context#load_module_graph lives in lib/rusty_racer.rb
-    class.define_method("_load_module_graph", method!(Context::load_module_graph, 3))?;
     // keyword-arg wrapper Context#compile_module(source, filename:) in lib.
     class.define_method("_compile_module", method!(Context::compile_module, 2))?;
     class.define_method("stop", method!(Context::stop, 0))?;

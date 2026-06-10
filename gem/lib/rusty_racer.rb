@@ -37,13 +37,6 @@ module RustyRacer
       _eval_t(source, filename, timeout_ms)
     end
 
-    # Keyword-arg API over the positional Rust primitive. `resolve` maps
-    # [[specifier, referrer], ...] -> [url|nil, ...]; `fetch_batch` maps
-    # [url, ...] -> [[source, cached_data]|nil, ...]. Returns { modules: [...] }.
-    def load_module_graph(entry_url, resolve:, fetch_batch:)
-      _load_module_graph(entry_url, resolve, fetch_batch)
-    end
-
     # Compile an ES module; returns a RustyRacer::Module to instantiate/evaluate.
     def compile_module(source, filename: '<compile_module>')
       _compile_module(source, filename)
