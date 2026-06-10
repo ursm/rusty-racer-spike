@@ -482,6 +482,28 @@ impl Context {
         Self::eval_t(ruby, rb_self, source, 0)
     }
 
+    // Context#call(name, *args). Spike: reuse eval with JSON-injected args. A
+    // real impl would use Function::Call (preserves receiver, non-JSON values);
+    // for the supported primitive types this is equivalent and reuses the whole
+    // rendezvous / nesting / error path for free.
+    fn call(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
+        let Some((name, call_args)) = args.split_first() else {
+            return Err(Error::new(
+                ruby.exception_arg_error(),
+                "call requires a function name",
+            ));
+        };
+        let name = String::try_convert(*name)?;
+        let mut json = String::new();
+        for (i, v) in call_args.iter().enumerate() {
+            if i > 0 {
+                json.push(',');
+            }
+            json.push_str(&jsval_to_json(&ruby_to_jsval(*v)?));
+        }
+        Self::eval_t(ruby, rb_self, format!("({name})(...[{json}])"), 0)
+    }
+
     fn eval_t(ruby: &Ruby, rb_self: &Self, source: String, timeout_ms: u64) -> Result<Value, Error> {
         // Inside a proc serving a callback? Route as a nested eval through the
         // suspended V8 frame instead of the main queue (which is busy).
@@ -549,6 +571,35 @@ impl Context {
     }
 }
 
+// Minimal JSON encoding for Context#call's argument injection (primitives only,
+// matching what the marshaller supports).
+fn jsval_to_json(val: &JsVal) -> String {
+    match val {
+        JsVal::Undefined | JsVal::Null => "null".to_string(),
+        JsVal::Bool(b) => b.to_string(),
+        JsVal::Int(i) => i.to_string(),
+        JsVal::Num(n) if n.is_finite() => n.to_string(),
+        JsVal::Num(_) => "null".to_string(),
+        JsVal::Str(s) => {
+            let mut out = String::with_capacity(s.len() + 2);
+            out.push('"');
+            for c in s.chars() {
+                match c {
+                    '"' => out.push_str("\\\""),
+                    '\\' => out.push_str("\\\\"),
+                    '\n' => out.push_str("\\n"),
+                    '\r' => out.push_str("\\r"),
+                    '\t' => out.push_str("\\t"),
+                    c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                    c => out.push(c),
+                }
+            }
+            out.push('"');
+            out
+        }
+    }
+}
+
 fn jsval_to_ruby(ruby: &Ruby, val: &JsVal) -> Value {
     match val {
         JsVal::Undefined | JsVal::Null => ruby.qnil().as_value(),
@@ -588,6 +639,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_singleton_method("new", function!(Context::new, 0))?;
     class.define_method("eval", method!(Context::eval, 1))?;
     class.define_method("eval_t", method!(Context::eval_t, 2))?;
+    class.define_method("call", method!(Context::call, -1))?;
     class.define_method("attach", method!(Context::attach, 2))?;
     class.define_method("stop", method!(Context::stop, 0))?;
     class.define_method("dispose", method!(Context::dispose, 0))?;

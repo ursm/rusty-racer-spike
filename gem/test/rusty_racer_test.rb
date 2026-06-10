@@ -37,6 +37,13 @@ class RustyRacerTest < Minitest::Test
     assert_operator counter, :>, 1000, "GVL not released during eval"
   end
 
+  def test_call_invokes_global_function
+    @ctx.eval("function mul(a, b) { return a * b }")
+    assert_equal 6, @ctx.call("mul", 2, 3)
+    @ctx.eval('globalThis.greet = (who) => "hi " + who')
+    assert_equal "hi bob", @ctx.call("greet", "bob")
+  end
+
   def test_host_function_roundtrip
     @ctx.attach("rubyAdd", proc { |a, b| a + b })
     assert_equal 42, @ctx.eval("rubyAdd(20, 22)")
