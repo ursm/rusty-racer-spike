@@ -8,7 +8,8 @@ require "rusty_racer"
 # the mini_racer-csim audit's hang classes where relevant.
 class RustyRacerTest < Minitest::Test
   def setup
-    @ctx = RustyRacer::Context.new
+    @iso = RustyRacer::Isolate.new
+    @ctx = @iso.context
   end
 
   def test_eval_roundtrip
@@ -81,7 +82,7 @@ class RustyRacerTest < Minitest::Test
   end
 
   def test_host_namespace_injects_drain_microtasks
-    ctx = RustyRacer::Context.new(host_namespace: "MiniRacer")
+    ctx = RustyRacer::Isolate.new(host_namespace: "MiniRacer").context
     assert_equal "object", ctx.eval("typeof MiniRacer")
     assert_equal "function", ctx.eval("typeof MiniRacer.drainMicrotasks")
     order = ctx.eval(<<~JS)
@@ -95,9 +96,9 @@ class RustyRacerTest < Minitest::Test
     assert_equal %w[before microtask after], order
   end
 
-  def test_host_namespace_survives_reset_realm
-    ctx = RustyRacer::Context.new(host_namespace: "MiniRacer")
-    ctx.reset_realm
+  def test_host_namespace_survives_reset
+    ctx = RustyRacer::Isolate.new(host_namespace: "MiniRacer").context
+    ctx.reset
     assert_equal "object", ctx.eval("typeof MiniRacer")
   end
 
@@ -214,7 +215,7 @@ class RustyRacerTest < Minitest::Test
   end
 
   def test_attach_under_host_namespace
-    ctx = RustyRacer::Context.new(host_namespace: "MiniRacer")
+    ctx = RustyRacer::Isolate.new(host_namespace: "MiniRacer").context
     ctx.attach("MiniRacer.rubyAdd", proc { |a, b| a + b })
     assert_equal 7, ctx.eval("MiniRacer.rubyAdd(3, 4)")
     # creates intermediate objects even without a pre-existing namespace
@@ -223,7 +224,7 @@ class RustyRacerTest < Minitest::Test
   end
 
   def test_context_default_timeout
-    ctx = RustyRacer::Context.new(timeout_ms: 50)
+    ctx = RustyRacer::Isolate.new(timeout_ms: 50).context
     assert_raises(RustyRacer::ScriptTerminatedError) { ctx.eval("for(;;){}") }
     # context survives and a normal eval still works
     assert_equal 3, ctx.eval("1 + 2")
@@ -238,7 +239,7 @@ class RustyRacerTest < Minitest::Test
     @ctx.attach("rubyVal", proc { 99 })
     @ctx.eval('globalThis.out = null; Promise.resolve().then(() => { globalThis.out = rubyVal() });')
     assert_nil @ctx.eval("globalThis.out") # not run yet (explicit policy)
-    @ctx.perform_microtask_checkpoint
+    @iso.perform_microtask_checkpoint
     assert_equal 99, @ctx.eval("globalThis.out")
   end
 
@@ -256,7 +257,7 @@ class RustyRacerTest < Minitest::Test
       seen;
     JS
     assert_equal ["before"], order
-    @ctx.perform_microtask_checkpoint
+    @iso.perform_microtask_checkpoint
     assert_equal %w[before micro], @ctx.eval("globalThis.seen")
   end
 
@@ -332,10 +333,10 @@ class RustyRacerTest < Minitest::Test
     assert_raises(RangeError) { @ctx.eval('new Date("not a date")') }
   end
 
-  def test_reset_realm_clears_globals
+  def test_reset_clears_globals
     @ctx.eval("globalThis.x = 41")
     assert_equal 41, @ctx.eval("globalThis.x")
-    @ctx.reset_realm
+    @ctx.reset
     assert_equal "undefined", @ctx.eval("typeof globalThis.x")
     assert_equal 2, @ctx.eval("1 + 1") # realm usable after reset
   end
@@ -347,7 +348,7 @@ class RustyRacerTest < Minitest::Test
     JS
     assert_operator snap.size, :>, 0
 
-    ctx = RustyRacer::Context.new(snapshot: snap)
+    ctx = RustyRacer::Isolate.new(snapshot: snap).context
     assert_equal "from snapshot", ctx.eval("GREETING")
     assert_equal 42, ctx.eval("double(21)")
 
@@ -361,7 +362,7 @@ class RustyRacerTest < Minitest::Test
     assert_equal Encoding::ASCII_8BIT, blob.encoding
     reloaded = RustyRacer::Snapshot.load(blob)
     assert_equal snap.size, reloaded.size
-    ctx = RustyRacer::Context.new(snapshot: reloaded)
+    ctx = RustyRacer::Isolate.new(snapshot: reloaded).context
     assert_equal 7, ctx.eval("V")
   end
 
@@ -370,7 +371,7 @@ class RustyRacerTest < Minitest::Test
     before = snap.size
     snap.warmup!('function warmMe() { return A + 1 } warmMe();')
     assert_operator snap.size, :>=, before
-    ctx = RustyRacer::Context.new(snapshot: snap)
+    ctx = RustyRacer::Isolate.new(snapshot: snap).context
     assert_equal 1, ctx.eval("A")
     assert_equal 2, ctx.eval("warmMe()")
   end
@@ -382,8 +383,8 @@ class RustyRacerTest < Minitest::Test
   end
 
   def test_create_realm_is_isolated_from_main_and_siblings
-    a = @ctx.create_realm
-    b = @ctx.create_realm
+    a = @iso.create_context
+    b = @iso.create_context
     @ctx.eval("globalThis.x = 'main'")
     a.eval("globalThis.x = 'a'")
     b.eval("globalThis.x = 'b'")
@@ -395,8 +396,31 @@ class RustyRacerTest < Minitest::Test
     assert_equal "undefined", a.eval("typeof globalThis.notThere")
   end
 
+  def test_module_compiled_per_context_and_evaluates_in_it
+    other = @iso.create_context
+    m = other.compile_module("globalThis.WHERE = 'other'; export const x = 1;")
+    m.instantiate { |_s, _r| nil }
+    m.evaluate
+    # the module ran in `other`, not the default context
+    assert_equal "other", other.eval("globalThis.WHERE")
+    assert_equal "undefined", @ctx.eval("typeof globalThis.WHERE")
+  end
+
+  def test_cross_context_import_is_rejected_not_aborted
+    # a resolve block returning a module from a *different* context must fail
+    # cleanly (V8 would CHECK-abort the process otherwise).
+    other = @iso.create_context
+    dep_elsewhere = other.compile_module("export const x = 1;", filename: "/dep.js")
+    app = @ctx.compile_module('import {x} from "./dep.js";', filename: "/app.js")
+    assert_raises(RustyRacer::RuntimeError) do
+      app.instantiate { |_s, _r| dep_elsewhere } # foreign-context dep
+    end
+    # the isolate is still usable (no crash)
+    assert_equal 2, @ctx.eval("1 + 1")
+  end
+
   def test_realm_call_and_attach
-    r = @ctx.create_realm
+    r = @iso.create_context
     r.eval("function mul(a, b) { return a * b }")
     assert_equal 12, r.call("mul", 3, 4)
     r.attach("rubyAdd", proc { |a, b| a + b })
@@ -406,7 +430,7 @@ class RustyRacerTest < Minitest::Test
   end
 
   def test_realm_dispose
-    r = @ctx.create_realm
+    r = @iso.create_context
     assert_equal false, r.disposed?
     assert_equal 5, r.eval("2 + 3")
     r.dispose
@@ -474,20 +498,20 @@ class RustyRacerTest < Minitest::Test
     dep = @ctx.compile_module("export const v = 7;", filename: "/dep.js")
     dep.instantiate { |_s, _r| nil }
     dep.evaluate
-    @ctx.dynamic_import_resolver = ->(specifier, _referrer) { specifier == "/dep.js" ? dep : nil }
+    @iso.dynamic_import_resolver = ->(specifier, _referrer) { specifier == "/dep.js" ? dep : nil }
 
     @ctx.eval(<<~JS, filename: "/main.js")
       globalThis.OUT = null;
       import("/dep.js").then(m => { globalThis.OUT = m.v });
     JS
     assert_nil @ctx.eval("globalThis.OUT") # pending until drained (explicit policy)
-    @ctx.perform_microtask_checkpoint
+    @iso.perform_microtask_checkpoint
     assert_equal 7, @ctx.eval("globalThis.OUT")
   end
 
   def test_dynamic_import_without_resolver_rejects
     @ctx.eval('globalThis.ERR = null; import("/x.js").catch(e => { globalThis.ERR = String(e) });')
-    @ctx.perform_microtask_checkpoint
+    @iso.perform_microtask_checkpoint
     assert_match(/import|not|resolved/i, @ctx.eval("globalThis.ERR"))
   end
 
@@ -501,7 +525,7 @@ class RustyRacerTest < Minitest::Test
     assert_equal Encoding::ASCII_8BIT, blob.encoding
 
     # consume it in a fresh context: accepted (not rejected), same result
-    ctx2 = RustyRacer::Context.new
+    ctx2 = RustyRacer::Isolate.new.context
     m2 = ctx2.compile_module(src, filename: "/m.js", cached_data: blob)
     assert_equal false, m2.cache_rejected?
     m2.instantiate { |_s, _r| nil }
@@ -567,7 +591,7 @@ class RustyRacerTest < Minitest::Test
   end
 
   def test_timeout_terminates_and_recovers
-    assert_raises(RustyRacer::ScriptTerminatedError) { @ctx.eval_t("for(;;){}", 100) }
+    assert_raises(RustyRacer::ScriptTerminatedError) { @ctx.eval("for(;;){}", timeout_ms: 100) }
     assert_equal 4, @ctx.eval("2 + 2")
   end
 
@@ -575,7 +599,7 @@ class RustyRacerTest < Minitest::Test
     # audit #3: a late TerminateExecution must not leak into the next request.
     100.times do
       begin
-        @ctx.eval_t("{ const u = Date.now() + 1; while (Date.now() < u) {} }", 1)
+        @ctx.eval("{ const u = Date.now() + 1; while (Date.now() < u) {} }", timeout_ms: 1)
       rescue RustyRacer::ScriptTerminatedError
         # terminated this round — fine
       end
@@ -584,7 +608,7 @@ class RustyRacerTest < Minitest::Test
   end
 
   def test_stop_from_another_thread_then_usable
-    stopper = Thread.new { sleep 0.05; @ctx.stop }
+    stopper = Thread.new { sleep 0.05; @iso.terminate }
     assert_raises(RustyRacer::ScriptTerminatedError) { @ctx.eval("for(;;){}") }
     stopper.join
     assert_equal 6, @ctx.eval("3 + 3")
@@ -593,7 +617,8 @@ class RustyRacerTest < Minitest::Test
   def test_dispose_racing_eval_does_not_hang
     # audit #12/#13/#26: dispose racing an in-flight eval must not hang.
     10.times do
-      c = RustyRacer::Context.new
+      iso = RustyRacer::Isolate.new
+      c = iso.context
       worker = Thread.new do
         c.eval("const u = Date.now() + 30; while (Date.now() < u) {}")
       rescue StandardError
@@ -601,7 +626,7 @@ class RustyRacerTest < Minitest::Test
         # race); hanging is not.
       end
       sleep(rand * 0.03)
-      c.dispose
+      iso.dispose
       assert worker.join(5), "worker hung"
       # post-dispose use raises the plain disposed-context guard, not a JS error
       assert_raises(::RuntimeError) { c.eval("1") }

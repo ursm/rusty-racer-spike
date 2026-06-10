@@ -9,10 +9,14 @@ Embed [V8](https://v8.dev/) in Ruby, built on [rusty_v8](https://crates.io/crate
 
 ## What it can do
 
+Names follow V8's: an `Isolate` is the VM; it hands out `Context`s (v8::Context,
+a realm) that you run JS in.
+
 ```ruby
 require "rusty_racer"
 
-ctx = RustyRacer::Context.new(timeout_ms: 1000)
+iso = RustyRacer::Isolate.new(timeout_ms: 1000)
+ctx = iso.context                        # the default context
 
 ctx.eval("1 + 1")                        # => 2
 ctx.eval("({a: 1, b: [true, 'x']})")     # => {"a"=>1, "b"=>[true, "x"]}
@@ -48,13 +52,13 @@ app.namespace["r"]                       # => 42
 
 # Bytecode cache for cross-process boot:
 blob = ctx.compile_module(src, produce_cache: true).cached_data
-ctx2.compile_module(src, cached_data: blob)   # skips reparse
+iso2.context.compile_module(src, cached_data: blob)   # skips reparse
 ```
 
-Also: `Snapshot` (startup blobs), `Context#create_realm` (isolated globals in
-one isolate), `Context#perform_microtask_checkpoint` (manual event-loop
-control — microtasks never auto-drain), `Context#dynamic_import_resolver=`,
-`Platform.set_flags!`.
+Also: `Snapshot` (startup blobs), `Isolate#create_context` (an extra realm —
+isolated globals sharing the heap), `Isolate#perform_microtask_checkpoint`
+(manual event-loop control — microtasks never auto-drain), `Isolate#terminate`,
+`Isolate#dynamic_import_resolver=`, `Context#reset`, `Platform.set_flags!`.
 
 ## Building
 

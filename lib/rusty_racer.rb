@@ -4,13 +4,12 @@ require "set" # JS Set <-> Ruby Set marshalling needs the stdlib Set constant
 
 require_relative "rusty_racer/version"
 
-# Load the compiled extension (defines RustyRacer::Context). rb-sys names the
-# init after the crate; the .so lands at rusty_racer/rusty_racer.<dlext>.
+# Load the compiled extension (defines RustyRacer::Isolate etc.). rb-sys names
+# the init after the crate; the .so lands at rusty_racer/rusty_racer.<dlext>.
 require "rusty_racer/rusty_racer"
 
 module RustyRacer
-  # The error hierarchy csim's V8 adapter rescues. The extension maps VM
-  # failures to these (see err_class in the Rust side).
+  # JS exceptions map to these (see err_class on the Rust side).
   class Error < StandardError; end
   class EvalError < Error; end
   class ParseError < EvalError; end
@@ -19,7 +18,8 @@ module RustyRacer
   class SnapshotError < Error; end
   class PlatformAlreadyInitialized < Error; end
 
-  class Context
+  # A V8 isolate. Owns the VM and its lifecycle; hands out Contexts to run JS in.
+  class Isolate
     # Keyword-arg constructor over the positional Rust primitive. A snapshot
     # (RustyRacer::Snapshot) boots the isolate with its baked-in state;
     # timeout_ms caps each eval/call (0 = no limit) against in-V8 infinite loops.
@@ -27,14 +27,21 @@ module RustyRacer
       _new(host_namespace, snapshot, timeout_ms)
     end
 
-    # `filename` names the script in stack traces and parse-error locations.
-    def eval(source, filename: '<eval>')
-      _eval(source, filename)
+    # ->(specifier, referrer_url) { already-loaded Module } for JS import().
+    # Held in an ivar so the proc stays alive for the isolate's lifetime (the
+    # native side only keeps a weak handle).
+    def dynamic_import_resolver=(resolver)
+      @dynamic_import_resolver = resolver
+      _set_dynamic_import_resolver(resolver)
     end
+  end
 
-    # Evaluate with a millisecond timeout (raises ScriptTerminatedError).
-    def eval_t(source, timeout_ms, filename: '<eval>')
-      _eval_t(source, filename, timeout_ms)
+  # A v8::Context (realm) handed out by an Isolate: where JS actually runs.
+  class Context
+    # `timeout_ms` (0 = the isolate default) caps this eval; `filename` names the
+    # script in stack traces and parse-error locations.
+    def eval(source, timeout_ms: 0, filename: '<eval>')
+      _eval(source, timeout_ms, filename)
     end
 
     # Compile an ES module; returns a RustyRacer::Module to instantiate/evaluate.
@@ -43,20 +50,6 @@ module RustyRacer
     # readable via Module#cached_data for cross-process reuse.
     def compile_module(source, filename: '<compile_module>', cached_data: nil, produce_cache: false)
       _compile_module(source, filename, cached_data, produce_cache)
-    end
-
-    # ->(specifier, referrer_url) { already-loaded Module } for JS import().
-    # Held in an ivar so the proc stays alive for the Context's lifetime (the
-    # native side only keeps a weak handle).
-    def dynamic_import_resolver=(resolver)
-      @dynamic_import_resolver = resolver
-      _set_dynamic_import_resolver(resolver)
-    end
-  end
-
-  class Realm
-    def eval(source, filename: '<eval>')
-      _eval(source, filename)
     end
   end
 
