@@ -491,6 +491,47 @@ class RustyRacerTest < Minitest::Test
     assert_match(/import|not|resolved/i, @ctx.eval("globalThis.ERR"))
   end
 
+  def test_module_cached_data_round_trip
+    src = "export const x = 1 + 2;"
+    # produce a bytecode cache
+    m1 = @ctx.compile_module(src, filename: "/m.js", produce_cache: true)
+    blob = m1.cached_data
+    refute_nil blob
+    assert_operator blob.bytesize, :>, 0
+    assert_equal Encoding::ASCII_8BIT, blob.encoding
+
+    # consume it in a fresh context: accepted (not rejected), same result
+    ctx2 = RustyRacer::Context.new
+    m2 = ctx2.compile_module(src, filename: "/m.js", cached_data: blob)
+    assert_equal false, m2.cache_rejected?
+    m2.instantiate { |_s, _r| nil }
+    m2.evaluate
+    assert_equal 3, m2.namespace["x"]
+  end
+
+  def test_module_cache_rejected_on_source_mismatch
+    blob = @ctx.compile_module("export const x = 1;", produce_cache: true).cached_data
+    # a different source invalidates the cache; V8 recompiles and flags rejected
+    m = @ctx.compile_module("export const x = 999;", cached_data: blob)
+    assert_equal true, m.cache_rejected?
+    m.instantiate { |_s, _r| nil }
+    m.evaluate
+    assert_equal 999, m.namespace["x"] # still correct (recompiled from source)
+  end
+
+  def test_module_non_binary_cached_data_raises
+    # a cache string that isn't ASCII-8BIT (e.g. read without 'rb') is refused
+    assert_raises(EncodingError) do
+      @ctx.compile_module("export const x = 1;", cached_data: "not binary".encode("UTF-8"))
+    end
+  end
+
+  def test_module_without_produce_cache_has_nil_cached_data
+    m = @ctx.compile_module("export const x = 1;")
+    assert_nil m.cached_data
+    assert_equal false, m.cache_rejected?
+  end
+
   def test_es_module_dispose
     m = @ctx.compile_module("export const a = 1;")
     assert_equal false, m.disposed?

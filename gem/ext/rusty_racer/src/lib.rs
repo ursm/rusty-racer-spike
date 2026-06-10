@@ -167,6 +167,10 @@ enum Request {
     CompileModule {
         source: String,
         filename: String,
+        // Bytecode cache to consume (skip reparse); None compiles fresh.
+        cached_data: Option<Vec<u8>>,
+        // Produce a fresh bytecode cache to hand back (Module#cached_data).
+        produce_cache: bool,
         reply: Sender<VmReply>,
     },
     // instantiate: V8 walks imports, calling back to the Ruby resolve block
@@ -190,9 +194,19 @@ enum Request {
     Dispose,
 }
 
+// compile_module result: the module's id plus any produced bytecode cache and
+// whether a supplied cache was rejected.
+struct CompiledModule {
+    id: i32,
+    cached_data: Option<Vec<u8>>,
+    cache_rejected: bool,
+}
+
 // V8 thread -> the Ruby thread that is waiting on this request
 enum VmReply {
     Done(Result<JsVal, VmError>),
+    // compile_module's richer reply (id + produced cache + cache_rejected).
+    ModuleCompiled(Result<CompiledModule, VmError>),
     // JS called host fn |id|; run the proc and send the answer back.
     Callback {
         host_fn_id: usize,
@@ -1150,6 +1164,8 @@ fn v8_thread_main(
             Request::CompileModule {
                 source,
                 filename,
+                cached_data,
+                produce_cache,
                 reply,
             } => {
                 let outcome = {
@@ -1161,9 +1177,43 @@ fn v8_thread_main(
                         None => Err(VmError::Runtime("module source too large".into())),
                         Some(code) => {
                             let origin = module_origin(tc, &filename);
-                            let mut src = v8::script_compiler::Source::new(code, Some(&origin));
-                            match v8::script_compiler::compile_module(tc, &mut src) {
+                            // Consume a supplied bytecode cache (skip reparse) or
+                            // compile fresh.
+                            let (mut src, opts) = match &cached_data {
+                                Some(bytes) => (
+                                    v8::script_compiler::Source::new_with_cached_data(
+                                        code,
+                                        Some(&origin),
+                                        v8::script_compiler::CachedData::new(bytes),
+                                    ),
+                                    v8::script_compiler::CompileOptions::ConsumeCodeCache,
+                                ),
+                                None => (
+                                    v8::script_compiler::Source::new(code, Some(&origin)),
+                                    v8::script_compiler::CompileOptions::NoCompileOptions,
+                                ),
+                            };
+                            let compiled = v8::script_compiler::compile_module2(
+                                tc,
+                                &mut src,
+                                opts,
+                                v8::script_compiler::NoCacheReason::NoReason,
+                            );
+                            match compiled {
                                 Some(module) => {
+                                    // V8 marks a stale/incompatible supplied cache
+                                    // rejected; the embedder recompiles & re-caches.
+                                    let cache_rejected = cached_data.is_some()
+                                        && src.get_cached_data().is_some_and(|c| c.rejected());
+                                    // Produce a fresh cache from the unbound script.
+                                    let produced = if produce_cache {
+                                        module
+                                            .get_unbound_module_script(tc)
+                                            .create_code_cache()
+                                            .map(|c| c.to_vec())
+                                    } else {
+                                        None
+                                    };
                                     let id = MODULES.with(|m| {
                                         let mut m = m.borrow_mut();
                                         let id = m.next_id;
@@ -1174,7 +1224,11 @@ fn v8_thread_main(
                                         m.by_hash.entry(hash).or_default().push((g, id));
                                         id
                                     });
-                                    Ok(JsVal::Int(id as i64))
+                                    Ok(CompiledModule {
+                                        id,
+                                        cached_data: produced,
+                                        cache_rejected,
+                                    })
                                 }
                                 None if tc.has_terminated() => Err(VmError::Terminated),
                                 // A module compile failure is a parse error
@@ -1200,7 +1254,7 @@ fn v8_thread_main(
                         }
                     }
                 };
-                let _ = reply.send(VmReply::Done(outcome));
+                let _ = reply.send(VmReply::ModuleCompiled(outcome));
             }
             Request::InstantiateModule { module_id, reply } => {
                 // REPLY_STACK so resolve_imported can round-trip per import edge.
@@ -1416,6 +1470,10 @@ struct JsModule {
     core: Arc<Core>,
     module_id: i32,
     disposed: AtomicBool,
+    // Bytecode cache produced at compile (produce_cache:), and whether a
+    // supplied cache was rejected — exposed as #cached_data / #cache_rejected?.
+    cached_data: Option<Vec<u8>>,
+    cache_rejected: bool,
 }
 
 // Set true once V8 is initialized; Platform.set_flags! refuses after that
@@ -1647,6 +1705,13 @@ impl Core {
             match message {
                 Ok(VmReply::Done(Ok(val))) => return jsval_to_ruby(ruby, &val),
                 Ok(VmReply::Done(Err(e))) => return Err(vm_err(ruby, e)),
+                // compile_module receives this directly, never via pump.
+                Ok(VmReply::ModuleCompiled(_)) => {
+                    return Err(Error::new(
+                        ruby.exception_runtime_error(),
+                        "unexpected compile reply",
+                    ));
+                }
                 Ok(VmReply::Callback {
                     host_fn_id,
                     args,
@@ -1889,17 +1954,35 @@ impl Core {
     }
 
     // Thin ESM primitives. compile_module returns the new module's id.
-    fn compile_module(&self, ruby: &Ruby, source: String, filename: String) -> Result<i32, Error> {
+    fn compile_module(
+        &self,
+        ruby: &Ruby,
+        source: String,
+        filename: String,
+        cached_data: Option<Vec<u8>>,
+        produce_cache: bool,
+    ) -> Result<CompiledModule, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
         self.send(
             ruby,
             Request::CompileModule {
                 source,
                 filename,
+                cached_data,
+                produce_cache,
                 reply: reply_tx,
             },
         )?;
-        i32::try_convert(self.pump(ruby, reply_rx, None)?)
+        // compile_module can't trigger host callbacks, so receive directly
+        // (release the GVL) rather than via pump.
+        match without_gvl(|| reply_rx.recv()) {
+            Ok(VmReply::ModuleCompiled(Ok(cm))) => Ok(cm),
+            Ok(VmReply::ModuleCompiled(Err(e))) => Err(vm_err(ruby, e)),
+            _ => Err(Error::new(
+                ruby.exception_runtime_error(),
+                "V8 thread went away mid-compile",
+            )),
+        }
     }
 
     // instantiate carries the resolve block to pump so resolve_imported can ask
@@ -2002,12 +2085,39 @@ impl Context {
         rb_self: &Self,
         source: String,
         filename: String,
+        cached_data: Option<magnus::RString>,
+        produce_cache: bool,
     ) -> Result<JsModule, Error> {
-        let id = rb_self.core.compile_module(ruby, source, filename)?;
+        // A bytecode cache is raw bytes; refuse a non-binary string so a cache
+        // file read without 'rb' (silently transcoded) fails loudly instead of
+        // being consumed as garbage and rejected with no signal (csim parity).
+        let cache_in = match cached_data {
+            Some(s) => {
+                let enc: String = s
+                    .funcall::<_, _, Value>("encoding", ())?
+                    .funcall("to_s", ())?;
+                if enc != "ASCII-8BIT" {
+                    let cls = ruby
+                        .class_object()
+                        .const_get::<_, ExceptionClass>("EncodingError")?;
+                    return Err(Error::new(
+                        cls,
+                        format!("cached_data must be ASCII-8BIT (binary), got {enc}"),
+                    ));
+                }
+                Some(unsafe { s.as_slice() }.to_vec())
+            }
+            None => None,
+        };
+        let cm = rb_self
+            .core
+            .compile_module(ruby, source, filename, cache_in, produce_cache)?;
         Ok(JsModule {
             core: rb_self.core.clone(),
-            module_id: id,
+            module_id: cm.id,
             disposed: AtomicBool::new(false),
+            cached_data: cm.cached_data,
+            cache_rejected: cm.cache_rejected,
         })
     }
     // Context#dynamic_import_resolver = ->(specifier, referrer_url) { module }.
@@ -2130,6 +2240,19 @@ impl JsModule {
     fn namespace(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
         rb_self.core.module_namespace(ruby, rb_self.module_id)
+    }
+    // The bytecode cache produced at compile (produce_cache: true), as a binary
+    // String, or nil. Persist it cross-process and pass back via cached_data:.
+    fn cached_data(ruby: &Ruby, rb_self: &Self) -> Value {
+        match &rb_self.cached_data {
+            Some(bytes) => ruby.str_from_slice(bytes).as_value(),
+            None => ruby.qnil().as_value(),
+        }
+    }
+    // True if a cached_data: supplied at compile was stale/incompatible and V8
+    // recompiled from source instead.
+    fn cache_rejected(&self) -> bool {
+        self.cache_rejected
     }
     fn dispose(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
         if rb_self.disposed.swap(true, Ordering::SeqCst) {
@@ -2455,8 +2578,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     class.define_method("attach", method!(Context::attach, 2))?;
     class.define_method("reset_realm", method!(Context::reset_realm, 0))?;
     class.define_method("create_realm", method!(Context::create_realm, 0))?;
-    // keyword-arg wrapper Context#compile_module(source, filename:) in lib.
-    class.define_method("_compile_module", method!(Context::compile_module, 2))?;
+    // keyword-arg wrapper Context#compile_module(source, filename:, ...) in lib.
+    class.define_method("_compile_module", method!(Context::compile_module, 4))?;
     // lib keeps the proc in an ivar (GC liveness) and calls this primitive.
     class.define_method(
         "_set_dynamic_import_resolver",
@@ -2492,6 +2615,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     jsmodule.define_method("_instantiate", method!(JsModule::instantiate, 1))?;
     jsmodule.define_method("evaluate", method!(JsModule::evaluate, 0))?;
     jsmodule.define_method("namespace", method!(JsModule::namespace, 0))?;
+    jsmodule.define_method("cached_data", method!(JsModule::cached_data, 0))?;
+    jsmodule.define_method("cache_rejected?", method!(JsModule::cache_rejected, 0))?;
     jsmodule.define_method("dispose", method!(JsModule::dispose, 0))?;
     jsmodule.define_method("disposed?", method!(JsModule::disposed, 0))?;
 

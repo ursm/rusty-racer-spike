@@ -38,8 +38,11 @@ module RustyRacer
     end
 
     # Compile an ES module; returns a RustyRacer::Module to instantiate/evaluate.
-    def compile_module(source, filename: '<compile_module>')
-      _compile_module(source, filename)
+    # cached_data: a binary bytecode cache to consume (skip reparse); the result
+    # reports #cache_rejected? if stale. produce_cache: collect a fresh cache,
+    # readable via Module#cached_data for cross-process reuse.
+    def compile_module(source, filename: '<compile_module>', cached_data: nil, produce_cache: false)
+      _compile_module(source, filename, cached_data, produce_cache)
     end
 
     # ->(specifier, referrer_url) { already-loaded Module } for JS import().
