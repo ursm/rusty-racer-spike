@@ -47,16 +47,15 @@ jobs:
         working-directory: rusty_v8
         env:
           V8_FROM_SOURCE: "1"
-          # Pin BOTH to the same LLVM 21: CLANG_BASE_PATH compiles V8 (and
-          # configures its bundled libc++), LIBCLANG_PATH is what bindgen uses
-          # to parse those headers. The first two runs set only LIBCLANG_PATH,
-          # so the build auto-downloaded a chromium *trunk* clang to compile V8
-          # while bindgen parsed the trunk-configured libc++ with release
-          # libclang-21 -> "unresolved using declaration". Matching them fixes it.
-          # (build.rs takes the unversioned <base>/bin/clang, which llvm.sh
-          # installs at /usr/lib/llvm-21/bin/clang.)
-          CLANG_BASE_PATH: "/usr/lib/llvm-21"
-          LIBCLANG_PATH: "/usr/lib/llvm-21/lib"
+          # V8 15.0's vendored rust-toolchain is LLVM 23, so compile, the
+          # rust-allocator's libclang_rt.builtins, AND bindgen must all use
+          # clang 23. apt tops out at 21 (run 3 failed: builtins wanted clang/23
+          # under llvm-21). clang 23 only exists as the chromium clang the build
+          # downloads — so DON'T set CLANG_BASE_PATH (let build.rs download it to
+          # target/release/clang, used for compile + builtins), and point bindgen
+          # at that same downloaded clang. The path is created before bindgen
+          # runs; clang-sys resolves LIBCLANG_PATH lazily.
+          LIBCLANG_PATH: "${{ github.workspace }}/rusty_v8/target/release/clang/lib"
         run: cargo build --release -vv
       - name: "Stage the static archive"
         run: |
