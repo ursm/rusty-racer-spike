@@ -205,6 +205,61 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2**70 + 1, @ctx.call("inc", 2**70)
   end
 
+  def test_call_void_runs_without_marshalling_return
+    # call_void runs the fn for its side effect but never walks the return,
+    # so a huge/cyclic result is fine and the Ruby return is nil.
+    @ctx.eval("function makeCyclic() { const a = {}; a.self = a; globalThis.RAN = true; return a }")
+    assert_nil @ctx.call_void("makeCyclic")
+    assert_equal true, @ctx.eval("globalThis.RAN")
+  end
+
+  def test_attach_under_host_namespace
+    ctx = RustyRacer::Context.new(host_namespace: "MiniRacer")
+    ctx.attach("MiniRacer.rubyAdd", proc { |a, b| a + b })
+    assert_equal 7, ctx.eval("MiniRacer.rubyAdd(3, 4)")
+    # creates intermediate objects even without a pre-existing namespace
+    ctx.attach("Helpers.greet", proc { |who| "hi #{who}" })
+    assert_equal "hi bob", ctx.eval('Helpers.greet("bob")')
+  end
+
+  def test_context_default_timeout
+    ctx = RustyRacer::Context.new(timeout_ms: 50)
+    assert_raises(RustyRacer::ScriptTerminatedError) { ctx.eval("for(;;){}") }
+    # context survives and a normal eval still works
+    assert_equal 3, ctx.eval("1 + 2")
+    # the default also applies to call
+    ctx.eval("function spin() { for(;;){} }")
+    assert_raises(RustyRacer::ScriptTerminatedError) { ctx.call("spin") }
+  end
+
+  def test_host_fn_invoked_from_microtask_during_checkpoint
+    # csim's settle model: a Promise resolved via a host callback. The host fn
+    # fires from a microtask during the checkpoint and must still route to Ruby.
+    @ctx.attach("rubyVal", proc { 99 })
+    @ctx.eval('globalThis.out = null; Promise.resolve().then(() => { globalThis.out = rubyVal() });')
+    assert_nil @ctx.eval("globalThis.out") # not run yet (explicit policy)
+    @ctx.perform_microtask_checkpoint
+    assert_equal 99, @ctx.eval("globalThis.out")
+  end
+
+  def test_attach_does_not_clobber_primitive_global
+    @ctx.eval("globalThis.x = 42")
+    assert_raises(RustyRacer::RuntimeError) { @ctx.attach("x.y", proc { 1 }) }
+    assert_equal 42, @ctx.eval("globalThis.x") # untouched
+  end
+
+  def test_perform_microtask_checkpoint_drains_queue
+    order = @ctx.eval(<<~JS)
+      globalThis.seen = [];
+      Promise.resolve().then(() => seen.push("micro"));
+      seen.push("before");
+      seen;
+    JS
+    assert_equal ["before"], order
+    @ctx.perform_microtask_checkpoint
+    assert_equal %w[before micro], @ctx.eval("globalThis.seen")
+  end
+
   def test_call_unknown_name_raises_not_injects
     # name is resolved as a property path, never eval'd, so a bogus/injection-y
     # name cannot execute code — it just fails to resolve to a function.

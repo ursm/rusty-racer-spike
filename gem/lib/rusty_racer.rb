@@ -21,9 +21,10 @@ module RustyRacer
 
   class Context
     # Keyword-arg constructor over the positional Rust primitive. A snapshot
-    # (RustyRacer::Snapshot) boots the isolate with its baked-in state.
-    def self.new(host_namespace: nil, snapshot: nil)
-      _new(host_namespace, snapshot)
+    # (RustyRacer::Snapshot) boots the isolate with its baked-in state;
+    # timeout_ms caps each eval/call (0 = no limit) against in-V8 infinite loops.
+    def self.new(host_namespace: nil, snapshot: nil, timeout_ms: 0)
+      _new(host_namespace, snapshot, timeout_ms)
     end
 
     # `filename` names the script in stack traces and parse-error locations.

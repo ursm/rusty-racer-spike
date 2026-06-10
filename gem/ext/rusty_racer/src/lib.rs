@@ -129,6 +129,15 @@ enum Request {
         realm_id: i32,
         name: String,
         args: Vec<JsVal>,
+        // void = don't marshal the return (fire-and-forget): the called fn may
+        // return a huge/cyclic JS object the caller never reads.
+        void: bool,
+        timeout_ms: u64,
+        reply: Sender<VmReply>,
+    },
+    // Drain the isolate's microtask queue once (no auto event loop).
+    DrainMicrotasks {
+        timeout_ms: u64,
         reply: Sender<VmReply>,
     },
     Attach {
@@ -199,6 +208,7 @@ enum Answer {
     NestedCall {
         name: String,
         args: Vec<JsVal>,
+        void: bool,
         reply: Sender<VmReply>,
     },
     // per-URL module source (None = fetch failed / 404)
@@ -559,9 +569,9 @@ fn host_fn_callback(
                 let outcome = run_source(scope, &source, &filename);
                 let _ = reply.send(VmReply::Done(outcome));
             }
-            Ok(Answer::NestedCall { name, args, reply }) => {
+            Ok(Answer::NestedCall { name, args, void, reply }) => {
                 // ruby -> js -> ruby calls ctx.call -> js: invoke re-entrantly.
-                let outcome = call_function(scope, &name, &args);
+                let outcome = call_function(scope, &name, &args, void);
                 let _ = reply.send(VmReply::Done(outcome));
             }
             Ok(Answer::FetchResult(_)) | Ok(Answer::ResolveResult(_)) => {
@@ -715,6 +725,7 @@ fn call_function(
     scope: &mut v8::PinScope<'_, '_>,
     name: &str,
     args: &[JsVal],
+    void: bool,
 ) -> Result<JsVal, VmError> {
     v8::tc_scope!(let tc, scope);
     let context = tc.get_current_context();
@@ -750,6 +761,8 @@ fn call_function(
     };
     let argv: Vec<v8::Local<v8::Value>> = args.iter().map(|a| jsval_to_js(tc, a)).collect();
     match func.call(tc, recv, &argv) {
+        // void: skip marshalling the return so a huge/cyclic result is never walked.
+        Some(_) if void => Ok(JsVal::Undefined),
         Some(value) => Ok(js_to_jsval(tc, value)),
         None if tc.has_terminated() => Err(VmError::Terminated),
         None => {
@@ -927,6 +940,37 @@ fn load_module_graph_inner(
     Ok(new_urls)
 }
 
+// Per-request watchdog, split so neither half borrows the isolate (it runs off
+// a Send IsolateHandle): start before running JS, finish after. Joining before
+// the reply and cancelling unconditionally if it fired keeps a late
+// TerminateExecution from poisoning the next request (audit #3).
+fn start_watchdog(
+    handle: v8::IsolateHandle,
+    timeout_ms: u64,
+) -> (Sender<()>, Option<std::thread::JoinHandle<bool>>) {
+    let (cancel_tx, cancel_rx) = channel::<()>();
+    let watchdog = (timeout_ms > 0).then(|| {
+        std::thread::spawn(move || {
+            match cancel_rx.recv_timeout(Duration::from_millis(timeout_ms)) {
+                Ok(()) => false,
+                Err(_) => {
+                    handle.terminate_execution();
+                    true
+                }
+            }
+        })
+    });
+    (cancel_tx, watchdog)
+}
+
+// Returns true if the watchdog fired (caller must cancel_terminate_execution).
+fn finish_watchdog(cancel_tx: Sender<()>, watchdog: Option<std::thread::JoinHandle<bool>>) -> bool {
+    watchdog.is_some_and(|w| {
+        let _ = cancel_tx.send(());
+        w.join().unwrap_or(false)
+    })
+}
+
 fn v8_thread_main(
     rx: Receiver<Request>,
     handle_tx: Sender<v8::IsolateHandle>,
@@ -941,6 +985,10 @@ fn v8_thread_main(
         None => Default::default(),
     };
     let mut isolate = v8::Isolate::new(create_params);
+    // Explicit microtask policy: never auto-drain at end-of-script. Microtasks
+    // run only on perform_microtask_checkpoint / the host-namespace
+    // drainMicrotasks — the embedder owns the event loop (no real timers/loop).
+    isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
     let _ = handle_tx.send(isolate.thread_safe_handle());
     // mut: reset_realm swaps this for a fresh Context in the same warm isolate.
     let mut main_context = {
@@ -966,24 +1014,7 @@ fn v8_thread_main(
                 reply,
             } => {
                 REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
-
-                // Watchdog: fire-and-join per timed request. Joining before
-                // the reply and cancelling unconditionally if it fired keeps a
-                // late termination from poisoning the next request (audit #3).
-                let (cancel_tx, cancel_rx) = channel::<()>();
-                let watchdog = (timeout_ms > 0).then(|| {
-                    let handle = isolate.thread_safe_handle();
-                    std::thread::spawn(move || {
-                        match cancel_rx.recv_timeout(Duration::from_millis(timeout_ms)) {
-                            Ok(()) => false,
-                            Err(_) => {
-                                handle.terminate_execution();
-                                true
-                            }
-                        }
-                    })
-                });
-
+                let (cancel_tx, watchdog) = start_watchdog(isolate.thread_safe_handle(), timeout_ms);
                 let outcome = match realm_context(&main_context, &realms, realm_id) {
                     Some(ctx) => {
                         v8::scope!(let scope, &mut isolate);
@@ -993,15 +1024,9 @@ fn v8_thread_main(
                     }
                     None => Err(VmError::Runtime("realm disposed or unknown".into())),
                 };
-
-                let fired = watchdog.is_some_and(|w| {
-                    let _ = cancel_tx.send(());
-                    w.join().unwrap_or(false)
-                });
-                if fired {
+                if finish_watchdog(cancel_tx, watchdog) {
                     isolate.cancel_terminate_execution();
                 }
-
                 REPLY_STACK.with(|s| {
                     s.borrow_mut().pop();
                 });
@@ -1011,23 +1036,55 @@ fn v8_thread_main(
                 realm_id,
                 name,
                 args,
+                void,
+                timeout_ms,
                 reply,
             } => {
                 // REPLY_STACK so a host fn invoked by the called function routes
                 // back to this request's waiter, exactly like Eval.
                 REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
+                let (cancel_tx, watchdog) = start_watchdog(isolate.thread_safe_handle(), timeout_ms);
                 let outcome = match realm_context(&main_context, &realms, realm_id) {
                     Some(ctx) => {
                         v8::scope!(let scope, &mut isolate);
                         let context = v8::Local::new(scope, &ctx);
                         let scope = &mut v8::ContextScope::new(scope, context);
-                        call_function(scope, &name, &args)
+                        call_function(scope, &name, &args, void)
                     }
                     None => Err(VmError::Runtime("realm disposed or unknown".into())),
                 };
+                if finish_watchdog(cancel_tx, watchdog) {
+                    isolate.cancel_terminate_execution();
+                }
                 REPLY_STACK.with(|s| {
                     s.borrow_mut().pop();
                 });
+                let _ = reply.send(VmReply::Done(outcome));
+            }
+            Request::DrainMicrotasks { timeout_ms, reply } => {
+                // A microtask may call an attached host fn (a Promise .then ->
+                // ruby), so push the reply onto REPLY_STACK exactly like Eval,
+                // or that callback would find no waiter and silently no-op.
+                REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
+                let (cancel_tx, watchdog) = start_watchdog(isolate.thread_safe_handle(), timeout_ms);
+                {
+                    v8::scope!(let scope, &mut isolate);
+                    let context = v8::Local::new(scope, &main_context);
+                    let scope = &mut v8::ContextScope::new(scope, context);
+                    scope.perform_microtask_checkpoint();
+                }
+                let fired = finish_watchdog(cancel_tx, watchdog);
+                if fired {
+                    isolate.cancel_terminate_execution();
+                }
+                REPLY_STACK.with(|s| {
+                    s.borrow_mut().pop();
+                });
+                let outcome = if fired {
+                    Err(VmError::Terminated)
+                } else {
+                    Ok(JsVal::Undefined)
+                };
                 let _ = reply.send(VmReply::Done(outcome));
             }
             Request::Attach {
@@ -1046,12 +1103,10 @@ fn v8_thread_main(
                             .data(external.into())
                             .build(scope)
                         {
-                            Some(function) => {
-                                let key = v8::String::new(scope, &name).unwrap();
-                                let global = context.global(scope);
-                                global.set(scope, key.into(), function.into());
-                                Ok(JsVal::Undefined)
-                            }
+                            // A dotted name (e.g. "MiniRacer.foo") attaches under
+                            // a namespace object, creating missing intermediates,
+                            // so host fns needn't pollute the bare global.
+                            Some(function) => attach_at_path(scope, context, &name, function),
                             None => Err(VmError::Runtime("failed to build function".into())),
                         }
                     }
@@ -1158,6 +1213,9 @@ struct Core {
     // Shared across realms (host_fn_id indexes this one vector). Mutex (not
     // RefCell) because realms of one Context may be pumped on different threads.
     procs: Mutex<Vec<Opaque<Proc>>>,
+    // Default per-eval/call timeout (ms); 0 = none. eval_t's explicit timeout
+    // overrides it. Guards against an in-V8 infinite loop without a watchdog.
+    default_timeout_ms: u64,
 }
 
 #[magnus::wrap(class = "RustyRacer::Context")]
@@ -1253,6 +1311,56 @@ fn install_host_namespace(isolate: &mut v8::Isolate, ctx: &v8::Global<v8::Contex
     }
 }
 
+// Set |function| at the dotted property path |name| on the global, creating
+// intermediate plain objects as needed — so attach("MiniRacer.foo", ...) lands
+// under the namespace whether or not globalThis.MiniRacer already exists, while
+// a bare "foo" still attaches on the global.
+fn attach_at_path(
+    scope: &mut v8::PinScope<'_, '_>,
+    context: v8::Local<v8::Context>,
+    name: &str,
+    function: v8::Local<v8::Function>,
+) -> Result<JsVal, VmError> {
+    let mut parts: Vec<&str> = name.split('.').collect();
+    let leaf = parts
+        .pop()
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| VmError::Runtime(format!("invalid attach name `{name}`")))?;
+    let mut holder = context.global(scope);
+    for part in parts {
+        if part.is_empty() {
+            return Err(VmError::Runtime(format!("invalid attach name `{name}`")));
+        }
+        let key =
+            v8::String::new(scope, part).ok_or_else(|| VmError::Runtime("name too large".into()))?;
+        holder = match holder.get(scope, key.into()) {
+            Some(v) if v.is_object() => v8::Local::<v8::Object>::try_from(v).unwrap(),
+            // Don't clobber an existing non-object (e.g. a primitive global that
+            // collides with the namespace name) — fail loudly instead.
+            Some(v) if !v.is_undefined() && !v.is_null() => {
+                return Err(VmError::Runtime(format!(
+                    "`{name}`: `{part}` exists and is not an object"
+                )));
+            }
+            _ => {
+                let obj = v8::Object::new(scope);
+                if holder.set(scope, key.into(), obj.into()) != Some(true) {
+                    return Err(VmError::Runtime(format!("`{name}`: cannot create `{part}`")));
+                }
+                obj
+            }
+        };
+    }
+    let key =
+        v8::String::new(scope, leaf).ok_or_else(|| VmError::Runtime("name too large".into()))?;
+    if holder.set(scope, key.into(), function.into()) != Some(true) {
+        return Err(VmError::Runtime(format!(
+            "`{name}`: target is not writable/extensible"
+        )));
+    }
+    Ok(JsVal::Undefined)
+}
+
 // Build a startup blob by running |code| in a throwaway isolate and snapshotting
 // its default context. Runs entirely on the calling (Ruby) thread: the
 // OwnedIsolate is a local, never stored in a Send wrapper, so the !Send dedicated
@@ -1307,6 +1415,7 @@ impl Context {
         ruby: &Ruby,
         host_namespace: Option<String>,
         snapshot: Option<magnus::typed_data::Obj<Snapshot>>,
+        timeout_ms: u64,
     ) -> Result<Self, Error> {
         let snapshot_bytes = snapshot.map(|s| s.blob.borrow().clone());
         let (tx, rx) = channel::<Request>();
@@ -1325,6 +1434,7 @@ impl Context {
                     disposed: false,
                 }),
                 procs: Mutex::new(Vec::new()),
+                default_timeout_ms: timeout_ms,
             }),
         })
     }
@@ -1419,11 +1529,10 @@ impl Core {
         ruby_to_jsval(value).map_err(|e| e.to_string())
     }
 
-    // Context#call / Realm#call. Spike: reuse eval with JSON-injected args. A
-    // real impl would use Function::Call (preserves receiver, non-JSON values);
-    // for the supported primitive types this is equivalent and reuses the whole
-    // rendezvous / nesting / error path for free.
-    fn call(&self, ruby: &Ruby, realm_id: i32, args: &[Value]) -> Result<Value, Error> {
+    // Context#call / Realm#call (and call_void). Resolves a dotted function path
+    // on globalThis and invokes it via v8::Function::call. |void| skips
+    // marshalling the return for fire-and-forget calls.
+    fn call(&self, ruby: &Ruby, realm_id: i32, args: &[Value], void: bool) -> Result<Value, Error> {
         let Some((name, call_args)) = args.split_first() else {
             return Err(Error::new(
                 ruby.exception_arg_error(),
@@ -1448,6 +1557,7 @@ impl Core {
                 .send(Answer::NestedCall {
                     name,
                     args: jsargs,
+                    void,
                     reply: reply_tx,
                 })
                 .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread is gone"))?;
@@ -1461,6 +1571,20 @@ impl Core {
                 realm_id,
                 name,
                 args: jsargs,
+                void,
+                timeout_ms: self.default_timeout_ms,
+                reply: reply_tx,
+            },
+        )?;
+        self.pump(ruby, reply_rx, None)
+    }
+
+    fn drain_microtasks(&self, ruby: &Ruby) -> Result<Value, Error> {
+        let (reply_tx, reply_rx) = channel::<VmReply>();
+        self.send(
+            ruby,
+            Request::DrainMicrotasks {
+                timeout_ms: self.default_timeout_ms,
                 reply: reply_tx,
             },
         )?;
@@ -1589,8 +1713,11 @@ impl Core {
 
 // Thin magnus-method wrappers: a Context drives realm 0; a Realm drives its id.
 impl Context {
+    // eval uses the context's default timeout; eval_t's explicit value overrides.
     fn eval(ruby: &Ruby, rb_self: &Self, source: String, filename: String) -> Result<Value, Error> {
-        rb_self.core.eval_t(ruby, 0, source, filename, 0)
+        rb_self
+            .core
+            .eval_t(ruby, 0, source, filename, rb_self.core.default_timeout_ms)
     }
     fn eval_t(
         ruby: &Ruby,
@@ -1602,7 +1729,13 @@ impl Context {
         rb_self.core.eval_t(ruby, 0, source, filename, timeout_ms)
     }
     fn call(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
-        rb_self.core.call(ruby, 0, args)
+        rb_self.core.call(ruby, 0, args, false)
+    }
+    fn call_void(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
+        rb_self.core.call(ruby, 0, args, true)
+    }
+    fn perform_microtask_checkpoint(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+        rb_self.core.drain_microtasks(ruby)
     }
     fn attach(ruby: &Ruby, rb_self: &Self, name: String, proc: Proc) -> Result<Value, Error> {
         rb_self.core.attach(ruby, 0, name, proc)
@@ -1644,11 +1777,21 @@ impl Realm {
     }
     fn eval(ruby: &Ruby, rb_self: &Self, source: String, filename: String) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
-        rb_self.core.eval_t(ruby, rb_self.id, source, filename, 0)
+        rb_self
+            .core
+            .eval_t(ruby, rb_self.id, source, filename, rb_self.core.default_timeout_ms)
     }
     fn call(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
-        rb_self.core.call(ruby, rb_self.id, args)
+        rb_self.core.call(ruby, rb_self.id, args, false)
+    }
+    fn call_void(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        rb_self.core.call(ruby, rb_self.id, args, true)
+    }
+    fn perform_microtask_checkpoint(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        rb_self.core.drain_microtasks(ruby) // isolate-wide, but offered for parity
     }
     fn attach(ruby: &Ruby, rb_self: &Self, name: String, proc: Proc) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
@@ -2044,12 +2187,17 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let module = ruby.define_module("RustyRacer")?;
     let class = module.define_class("Context", ruby.class_object())?;
     // keyword-arg wrapper Context.new(host_namespace:) lives in lib/rusty_racer.rb
-    class.define_singleton_method("_new", function!(Context::new, 2))?;
+    class.define_singleton_method("_new", function!(Context::new, 3))?;
     // keyword-arg wrappers (eval(source, filename:) / eval_t(source, timeout,
     // filename:)) live in lib/rusty_racer.rb over these positional primitives.
     class.define_method("_eval", method!(Context::eval, 2))?;
     class.define_method("_eval_t", method!(Context::eval_t, 3))?;
     class.define_method("call", method!(Context::call, -1))?;
+    class.define_method("call_void", method!(Context::call_void, -1))?;
+    class.define_method(
+        "perform_microtask_checkpoint",
+        method!(Context::perform_microtask_checkpoint, 0),
+    )?;
     class.define_method("attach", method!(Context::attach, 2))?;
     class.define_method("reset_realm", method!(Context::reset_realm, 0))?;
     class.define_method("create_realm", method!(Context::create_realm, 0))?;
@@ -2063,6 +2211,11 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let realm = module.define_class("Realm", ruby.class_object())?;
     realm.define_method("_eval", method!(Realm::eval, 2))?;
     realm.define_method("call", method!(Realm::call, -1))?;
+    realm.define_method("call_void", method!(Realm::call_void, -1))?;
+    realm.define_method(
+        "perform_microtask_checkpoint",
+        method!(Realm::perform_microtask_checkpoint, 0),
+    )?;
     realm.define_method("attach", method!(Realm::attach, 2))?;
     realm.define_method("dispose", method!(Realm::dispose, 0))?;
     realm.define_method("disposed?", method!(Realm::disposed, 0))?;
