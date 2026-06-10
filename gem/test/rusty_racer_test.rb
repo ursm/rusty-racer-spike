@@ -28,6 +28,49 @@ class RustyRacerTest < Minitest::Test
     assert_raises(RustyRacer::ParseError) { @ctx.eval("this is not valid js ===") }
   end
 
+  def test_parse_error_includes_location
+    e = assert_raises(RustyRacer::ParseError) do
+      @ctx.eval("let x = ;", filename: "boot.js")
+    end
+    assert_includes e.message, "boot.js"
+  end
+
+  def test_runtime_error_carries_js_stack_as_backtrace
+    src = <<~JS
+      function inner() { throw new Error("kaboom") }
+      function outer() { inner() }
+      outer();
+    JS
+    e = assert_raises(RustyRacer::RuntimeError) { @ctx.eval(src, filename: "app.js") }
+    assert_includes e.message, "kaboom"
+    refute_nil e.backtrace
+    joined = e.backtrace.join("\n")
+    # the JS frames are reconstructed into the Ruby backtrace, with our filename
+    assert_includes joined, "app.js"
+    assert_includes joined, "inner"
+  end
+
+  def test_multiline_error_message_does_not_leak_into_backtrace
+    e = assert_raises(RustyRacer::RuntimeError) { @ctx.eval('throw new Error("line1\nline2")') }
+    # every backtrace frame must look like a frame (carry a location), not a
+    # stray fragment of the multi-line message
+    e.backtrace.each { |f| refute_equal "line2", f }
+  end
+
+  def test_stackless_throw_has_no_host_backtrace
+    # throwing a non-Error has no JS stack; the backtrace must not be backfilled
+    # with host-side (Rust/pump) frames.
+    e = assert_raises(RustyRacer::RuntimeError) { @ctx.eval("throw 42") }
+    assert_equal [], e.backtrace
+  end
+
+  def test_eval_filename_appears_in_thrown_stack
+    e = assert_raises(RustyRacer::RuntimeError) do
+      @ctx.eval('throw new Error("boom")', filename: "widget.js")
+    end
+    assert(e.backtrace.any? { |line| line.include?("widget.js") }, "filename missing from backtrace")
+  end
+
   def test_other_ruby_threads_progress_during_eval
     counter = 0
     t = Thread.new { loop { counter += 1; Thread.pass } }

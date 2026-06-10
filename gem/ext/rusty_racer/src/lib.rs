@@ -101,8 +101,14 @@ const MAX_MARSHAL_DEPTH: u32 = 256;
 #[derive(Debug)]
 enum VmError {
     Parse(String),   // compile-time failure -> RustyRacer::ParseError
-    Runtime(String), // runtime JS exception -> RustyRacer::RuntimeError
-    Terminated,      // watchdog/stop -> RustyRacer::ScriptTerminatedError
+    Runtime(String), // internal failure (no JS stack) -> RustyRacer::RuntimeError
+    // A thrown JS exception: its message plus the JS stack frames, which become
+    // the Ruby exception's backtrace -> RustyRacer::RuntimeError.
+    JsError {
+        message: String,
+        backtrace: Vec<String>,
+    },
+    Terminated, // watchdog/stop -> RustyRacer::ScriptTerminatedError
 }
 
 // Ruby thread -> V8 thread. |realm_id| selects which realm in the isolate the
@@ -112,6 +118,7 @@ enum Request {
     Eval {
         realm_id: i32,
         source: String,
+        filename: String,
         timeout_ms: u64,
         reply: Sender<VmReply>,
     },
@@ -185,6 +192,7 @@ enum Answer {
     // the proc's Ruby body called ctx.eval — serve it re-entrantly
     NestedEval {
         source: String,
+        filename: String,
         reply: Sender<VmReply>,
     },
     // the proc's Ruby body called ctx.call — serve it re-entrantly
@@ -546,9 +554,9 @@ fn host_fn_callback(
                 throw_js_error(scope, &message);
                 return;
             }
-            Ok(Answer::NestedEval { source, reply }) => {
+            Ok(Answer::NestedEval { source, filename, reply }) => {
                 // ruby -> js -> ruby -> js: run it re-entrantly right here.
-                let outcome = run_source(scope, &source);
+                let outcome = run_source(scope, &source, &filename);
                 let _ = reply.send(VmReply::Done(outcome));
             }
             Ok(Answer::NestedCall { name, args, reply }) => {
@@ -576,14 +584,97 @@ fn throw_js_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     }
 }
 
-fn run_source(scope: &mut v8::PinScope<'_, '_>, source: &str) -> Result<JsVal, VmError> {
+// A ScriptOrigin naming the script |filename|, so stack traces and parse-error
+// locations report a meaningful resource name instead of being anonymous.
+fn script_origin<'s>(scope: &v8::PinScope<'s, '_>, filename: &str) -> v8::ScriptOrigin<'s> {
+    let name = v8::String::new(scope, filename).unwrap_or_else(|| v8::String::empty(scope));
+    v8::ScriptOrigin::new(
+        scope,
+        name.into(),
+        0,
+        0,
+        false,
+        -1,
+        None,
+        false,
+        false,
+        /*is_module*/ false,
+        None,
+    )
+}
+
+// Turn V8's Error.stack text into Ruby-backtrace lines. The first line is the
+// "ErrorType: message" header (dropped); each "  at NAME (LOC)" frame becomes
+// "LOC:in 'NAME'", and a bare "  at LOC" frame becomes "LOC".
+fn parse_js_stack(stack: &str) -> Vec<String> {
+    stack
+        .lines()
+        .filter_map(|line| {
+            // Only "at ..." lines are frames; this also skips the header, which
+            // is the "ErrorType: message" line(s) — and the message may itself
+            // span multiple lines, so a blind skip(1) would leak it as a frame.
+            let frame = line.trim().strip_prefix("at ")?;
+            if frame.is_empty() {
+                return None;
+            }
+            // "NAME (LOC)" -> "LOC:in 'NAME'". Split on the FIRST " (" so a LOC
+            // path that itself contains parentheses stays intact.
+            if frame.ends_with(')') {
+                if let Some(open) = frame.find(" (") {
+                    let name = &frame[..open];
+                    let loc = &frame[open + 2..frame.len() - 1];
+                    return Some(format!("{loc}:in '{name}'"));
+                }
+            }
+            Some(frame.to_string())
+        })
+        .collect()
+}
+
+// Capture a thrown exception as a JsError: its message + JS stack frames. The
+// |exception| and |fallback_stack| Locals are read by the caller (where the
+// scope is still a TryCatch); here we only need plain scope access, so this
+// takes a PinScope. Prefers the Error's own .stack, then the TryCatch trace.
+fn capture_js_error(
+    scope: &mut v8::PinScope<'_, '_>,
+    exception: Option<v8::Local<v8::Value>>,
+    fallback_stack: Option<v8::Local<v8::Value>>,
+) -> VmError {
+    let message = exception
+        .map(|e| e.to_rust_string_lossy(scope))
+        .unwrap_or_else(|| "unexpected failure".to_string());
+    let mut stack_str = None;
+    if let Some(e) = exception {
+        if let Some(obj) = e.to_object(scope) {
+            if let Some(key) = v8::String::new(scope, "stack") {
+                if let Some(s) = obj.get(scope, key.into()) {
+                    if s.is_string() {
+                        stack_str = Some(s.to_rust_string_lossy(scope));
+                    }
+                }
+            }
+        }
+    }
+    if stack_str.is_none() {
+        if let Some(s) = fallback_stack {
+            stack_str = Some(s.to_rust_string_lossy(scope));
+        }
+    }
+    let backtrace = stack_str
+        .map(|s| parse_js_stack(s.as_str()))
+        .unwrap_or_default();
+    VmError::JsError { message, backtrace }
+}
+
+fn run_source(scope: &mut v8::PinScope<'_, '_>, source: &str, filename: &str) -> Result<JsVal, VmError> {
     v8::tc_scope!(let tc, scope);
     // Compile and run as distinct phases so a compile failure maps to
     // ParseError and a thrown exception to RuntimeError (csim rescues both).
     let Some(code) = v8::String::new(tc, source) else {
         return Err(VmError::Parse("source too large".into()));
     };
-    let script = match v8::Script::compile(tc, code, None) {
+    let origin = script_origin(tc, filename);
+    let script = match v8::Script::compile(tc, code, Some(&origin)) {
         Some(script) => script,
         None if tc.has_terminated() => return Err(VmError::Terminated),
         None => {
@@ -591,18 +682,28 @@ fn run_source(scope: &mut v8::PinScope<'_, '_>, source: &str) -> Result<JsVal, V
                 .exception()
                 .map(|e| e.to_rust_string_lossy(tc))
                 .unwrap_or_else(|| "parse error".to_string());
-            return Err(VmError::Parse(msg));
+            // Append the location V8 recorded; always name the file, add the
+            // line when V8 reports one.
+            let message = tc.message();
+            let res = message
+                .and_then(|m| m.get_script_resource_name(tc))
+                .filter(|v| v.is_string())
+                .map(|v| v.to_rust_string_lossy(tc))
+                .unwrap_or_else(|| filename.to_string());
+            let loc = match message.and_then(|m| m.get_line_number(tc)) {
+                Some(line) => format!(" at {res}:{line}"),
+                None => format!(" at {res}"),
+            };
+            return Err(VmError::Parse(format!("{msg}{loc}")));
         }
     };
     match script.run(tc) {
         Some(value) => Ok(js_to_jsval(tc, value)),
         None if tc.has_terminated() => Err(VmError::Terminated),
         None => {
-            let msg = tc
-                .exception()
-                .map(|e| e.to_rust_string_lossy(tc))
-                .unwrap_or_else(|| "unexpected failure".to_string());
-            Err(VmError::Runtime(msg))
+            let exc = tc.exception();
+            let stack = tc.stack_trace();
+            Err(capture_js_error(tc, exc, stack))
         }
     }
 }
@@ -652,11 +753,9 @@ fn call_function(
         Some(value) => Ok(js_to_jsval(tc, value)),
         None if tc.has_terminated() => Err(VmError::Terminated),
         None => {
-            let msg = tc
-                .exception()
-                .map(|e| e.to_rust_string_lossy(tc))
-                .unwrap_or_else(|| "call failed".to_string());
-            Err(VmError::Runtime(msg))
+            let exc = tc.exception();
+            let stack = tc.stack_trace();
+            Err(capture_js_error(tc, exc, stack))
         }
     }
 }
@@ -862,6 +961,7 @@ fn v8_thread_main(
             Request::Eval {
                 realm_id,
                 source,
+                filename,
                 timeout_ms,
                 reply,
             } => {
@@ -889,7 +989,7 @@ fn v8_thread_main(
                         v8::scope!(let scope, &mut isolate);
                         let context = v8::Local::new(scope, &ctx);
                         let scope = &mut v8::ContextScope::new(scope, context);
-                        run_source(scope, &source)
+                        run_source(scope, &source, &filename)
                     }
                     None => Err(VmError::Runtime("realm disposed or unknown".into())),
                 };
@@ -1178,9 +1278,10 @@ fn build_snapshot(code: &str, base: Option<Vec<u8>>) -> Result<Vec<u8>, String> 
         {
             let cscope = &mut v8::ContextScope::new(scope, context);
             if !code.is_empty() {
-                if let Err(e) = run_source(cscope, code) {
+                if let Err(e) = run_source(cscope, code, "<snapshot>") {
                     err = Some(match e {
                         VmError::Parse(m) | VmError::Runtime(m) => m,
+                        VmError::JsError { message, .. } => message,
                         VmError::Terminated => "snapshot code was terminated".to_string(),
                     });
                 }
@@ -1371,6 +1472,7 @@ impl Core {
         ruby: &Ruby,
         realm_id: i32,
         source: String,
+        filename: String,
         timeout_ms: u64,
     ) -> Result<Value, Error> {
         // Inside a proc serving a callback? Route as a nested eval through the
@@ -1382,6 +1484,7 @@ impl Core {
             answer
                 .send(Answer::NestedEval {
                     source,
+                    filename,
                     reply: reply_tx,
                 })
                 .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread is gone"))?;
@@ -1394,6 +1497,7 @@ impl Core {
             Request::Eval {
                 realm_id,
                 source,
+                filename,
                 timeout_ms,
                 reply: reply_tx,
             },
@@ -1485,11 +1589,17 @@ impl Core {
 
 // Thin magnus-method wrappers: a Context drives realm 0; a Realm drives its id.
 impl Context {
-    fn eval(ruby: &Ruby, rb_self: &Self, source: String) -> Result<Value, Error> {
-        rb_self.core.eval_t(ruby, 0, source, 0)
+    fn eval(ruby: &Ruby, rb_self: &Self, source: String, filename: String) -> Result<Value, Error> {
+        rb_self.core.eval_t(ruby, 0, source, filename, 0)
     }
-    fn eval_t(ruby: &Ruby, rb_self: &Self, source: String, timeout_ms: u64) -> Result<Value, Error> {
-        rb_self.core.eval_t(ruby, 0, source, timeout_ms)
+    fn eval_t(
+        ruby: &Ruby,
+        rb_self: &Self,
+        source: String,
+        filename: String,
+        timeout_ms: u64,
+    ) -> Result<Value, Error> {
+        rb_self.core.eval_t(ruby, 0, source, filename, timeout_ms)
     }
     fn call(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
         rb_self.core.call(ruby, 0, args)
@@ -1532,9 +1642,9 @@ impl Realm {
         }
         Ok(())
     }
-    fn eval(ruby: &Ruby, rb_self: &Self, source: String) -> Result<Value, Error> {
+    fn eval(ruby: &Ruby, rb_self: &Self, source: String, filename: String) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
-        rb_self.core.eval_t(ruby, rb_self.id, source, 0)
+        rb_self.core.eval_t(ruby, rb_self.id, source, filename, 0)
     }
     fn call(ruby: &Ruby, rb_self: &Self, args: &[Value]) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
@@ -1607,10 +1717,29 @@ fn vm_err(ruby: &Ruby, e: VmError) -> Error {
     match e {
         VmError::Parse(m) => Error::new(err_class(ruby, "ParseError"), m),
         VmError::Runtime(m) => Error::new(err_class(ruby, "RuntimeError"), m),
+        VmError::JsError { message, backtrace } => js_runtime_error(ruby, message, backtrace),
         VmError::Terminated => Error::new(
             err_class(ruby, "ScriptTerminatedError"),
             "JavaScript was terminated (timeout or stop)",
         ),
+    }
+}
+
+// Build a RustyRacer::RuntimeError carrying the JS stack as its Ruby backtrace.
+// Constructs the exception instance so we can set_backtrace before raising;
+// falls back to a plain Error if any of that fails.
+fn js_runtime_error(ruby: &Ruby, message: String, backtrace: Vec<String>) -> Error {
+    let class = err_class(ruby, "RuntimeError");
+    let exc: Value = match class.funcall("new", (message.as_str(),)) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    // Always set it (even to []) so an empty/absent JS stack doesn't let Ruby
+    // backfill the backtrace with host-side (pump/magnus) frames.
+    let _ = exc.funcall::<_, _, Value>("set_backtrace", (backtrace,));
+    match magnus::Exception::from_value(exc) {
+        Some(e) => Error::from(e),
+        None => Error::new(class, message),
     }
 }
 
@@ -1916,8 +2045,10 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     let class = module.define_class("Context", ruby.class_object())?;
     // keyword-arg wrapper Context.new(host_namespace:) lives in lib/rusty_racer.rb
     class.define_singleton_method("_new", function!(Context::new, 2))?;
-    class.define_method("eval", method!(Context::eval, 1))?;
-    class.define_method("eval_t", method!(Context::eval_t, 2))?;
+    // keyword-arg wrappers (eval(source, filename:) / eval_t(source, timeout,
+    // filename:)) live in lib/rusty_racer.rb over these positional primitives.
+    class.define_method("_eval", method!(Context::eval, 2))?;
+    class.define_method("_eval_t", method!(Context::eval_t, 3))?;
     class.define_method("call", method!(Context::call, -1))?;
     class.define_method("attach", method!(Context::attach, 2))?;
     class.define_method("reset_realm", method!(Context::reset_realm, 0))?;
@@ -1930,7 +2061,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     // Context#create_realm returns one of these: an isolated globalThis in the
     // same isolate, addressed by id (csim's multi-realm model).
     let realm = module.define_class("Realm", ruby.class_object())?;
-    realm.define_method("eval", method!(Realm::eval, 1))?;
+    realm.define_method("_eval", method!(Realm::eval, 2))?;
     realm.define_method("call", method!(Realm::call, -1))?;
     realm.define_method("attach", method!(Realm::attach, 2))?;
     realm.define_method("dispose", method!(Realm::dispose, 0))?;
