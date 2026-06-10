@@ -7,12 +7,20 @@ require_relative "rusty_racer/version"
 require "rusty_racer/rusty_racer"
 
 module RustyRacer
-  # The error hierarchy csim's V8 adapter rescues. The extension currently
-  # raises plain RuntimeError; mapping VmError -> these specific classes is the
-  # next API increment (stage "A"). Declared here so the namespace is stable.
+  # The error hierarchy csim's V8 adapter rescues. The extension maps VM
+  # failures to these (see err_class in the Rust side).
   class Error < StandardError; end
   class EvalError < Error; end
   class ParseError < EvalError; end
   class RuntimeError < EvalError; end
   class ScriptTerminatedError < EvalError; end
+
+  class Context
+    # csim's keyword-arg API over the positional Rust primitive. `resolve` maps
+    # [[specifier, referrer], ...] -> [url|nil, ...]; `fetch_batch` maps
+    # [url, ...] -> [[source, cached_data]|nil, ...]. Returns { modules: [...] }.
+    def load_module_graph(entry_url, resolve:, fetch_batch:)
+      _load_module_graph(entry_url, resolve, fetch_batch)
+    end
+  end
 end

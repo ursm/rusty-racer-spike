@@ -37,6 +37,51 @@ class RustyRacerTest < Minitest::Test
     assert_operator counter, :>, 1000, "GVL not released during eval"
   end
 
+  def test_reset_realm_clears_globals
+    @ctx.eval("globalThis.x = 41")
+    assert_equal 41, @ctx.eval("globalThis.x")
+    @ctx.reset_realm
+    assert_equal "undefined", @ctx.eval("typeof globalThis.x")
+    assert_equal 2, @ctx.eval("1 + 1") # realm usable after reset
+  end
+
+  def test_load_module_graph_evaluates_whole_graph
+    sources = {
+      "/app.js" => 'import {a} from "./a.js"; import {b} from "./b.js"; globalThis.RESULT = a + b;',
+      "/a.js"   => 'import {c} from "./c.js"; export const a = c + 1;',
+      "/b.js"   => "export const b = 20;",
+      "/c.js"   => "export const c = 100;",
+    }
+    # csim's contract: fetch_batch [url,...] -> [[source, cached]|nil,...];
+    # resolve [[specifier, referrer],...] -> [url|nil,...].
+    fetch = ->(urls) { urls.map { |u| (s = sources[u]) ? [s, nil] : nil } }
+    resolve = ->(edges) { edges.map { |spec, _ref| spec.start_with?("./") ? "/#{spec[2..]}" : spec } }
+
+    result = @ctx.load_module_graph("/app.js", resolve: resolve, fetch_batch: fetch)
+
+    assert_equal 121, @ctx.eval("globalThis.RESULT")
+    assert_equal %w[/a.js /app.js /b.js /c.js], result[:modules].map { |m| m[:url] }.sort
+    assert_equal [false], result[:modules].map { |m| m[:cache_rejected] }.uniq
+  end
+
+  def test_load_module_graph_batches_per_level
+    sources = {
+      "/app.js" => 'import {a} from "./a.js"; import {b} from "./b.js";',
+      "/a.js"   => 'import {c} from "./c.js"; export const a = 1;',
+      "/b.js"   => "export const b = 2;",
+      "/c.js"   => "export const c = 3;",
+    }
+    fetch_calls = []
+    fetch = ->(urls) { fetch_calls << urls; urls.map { |u| (s = sources[u]) ? [s, nil] : nil } }
+    resolve = ->(edges) { edges.map { |spec, _ref| "/#{spec[2..]}" } }
+
+    @ctx.load_module_graph("/app.js", resolve: resolve, fetch_batch: fetch)
+
+    # one fetch per graph level (app -> [a,b] -> c), not one per module
+    assert_equal 3, fetch_calls.size
+    assert_includes fetch_calls, %w[/a.js /b.js]
+  end
+
   def test_call_invokes_global_function
     @ctx.eval("function mul(a, b) { return a * b }")
     assert_equal 6, @ctx.call("mul", 2, 3)
