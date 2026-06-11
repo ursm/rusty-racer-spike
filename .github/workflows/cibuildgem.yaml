@@ -3,9 +3,11 @@
 #   - links a PREBUILT library-TLS librusty_v8.a (see RUSTY_V8_ARCHIVE) instead of
 #     a 30-45 min V8 source build on every run. That archive is built once per V8
 #     version by libv8-rusty.yml and published as a Release asset.
-#   - scope so far = compile + test_native (proves the extension links as a
-#     cdylib and the suite passes). cross/install/release/macOS deferred.
-name: "Package gem with precompiled binaries"
+#   - scope so far = compile + test_native + install + release, for x86_64-linux
+#     on Ruby 3.3 only. The published gem is therefore precompiled for that one
+#     (platform, ruby) pair; other targets fall back to the source gem (which
+#     needs a V8 build). Broadening the (ruby x platform) matrix is deferred.
+name: "Package and release the gem (precompiled V8)"
 on:
   workflow_dispatch:
     inputs:
@@ -80,3 +82,56 @@ jobs:
         with:
           step: "test_native"
           working-directory: "."
+  install:
+    timeout-minutes: 10
+    name: "Verify the packaged gem installs"
+    needs: test
+    strategy:
+      matrix:
+        os: ["ubuntu-22.04"]
+    runs-on: "${{ matrix.os }}"
+    steps:
+      # No checkout / no RUSTY_V8_ARCHIVE: cibuildgem downloads the compile job's
+      # gem artifact and `gem install`s it — the .so is already baked in, so V8
+      # is not linked here. Ruby 3.3 because that's the (only) ABI it's compiled
+      # for; a precompiled gem won't install on a ruby it wasn't built for.
+      - name: "Setup Ruby"
+        uses: "ruby/setup-ruby@v1"
+        with:
+          ruby-version: "3.3"
+      - name: "Run cibuildgem"
+        uses: "shopify/cibuildgem/.github/actions/cibuildgem@main"
+        with:
+          step: "install"
+      - name: "Smoke-test that the installed gem loads and runs"
+        # cibuildgem's install only `gem install`s the precompiled gem — it never
+        # `require`s it. The fat gem ships a per-Ruby binary under
+        # rusty_racer/<major.minor>/, so a broken version-dispatch loader would
+        # pass CI yet LoadError for every user. Actually load it (exercising the
+        # loader against the installed gem, no -Ilib) and run one eval.
+        run: ruby -e 'require "rusty_racer"; abort("eval failed") unless RustyRacer::Isolate.new.context.eval("40 + 2") == 42; puts "installed gem loads + runs OK"'
+  release:
+    name: "Release the gem on RubyGems"
+    needs: install
+    # Only when the dispatch asked for it; gated behind the whole build passing.
+    if: ${{ inputs.release }}
+    # Trusted publishing: cibuildgem's release step runs
+    # rubygems/configure-rubygems-credentials (OIDC) + `cibuildgem release`, so
+    # the job needs id-token: write. `environment: release` matches the RubyGems
+    # pending trusted publisher (repo ursm/rusty_racer, workflow cibuildgem.yaml,
+    # environment release) — keep them in sync.
+    environment: release
+    permissions:
+      id-token: write
+      contents: read
+    timeout-minutes: 10
+    runs-on: "ubuntu-22.04"
+    steps:
+      - name: "Setup Ruby"
+        uses: "ruby/setup-ruby@v1"
+        with:
+          ruby-version: "3.3"
+      - name: "Run cibuildgem"
+        uses: "shopify/cibuildgem/.github/actions/cibuildgem@main"
+        with:
+          step: "release"
