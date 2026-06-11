@@ -108,6 +108,10 @@ jobs:
       - name: "Publish as a Release asset (consumed by cibuildgem via RUSTY_V8_ARCHIVE)"
         env:
           GH_TOKEN: "${{ github.token }}"
+          # This job never checks out rusty_racer (it only clones rusty_v8 into a
+          # subdir), so there's no .git for `gh` to infer the repo from — it would
+          # die "not a git repository". Point it at the repo explicitly.
+          GH_REPO: "${{ github.repository }}"
         run: |
           set -x
           tag="libv8-${{ inputs.rusty_v8_tag }}"
