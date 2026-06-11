@@ -4,16 +4,19 @@ require "set" # JS Set <-> Ruby Set marshalling needs the stdlib Set constant
 
 require_relative "rusty_racer/version"
 
-# Load the compiled extension (defines RustyRacer::Isolate etc.). rb-sys names
-# the init after the crate. A precompiled ("fat") gem ships one binary per Ruby
-# minor version under rusty_racer/<major.minor>/ (the .so is ABI-specific — a
-# 3.3 build malfunctions on 4.0), so prefer the version-specific path; the
-# source gem and a local `rake compile` produce a single rusty_racer/rusty_racer
-# instead, which the fallback loads.
-begin
-  RUBY_VERSION =~ /(\d+\.\d+)/
-  require_relative "rusty_racer/#{Regexp.last_match(1)}/rusty_racer"
-rescue LoadError
+# Load the compiled extension (defines RustyRacer::Isolate etc.). A precompiled
+# ("fat") gem ships one binary per Ruby minor version under
+# rusty_racer/<major.minor>/ (the .so is ABI-specific — a 3.3 build malfunctions
+# on 4.0); the source gem and a local `rake compile` build a single flat
+# rusty_racer/rusty_racer instead. Pick by existence rather than rescuing
+# LoadError, so a binary that IS present but fails to load (a missing transitive
+# lib, an init error) surfaces its real error instead of being masked by the
+# flat fallback.
+versioned = "rusty_racer/#{RUBY_VERSION[/\d+\.\d+/]}/rusty_racer"
+
+if File.exist?(File.join(__dir__, "#{versioned}.#{RbConfig::CONFIG['DLEXT']}"))
+  require_relative versioned
+else
   require "rusty_racer/rusty_racer"
 end
 

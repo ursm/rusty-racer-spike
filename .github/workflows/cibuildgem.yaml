@@ -3,10 +3,11 @@
 #   - links a PREBUILT library-TLS librusty_v8.a (see RUSTY_V8_ARCHIVE) instead of
 #     a 30-45 min V8 source build on every run. That archive is built once per V8
 #     version by libv8-rusty.yml and published as a Release asset.
-#   - scope so far = compile + test_native + install + release, for x86_64-linux
-#     on Ruby 3.3 only. The published gem is therefore precompiled for that one
-#     (platform, ruby) pair; other targets fall back to the source gem (which
-#     needs a V8 build). Broadening the (ruby x platform) matrix is deferred.
+#   - scope so far = compile + test_native + install + release on x86_64-linux.
+#     cibuildgem cross-compiles a fat gem (a per-Ruby binary for 3.3/3.4/4.0,
+#     read from the gemspec's required_ruby_version), so the published gem covers
+#     those rubies — but only on linux; other PLATFORMS fall back to the source
+#     gem (a V8 build). Broadening to macOS/Windows (the os matrix) is deferred.
 name: "Package and release the gem (precompiled V8)"
 on:
   workflow_dispatch:
@@ -91,14 +92,15 @@ jobs:
         os: ["ubuntu-22.04"]
     runs-on: "${{ matrix.os }}"
     steps:
-      # No checkout / no RUSTY_V8_ARCHIVE: cibuildgem downloads the compile job's
-      # gem artifact and `gem install`s it — the .so is already baked in, so V8
-      # is not linked here. Ruby 3.3 because that's the (only) ABI it's compiled
-      # for; a precompiled gem won't install on a ruby it wasn't built for.
+      # No checkout needed: cibuildgem downloads the compile job's gem artifact
+      # and `gem install`s it — the .so is already baked in (V8 is not linked
+      # here; the inherited RUSTY_V8_ARCHIVE is unused). The fat gem carries a
+      # binary for each of Ruby 3.3/3.4/4.0, so installing on the newest (4.0)
+      # exercises that version's dispatch path; the smoke step then loads it.
       - name: "Setup Ruby"
         uses: "ruby/setup-ruby@v1"
         with:
-          ruby-version: "3.3"
+          ruby-version: "4.0"
       - name: "Run cibuildgem"
         uses: "shopify/cibuildgem/.github/actions/cibuildgem@main"
         with:
@@ -127,10 +129,13 @@ jobs:
     timeout-minutes: 10
     runs-on: "ubuntu-22.04"
     steps:
+      # Ruby 4.0 (latest 4.0.x; matching cibuildgem's template / rubydex): release does no
+      # native build, so ABI doesn't matter, but trusted-publishing OIDC `gem
+      # push` wants a recent RubyGems — older 3.3-bundled RubyGems is risky.
       - name: "Setup Ruby"
         uses: "ruby/setup-ruby@v1"
         with:
-          ruby-version: "3.3"
+          ruby-version: "4.0"
       - name: "Run cibuildgem"
         uses: "shopify/cibuildgem/.github/actions/cibuildgem@main"
         with:
