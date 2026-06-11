@@ -39,8 +39,8 @@ use std::ffi::c_void;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Mutex, Once};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex, Once};
+use std::time::{Duration, Instant};
 
 use magnus::block::Proc;
 use magnus::value::{BoxValue, ReprValue};
@@ -1117,9 +1117,9 @@ fn run_js_bracketed(
     body: impl FnOnce(&mut v8::PinScope<'_, '_, ()>, bool) -> (bool, Result<JsVal, VmError>),
 ) -> Result<JsVal, VmError> {
     REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
-    let (cancel_tx, watchdog) = start_watchdog(scope.thread_safe_handle(), timeout_ms);
+    let watchdog = arm_watchdog(timeout_ms);
     let (ran_js, mut outcome) = body(scope, outermost);
-    if finish_watchdog(cancel_tx, watchdog) {
+    if disarm_watchdog(watchdog) {
         WATCHDOG_FIRED.with(|w| w.set(true));
         if ran_js {
             outcome = Err(VmError::Terminated);
@@ -1441,34 +1441,122 @@ fn finish_dynamic_import(
     }
 }
 
-// Per-request watchdog, split so neither half borrows the isolate (it runs off
-// a Send IsolateHandle): start before running JS, finish after. Joining before
-// the reply and cancelling unconditionally if it fired keeps a late
-// TerminateExecution from poisoning the next request (audit #3).
-fn start_watchdog(
-    handle: v8::IsolateHandle,
-    timeout_ms: u64,
-) -> (Sender<()>, Option<std::thread::JoinHandle<bool>>) {
-    let (cancel_tx, cancel_rx) = channel::<()>();
-    let watchdog = (timeout_ms > 0).then(|| {
-        std::thread::spawn(move || {
-            match cancel_rx.recv_timeout(Duration::from_millis(timeout_ms)) {
-                Ok(()) => false,
-                Err(_) => {
-                    handle.terminate_execution();
-                    true
-                }
-            }
-        })
-    });
-    (cancel_tx, watchdog)
+// The watchdog runs on ONE persistent thread per isolate rather than a fresh
+// std::thread per request: spawning + joining a thread on every op cost ~16µs
+// (5.5x) when a timeout was set, dwarfing the actual work. The thread sleeps on
+// a condvar until a deadline is armed, terminates execution once the deadline
+// passes, then goes back to sleep.
+struct WatchdogShared {
+    inner: Mutex<WatchdogInner>,
+    cv: Condvar,
 }
 
-// Returns true if the watchdog fired (caller must cancel_terminate_execution).
-fn finish_watchdog(cancel_tx: Sender<()>, watchdog: Option<std::thread::JoinHandle<bool>>) -> bool {
-    watchdog.is_some_and(|w| {
-        let _ = cancel_tx.send(());
-        w.join().unwrap_or(false)
+// One armed request's deadline. `run_js_bracketed` is RE-ENTRANT — a host fn
+// called from JS can issue a nested op that arms again while the outer op is
+// still running — so the armed deadlines form a LIFO stack, not a single slot.
+// (The old per-op design gave each op its own watchdog thread; collapsing onto
+// one thread must not let a nested arm/disarm clobber the outer op's deadline,
+// or the outer op would run unbounded after the nested call returns.)
+#[derive(Clone, Copy)]
+struct WatchdogFrame {
+    generation: u64,
+    deadline: Instant,
+}
+
+struct WatchdogInner {
+    // Every currently-armed op (with timeout_ms > 0), pushed on arm and removed
+    // on disarm. The loop honours the EARLIEST deadline across all frames: the
+    // most urgent timeout fires first, and since TerminateExecution is
+    // isolate-global it tears down whatever is running (escalating outward).
+    frames: Vec<WatchdogFrame>,
+    // Monotonic; each arm takes the next value as its frame's id.
+    next_generation: u64,
+    // The generation whose deadline the loop terminated on — consumed (and
+    // cleared) by that op's disarm so it can map its outcome to Terminated.
+    fired_generation: Option<u64>,
+    // Set at isolate teardown to break the loop.
+    shutdown: bool,
+}
+
+// The persistent watchdog loop. Runs off a Send IsolateHandle so it never
+// borrows the isolate the V8 thread owns.
+fn watchdog_loop(shared: Arc<WatchdogShared>, handle: v8::IsolateHandle) {
+    let mut inner = shared.inner.lock().unwrap();
+    loop {
+        if inner.shutdown {
+            return;
+        }
+        // The earliest deadline among all armed frames is the one to enforce.
+        match inner.frames.iter().min_by_key(|f| f.deadline).copied() {
+            // Idle: sleep until a frame is armed (or shutdown).
+            None => inner = shared.cv.wait(inner).unwrap(),
+            Some(frame) => {
+                let now = Instant::now();
+                if now >= frame.deadline {
+                    handle.terminate_execution();
+                    inner.fired_generation = Some(frame.generation);
+                    // Drop the fired frame so the loop moves on to the next
+                    // deadline instead of re-firing this one every wakeup.
+                    inner.frames.retain(|f| f.generation != frame.generation);
+                } else {
+                    let (next, _) = shared.cv.wait_timeout(inner, frame.deadline - now).unwrap();
+                    inner = next;
+                }
+            }
+        }
+    }
+}
+
+thread_local! {
+    // The V8 thread's handle to its watchdog (set in v8_thread_main before the
+    // request loop). arm/disarm reach it from inside service_request.
+    static WATCHDOG: RefCell<Option<Arc<WatchdogShared>>> = const { RefCell::new(None) };
+}
+
+// Arm the watchdog for this request: push a frame with its own deadline and
+// wake the loop. Returns the generation token to hand to `disarm_watchdog`
+// (None when timeout_ms is 0 — no watchdog for this request).
+fn arm_watchdog(timeout_ms: u64) -> Option<u64> {
+    if timeout_ms == 0 {
+        return None;
+    }
+    WATCHDOG.with(|w| {
+        let w = w.borrow();
+        let shared = w.as_ref()?;
+        let mut inner = shared.inner.lock().unwrap();
+        inner.next_generation += 1;
+        let generation = inner.next_generation;
+        inner.frames.push(WatchdogFrame {
+            generation,
+            deadline: Instant::now() + Duration::from_millis(timeout_ms),
+        });
+        shared.cv.notify_one();
+        Some(generation)
+    })
+}
+
+// Disarm: drop THIS request's frame (leaving any outer frame still armed) and
+// report whether its deadline fired. On fire the caller maps the outcome to
+// Terminated and the outermost frame sweeps the leftover terminate via
+// WATCHDOG_FIRED; removing only this frame keeps a late terminate from
+// poisoning the next request without clobbering a still-running outer op.
+fn disarm_watchdog(generation: Option<u64>) -> bool {
+    let Some(generation) = generation else {
+        return false;
+    };
+    WATCHDOG.with(|w| {
+        let w = w.borrow();
+        let Some(shared) = w.as_ref() else {
+            return false;
+        };
+        let mut inner = shared.inner.lock().unwrap();
+        inner.frames.retain(|f| f.generation != generation);
+        let fired = inner.fired_generation == Some(generation);
+        if fired {
+            inner.fired_generation = None;
+        }
+        shared.cv.notify_one();
+        fired
     })
 }
 
@@ -1506,6 +1594,23 @@ fn v8_thread_main(
     // registered via NS.setPromiseRejectHandler (no-op otherwise).
     isolate.set_promise_reject_callback(promise_reject_cb);
     let _ = handle_tx.send(isolate.thread_safe_handle());
+    // One persistent watchdog thread for the isolate's whole life; requests
+    // arm/disarm it instead of each spawning their own (see WatchdogShared).
+    let watchdog_shared = Arc::new(WatchdogShared {
+        inner: Mutex::new(WatchdogInner {
+            frames: Vec::new(),
+            next_generation: 0,
+            fired_generation: None,
+            shutdown: false,
+        }),
+        cv: Condvar::new(),
+    });
+    let watchdog_thread = {
+        let shared = Arc::clone(&watchdog_shared);
+        let handle = isolate.thread_safe_handle();
+        std::thread::spawn(move || watchdog_loop(shared, handle))
+    };
+    WATCHDOG.with(|w| *w.borrow_mut() = Some(Arc::clone(&watchdog_shared)));
     // Boot the main realm (id 0) into the thread-local STATE, where
     // service_request — callable with only a scope in hand — can reach it.
     // The host-namespace name goes in first so new_realm can read it.
@@ -1537,6 +1642,15 @@ fn v8_thread_main(
     STATE.with(|s| *s.borrow_mut() = V8State::default());
     MODULES.with(|m| *m.borrow_mut() = ModuleReg::default());
     SCRIPTS.with(|s| *s.borrow_mut() = ScriptReg::default());
+    // Stop the watchdog and join it before the isolate (whose handle it holds)
+    // drops, so no terminate can land after teardown.
+    WATCHDOG.with(|w| *w.borrow_mut() = None);
+    {
+        let mut inner = watchdog_shared.inner.lock().unwrap();
+        inner.shutdown = true;
+        watchdog_shared.cv.notify_one();
+    }
+    let _ = watchdog_thread.join();
     drop(isolate);
 }
 
@@ -1664,13 +1778,13 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 // ruby), so push the reply onto REPLY_STACK exactly like Eval,
                 // or that callback would find no waiter and silently no-op.
                 REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
-                let (cancel_tx, watchdog) = start_watchdog(scope.thread_safe_handle(), timeout_ms);
+                let watchdog = arm_watchdog(timeout_ms);
                 if let Some(ctx) = context_for(0) {
                     let context = v8::Local::new(scope, &ctx);
                     let scope = &mut v8::ContextScope::new(scope, context);
                     checkpoint_draining(scope);
                 }
-                let fired = finish_watchdog(cancel_tx, watchdog);
+                let fired = disarm_watchdog(watchdog);
                 if fired {
                     WATCHDOG_FIRED.with(|w| w.set(true));
                 }

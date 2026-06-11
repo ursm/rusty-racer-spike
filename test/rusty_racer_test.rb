@@ -1325,6 +1325,21 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2, @ctx.eval('1 + 1')
   end
 
+  def test_outer_timeout_survives_a_nested_op
+    # The watchdog tracks every armed op's deadline independently (a LIFO stack),
+    # not one shared slot. A nested op (host fn -> nested eval) arms and disarms
+    # the watchdog while the OUTER op is suspended; that must NOT clear the
+    # outer op's own deadline. With a single slot the nested disarm would leave
+    # the outer `for(;;){}` below unwatched and it would run unbounded.
+    @ctx.attach('quick', proc { @ctx.eval('1 + 1', timeout_ms: 100) })
+    t = deadline_thread { @ctx.eval('quick(); for(;;){}', timeout_ms: 200) }
+    assert_raises(RustyRacer::ScriptTerminatedError) {
+      flunk 'outer timeout was lost after the nested op returned' unless t.join(10)
+      t.value
+    }
+    assert_equal 2, @ctx.eval('1 + 1')
+  end
+
   def test_terminate_during_host_proc_is_not_erased_by_nested_watchdog
     # an Isolate#terminate aimed at the suspended outer JS must survive a
     # nested watchdog firing in the same window (a nested cancel of the
