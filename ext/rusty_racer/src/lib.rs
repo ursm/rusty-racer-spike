@@ -22,13 +22,16 @@
 //   - a Ruby exception in a host proc is a magnus Err return (no longjmp
 //     through foreign frames), answered over the channel — audit #24's
 //     "exception wedges the context forever" path is a clean error reply;
-//   - the watchdog joins before the reply and cancels unconditionally if it
-//     fired, so audit #3's stale TerminateExecution cannot poison the next
-//     request.
+//   - the watchdog joins before the reply, and the OUTERMOST request cancels
+//     if one fired, so audit #3's stale TerminateExecution cannot poison the
+//     next request — while a nested request's cancel can never erase a
+//     termination aimed at the suspended outer JS (the flag is isolate-global).
 //
-// Spike simplifications: marshalling is nil/bool/i64/f64/String; attached
-// procs are kept alive by the Ruby caller (a real gem adds a GC mark); the
-// GVL-released channel waits pass no unblock function.
+// Attached procs and the dynamic-import resolver are GC-rooted via
+// rb_gc_register_address (see RootedProc): marked, so the extension may hold
+// the only reference, and pinned, so GC.compact cannot move them behind the
+// extension's back. Remaining spike simplification: the GVL-released channel
+// waits pass no unblock function (a parked op ignores Thread#kill).
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -40,11 +43,42 @@ use std::sync::{Arc, Mutex, Once};
 use std::time::Duration;
 
 use magnus::block::Proc;
-use magnus::value::{Opaque, ReprValue};
+use magnus::value::{BoxValue, ReprValue};
 use magnus::{
-    function, method, prelude::*, Error, ExceptionClass, IntoValue, RArray, RHash, Ruby, TryConvert,
-    Value,
+    function, method, prelude::*, Error, ExceptionClass, IntoValue, RArray, RHash, RString, Ruby,
+    TryConvert, Value,
 };
+
+// A Ruby Proc rooted for as long as the Core holds it. BoxValue registers a
+// stable heap address with rb_gc_register_address, which both MARKS the proc
+// (the extension may hold the only reference — e.g. attach("f", -> {...}))
+// and PINS it (GC.compact must not move it: the copies living in Rust are
+// invisible to the compactor and would go stale).
+//
+// SAFETY of the manual Send: the !Send contents (and BoxValue's drop, which
+// calls rb_gc_unregister_address) only run under the GVL. Two conventions
+// keep that true — breaking either is silent UB, so don't:
+//   - Arc<Core> lives ONLY in the four TypedData wrappers (Isolate, Context,
+//     Module, Script). Never clone it into the V8/watchdog threads, or the
+//     last drop could run off a Ruby thread.
+//   - the wrappers must not set free_immediately: their dfree (and so Core's
+//     drop) has to run outside the GC sweep, where Ruby APIs are forbidden.
+struct RootedProc(BoxValue<Proc>);
+unsafe impl Send for RootedProc {}
+
+impl RootedProc {
+    fn get(&self) -> Proc {
+        *self.0
+    }
+}
+
+// One attach()'d host fn: the realm it was attached into — so resetting or
+// disposing that realm can release the GC root — and the rooted proc itself
+// (None once released; the slot stays because host_fn_ids index this Vec).
+struct ProcSlot {
+    context_id: i32,
+    proc: Option<RootedProc>,
+}
 
 // Look up a RustyRacer::<name> exception class at raise time. The classes are
 // defined in lib/rusty_racer.rb (loaded after this extension), so they exist
@@ -68,6 +102,14 @@ enum JsVal {
     Int(i64),
     Num(f64),
     Str(String),
+    // Binary bytes: a JS Uint8Array / ArrayBuffer (view) <-> a Ruby ASCII-8BIT
+    // (binary-tagged) String. The encoding tag IS the type declaration, so the
+    // round-trip is symmetric and faithful (Uint8Array -> binary String ->
+    // Uint8Array), like BigInt/Date/Map/Set — no lossy text coercion. |id| (when
+    // Some) registers it in the Ref table so a binary blob aliased in a graph
+    // keeps ONE identity instead of being duplicated; None = not identity-tracked
+    // (e.g. a to_str result).
+    Bytes { id: Option<u32>, bytes: Vec<u8> },
     // Arbitrary-precision integer (JS BigInt <-> Ruby Integer). Carried as V8's
     // word representation: sign + little-endian u64 limbs. Both ends speak this
     // natively (V8 BigInt words; Ruby Integer via a hex string), so no value is
@@ -144,6 +186,7 @@ enum Request {
         context_id: i32,
         name: String,
         host_fn_id: usize,
+        timeout_ms: u64,
         reply: Sender<VmReply>,
     },
     // reset: swap globalThis for a fresh v8::Context, reusing the same warm
@@ -184,9 +227,16 @@ enum Request {
     },
     EvaluateModule {
         module_id: i32,
+        timeout_ms: u64,
         reply: Sender<VmReply>,
     },
     ModuleNamespace {
+        module_id: i32,
+        reply: Sender<VmReply>,
+    },
+    // The module's v8::Module::Status, as a lowercase name ("uninstantiated",
+    // "instantiated", ...) the Ruby wrapper symbolizes.
+    ModuleStatus {
         module_id: i32,
         reply: Sender<VmReply>,
     },
@@ -257,19 +307,12 @@ enum VmReply {
 // Ruby thread -> the V8 thread suspended inside a callback / batch round-trip
 enum Answer {
     Result(Result<JsVal, String>),
-    // the proc's Ruby body called ctx.eval — serve it re-entrantly
-    NestedEval {
-        source: String,
-        filename: String,
-        reply: Sender<VmReply>,
-    },
-    // the proc's Ruby body called ctx.call — serve it re-entrantly
-    NestedCall {
-        name: String,
-        args: Vec<JsVal>,
-        void: bool,
-        reply: Sender<VmReply>,
-    },
+    // the proc's/resolver's Ruby body issued another VM op (eval, call,
+    // compile, checkpoint, create_context, ... — ANY Request). The main queue
+    // is not being read while the V8 thread awaits this answer, so the
+    // suspended frame services it re-entrantly via the same dispatcher as the
+    // main loop (service_request).
+    Nested(Request),
     // the resolve block's answer: the dependency module's id (None = unresolved).
     ModuleId(Option<i32>),
 }
@@ -306,8 +349,8 @@ where
 // V8 thread
 // ---------------------------------------------------------------------------
 thread_local! {
-    // Reply sender of the request currently being served (stack: nested evals
-    // arriving through a suspended callback push their own sender).
+    // Reply sender of the request currently being served (stack: nested
+    // requests arriving through a suspended callback push their own sender).
     static REPLY_STACK: RefCell<Vec<Sender<VmReply>>> = const { RefCell::new(Vec::new()) };
 }
 
@@ -385,6 +428,20 @@ fn js_container_id(
     Ok(id)
 }
 
+// Copy |len| bytes from a V8 (Shared)ArrayBuffer backing pointer into an owned
+// Vec, with one allocation and no zero-fill (data is fully overwritten). |data|
+// is None only for a zero-length buffer, where the empty Vec is already right.
+fn copy_buffer_bytes(data: Option<std::ptr::NonNull<c_void>>, len: usize) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(len);
+    if let Some(p) = data {
+        unsafe {
+            std::ptr::copy_nonoverlapping(p.as_ptr() as *const u8, buf.as_mut_ptr(), len);
+            buf.set_len(len);
+        }
+    }
+    buf
+}
+
 fn js_to_jsval(scope: &mut v8::PinScope<'_, '_>, value: v8::Local<v8::Value>) -> JsVal {
     let mut seen = JsSeen::default();
     js_to_jsval_d(scope, value, &mut seen, 0)
@@ -422,6 +479,62 @@ fn js_to_jsval_d(
     if value.is_date() {
         if let Ok(date) = v8::Local::<v8::Date>::try_from(value) {
             return JsVal::Date(date.value_of());
+        }
+    }
+    // Binary buffers before the generic object branch (they are objects too).
+    // A TypedArray/DataView copies its VIEWED window; a bare ArrayBuffer or
+    // SharedArrayBuffer copies the whole buffer. All become a Ruby binary
+    // String. (Without the SharedArrayBuffer arm a bare SAB would fall through
+    // to the plain-object branch and marshal as an empty Hash — silent loss.)
+    if value.is_array_buffer_view() {
+        if let Ok(view) = v8::Local::<v8::ArrayBufferView>::try_from(value) {
+            let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
+            // depth 0: a buffer is a leaf (no recursion into children), so it
+            // never risks native-stack overflow and must stay faithful bytes
+            // even when deeply nested — only the identity (Ref) check applies,
+            // never the depth-truncation-to-lossy-string the generic path uses.
+            let id = match js_container_id(scope, seen, value, obj, 0) {
+                Ok(id) => id,
+                Err(jsval) => return jsval, // a Ref to the same buffer
+            };
+            let len = view.byte_length();
+            let mut buf: Vec<u8> = Vec::with_capacity(len);
+            // copy_contents_uninit writes into the UNINITIALIZED spare capacity
+            // (a &mut [MaybeUninit<u8>]) — never forming a &mut [u8] over uninit
+            // memory the way copy_contents would (that's UB). set_len to exactly
+            // what it wrote so a detached/short view never exposes uninit bytes.
+            let n = view.copy_contents_uninit(&mut buf.spare_capacity_mut()[..len]);
+            unsafe { buf.set_len(n) };
+            return JsVal::Bytes { id: Some(id), bytes: buf };
+        }
+    }
+    if value.is_array_buffer() {
+        if let Ok(ab) = v8::Local::<v8::ArrayBuffer>::try_from(value) {
+            let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
+            // depth 0 — a buffer is a leaf; see the view arm above.
+            let id = match js_container_id(scope, seen, value, obj, 0) {
+                Ok(id) => id,
+                Err(jsval) => return jsval,
+            };
+            return JsVal::Bytes {
+                id: Some(id),
+                bytes: copy_buffer_bytes(ab.data(), ab.byte_length()),
+            };
+        }
+    }
+    if value.is_shared_array_buffer() {
+        if let Ok(sab) = v8::Local::<v8::SharedArrayBuffer>::try_from(value) {
+            let obj = v8::Local::<v8::Object>::try_from(value).unwrap();
+            // depth 0 — a buffer is a leaf; see the view arm above.
+            let id = match js_container_id(scope, seen, value, obj, 0) {
+                Ok(id) => id,
+                Err(jsval) => return jsval,
+            };
+            let store = sab.get_backing_store();
+            return JsVal::Bytes {
+                id: Some(id),
+                bytes: copy_buffer_bytes(store.data(), sab.byte_length()),
+            };
         }
     }
     // Map/Set before the generic object branch (both are objects).
@@ -502,37 +615,55 @@ fn js_to_jsval_d(
     JsVal::Str(value.to_rust_string_lossy(scope))
 }
 
-fn jsval_to_js<'s>(scope: &mut v8::PinScope<'s, '_>, val: &JsVal) -> v8::Local<'s, v8::Value> {
+// Owned-by-value (not &JsVal): a JsVal::Bytes hands its Vec straight to V8's
+// backing store with no copy of the payload, so a large binary blob crosses
+// Ruby->JS with zero extra allocation.
+fn jsval_to_js<'s>(scope: &mut v8::PinScope<'s, '_>, val: JsVal) -> v8::Local<'s, v8::Value> {
     let mut built: HashMap<u32, v8::Local<'s, v8::Value>> = HashMap::new();
     jsval_to_js_d(scope, val, &mut built)
 }
 
 fn jsval_to_js_d<'s>(
     scope: &mut v8::PinScope<'s, '_>,
-    val: &JsVal,
+    val: JsVal,
     built: &mut HashMap<u32, v8::Local<'s, v8::Value>>,
 ) -> v8::Local<'s, v8::Value> {
     match val {
         JsVal::Undefined => v8::undefined(scope).into(),
         JsVal::Null => v8::null(scope).into(),
-        JsVal::Bool(b) => v8::Boolean::new(scope, *b).into(),
-        JsVal::Int(i) => v8::Number::new(scope, *i as f64).into(),
-        JsVal::Num(n) => v8::Number::new(scope, *n).into(),
-        JsVal::Str(s) => v8::String::new(scope, s)
+        JsVal::Bool(b) => v8::Boolean::new(scope, b).into(),
+        JsVal::Int(i) => v8::Number::new(scope, i as f64).into(),
+        JsVal::Num(n) => v8::Number::new(scope, n).into(),
+        JsVal::Str(s) => v8::String::new(scope, &s)
             .map(|s| s.into())
             .unwrap_or_else(|| v8::undefined(scope).into()),
-        JsVal::BigInt { negative, words } => v8::BigInt::new_from_words(scope, *negative, words)
+        // Bytes -> Uint8Array, moving the Vec into V8's backing store (no copy
+        // of the payload). Registered under |id| so an aliased blob resolves to
+        // the same Uint8Array via Ref.
+        JsVal::Bytes { id, bytes } => {
+            let len = bytes.len();
+            let store = v8::ArrayBuffer::new_backing_store_from_vec(bytes).make_shared();
+            let ab = v8::ArrayBuffer::with_backing_store(scope, &store);
+            let arr: v8::Local<v8::Value> = v8::Uint8Array::new(scope, ab, 0, len)
+                .map(|a| a.into())
+                .unwrap_or_else(|| v8::undefined(scope).into());
+            if let Some(id) = id {
+                built.insert(id, arr);
+            }
+            arr
+        }
+        JsVal::BigInt { negative, words } => v8::BigInt::new_from_words(scope, negative, &words)
             .map(|b| b.into())
             .unwrap_or_else(|| v8::undefined(scope).into()),
-        JsVal::Date(ms) => v8::Date::new(scope, *ms)
+        JsVal::Date(ms) => v8::Date::new(scope, ms)
             .map(|d| d.into())
             .unwrap_or_else(|| v8::undefined(scope).into()),
         // Register the container under its id BEFORE filling it, so a Ref from
         // a descendant (a cycle back to here) resolves to this same object.
         JsVal::Array { id, items } => {
             let arr = v8::Array::new(scope, items.len() as i32);
-            built.insert(*id, arr.into());
-            for (i, it) in items.iter().enumerate() {
+            built.insert(id, arr.into());
+            for (i, it) in items.into_iter().enumerate() {
                 let v = jsval_to_js_d(scope, it, built);
                 arr.set_index(scope, i as u32, v);
             }
@@ -540,9 +671,9 @@ fn jsval_to_js_d<'s>(
         }
         JsVal::Obj { id, entries } => {
             let obj = v8::Object::new(scope);
-            built.insert(*id, obj.into());
+            built.insert(id, obj.into());
             for (k, it) in entries {
-                let Some(key) = v8::String::new(scope, k) else {
+                let Some(key) = v8::String::new(scope, &k) else {
                     continue;
                 };
                 let v = jsval_to_js_d(scope, it, built);
@@ -552,7 +683,7 @@ fn jsval_to_js_d<'s>(
         }
         JsVal::Map { id, pairs } => {
             let map = v8::Map::new(scope);
-            built.insert(*id, map.into());
+            built.insert(id, map.into());
             for (k, v) in pairs {
                 let kk = jsval_to_js_d(scope, k, built);
                 let vv = jsval_to_js_d(scope, v, built);
@@ -562,7 +693,7 @@ fn jsval_to_js_d<'s>(
         }
         JsVal::Set { id, items } => {
             let set = v8::Set::new(scope);
-            built.insert(*id, set.into());
+            built.insert(id, set.into());
             for it in items {
                 let v = jsval_to_js_d(scope, it, built);
                 set.add(scope, v);
@@ -570,14 +701,14 @@ fn jsval_to_js_d<'s>(
             set.into()
         }
         JsVal::Ref(id) => built
-            .get(id)
+            .get(&id)
             .copied()
             .unwrap_or_else(|| v8::undefined(scope).into()),
     }
 }
 
 // JS called a host function: round-trip to the Ruby thread that is waiting on
-// the current request, serving nested evals until the answer arrives.
+// the current request, servicing nested requests until the answer arrives.
 fn host_fn_callback(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -611,7 +742,7 @@ fn host_fn_callback(
     loop {
         match answer_rx.recv() {
             Ok(Answer::Result(Ok(val))) => {
-                let v = jsval_to_js(scope, &val);
+                let v = jsval_to_js(scope, val);
                 rv.set(v);
                 return;
             }
@@ -621,15 +752,13 @@ fn host_fn_callback(
                 throw_js_error(scope, &message);
                 return;
             }
-            Ok(Answer::NestedEval { source, filename, reply }) => {
-                // ruby -> js -> ruby -> js: run it re-entrantly right here.
-                let outcome = run_source(scope, &source, &filename);
-                let _ = reply.send(VmReply::Done(outcome));
-            }
-            Ok(Answer::NestedCall { name, args, void, reply }) => {
-                // ruby -> js -> ruby calls ctx.call -> js: invoke re-entrantly.
-                let outcome = call_function(scope, &name, &args, void);
-                let _ = reply.send(VmReply::Done(outcome));
+            Ok(Answer::Nested(request)) => {
+                // ruby -> js -> ruby -> VM op: the proc issued another request
+                // while the main loop is parked in this very callback. Service
+                // it right here with the main loop's dispatcher — ANY op, not
+                // just eval/call, or the rendezvous deadlocks (the proc waits
+                // on the V8 thread, which waits on the proc's answer).
+                service_request(scope, request);
             }
             Ok(Answer::ModuleId(_)) => {
                 // A module-resolve answer can't arrive on a host-fn channel.
@@ -648,6 +777,19 @@ fn throw_js_error(scope: &mut v8::PinScope<'_, '_>, message: &str) {
     if let Some(msg) = v8::String::new(scope, message) {
         let exception = v8::Exception::error(scope, msg);
         scope.throw_exception(exception);
+    }
+}
+
+// Reject |resolver| with a fresh Error(|message|) — the resolver-promise twin
+// of throw_js_error, shared by the dynamic-import paths.
+fn reject_with_error(
+    scope: &mut v8::PinScope<'_, '_>,
+    resolver: v8::Local<v8::PromiseResolver>,
+    message: &str,
+) {
+    if let Some(s) = v8::String::new(scope, message) {
+        let e = v8::Exception::error(scope, s);
+        resolver.reject(scope, e);
     }
 }
 
@@ -781,7 +923,7 @@ fn run_source(scope: &mut v8::PinScope<'_, '_>, source: &str, filename: &str) ->
 fn call_function(
     scope: &mut v8::PinScope<'_, '_>,
     name: &str,
-    args: &[JsVal],
+    args: Vec<JsVal>,
     void: bool,
 ) -> Result<JsVal, VmError> {
     v8::tc_scope!(let tc, scope);
@@ -816,7 +958,7 @@ fn call_function(
     let Ok(func) = v8::Local::<v8::Function>::try_from(target) else {
         return Err(VmError::Runtime(format!("`{name}` is not a function")));
     };
-    let argv: Vec<v8::Local<v8::Value>> = args.iter().map(|a| jsval_to_js(tc, a)).collect();
+    let argv: Vec<v8::Local<v8::Value>> = args.into_iter().map(|a| jsval_to_js(tc, a)).collect();
     match func.call(tc, recv, &argv) {
         // void: skip marshalling the return so a huge/cyclic result is never walked.
         Some(_) if void => Ok(JsVal::Undefined),
@@ -862,14 +1004,131 @@ struct ScriptReg {
     next_id: i32,
 }
 
+// The V8 thread's realm registry: the main context (id 0, swappable by reset),
+// the extra realms from create_context, and the host-namespace name to
+// re-install on fresh realms. Thread-local (like MODULES/SCRIPTS) so
+// service_request can run from BOTH the main request loop and the nested wait
+// loops (host callbacks / module resolvers), which only have a scope in hand.
+#[derive(Default)]
+struct V8State {
+    main_context: Option<v8::Global<v8::Context>>,
+    contexts: HashMap<i32, v8::Global<v8::Context>>,
+    next_context_id: i32,
+    host_namespace: Option<String>,
+    // One security token shared by every realm of this isolate: the
+    // embedder's frames are same-origin, so cross-context access (e.g.
+    // NS.contextGlobal) must pass V8's access checks, which compare the
+    // contexts' tokens by identity.
+    security_token: Option<v8::Global<v8::Value>>,
+    // The isolate-wide JS recorder registered via NS.setPromiseRejectHandler,
+    // tagged with the context id it was created in (cleared when that context
+    // dies — the function would be unusable). The V8 promise-reject callback
+    // forwards (event, contextId, promise, reason) to it; the embedder builds
+    // HTML's unhandled-rejection bookkeeping on top.
+    promise_reject_handler: Option<(i32, v8::Global<v8::Function>)>,
+}
+
+// Context embedder-data slot holding the realm id (an Integer), stamped by
+// new_realm so id_of_context is O(1). Slot 0 is the embedder's own first slot
+// (the binding adds INTERNAL_SLOT_COUNT); nothing else here uses embedder data.
+const REALM_ID_SLOT: i32 = 0;
+
 thread_local! {
+    static STATE: RefCell<V8State> = RefCell::new(V8State::default());
     static MODULES: RefCell<ModuleReg> = RefCell::new(ModuleReg::default());
     static SCRIPTS: RefCell<ScriptReg> = RefCell::new(ScriptReg::default());
-    // The context id the V8 thread is currently executing JS in. Set by the
-    // handlers that enter a context (eval/call/instantiate/evaluate) so the
-    // import callbacks can reject a module from a *different* context — V8
-    // CHECK-aborts the process if an import resolves across v8::Contexts.
-    static CURRENT_CTX: std::cell::Cell<i32> = const { std::cell::Cell::new(0) };
+    // Realm ids of requests currently on this thread's stack (the running one
+    // plus any suspended outer frames). A nested Reset/DisposeContext of an
+    // ACTIVE realm is refused: swapping/dropping the v8::Context behind a
+    // suspended frame corrupts the in-flight request's registry entries and
+    // defeats the cross-context import guards (which compare realm ids — the
+    // id would survive the swap while naming a different v8::Context).
+    static ACTIVE_REALMS: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
+    // True while InstantiateModule is on this thread's stack. A nested
+    // instantiate (from a resolve block) walks V8's half-built module graph
+    // and SEGVs the process, so it is refused up front — a resolve block may
+    // COMPILE lazily and let the outer instantiate resolve the imports.
+    static INSTANTIATING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Set when any watchdog (own or nested) fired during the current request
+    // stack. V8's terminate flag is isolate-global, so a NESTED frame must
+    // never cancel it — that could erase a termination aimed at the suspended
+    // outer JS (Isolate#terminate, or the outer request's own watchdog). A
+    // nested watchdog's termination instead escalates outward as the
+    // suspended frames resume; the OUTERMOST frame sweeps any leftover flag
+    // once the stack has unwound, so a late/unconsumed TerminateExecution
+    // cannot poison the next request (audit #3).
+    static WATCHDOG_FIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // Whether this isolate auto-drains microtasks at the end of an OUTERMOST
+    // request (the kAuto contract — HTML's "clean up after running script").
+    // We keep V8 on the Explicit policy and drain ourselves, in-bracket, so
+    // the drain is covered by the request's watchdog and honours termination
+    // (V8's own kAuto drain inside Function::Call ignores TerminateExecution,
+    // which would hang a timed-out call forever). false = the :explicit mode,
+    // where only perform_microtask_checkpoint drains.
+    static AUTO_MICROTASKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    // True while a microtask checkpoint (auto_drain or DrainMicrotasks) is
+    // running. V8's microtask queue is per-ISOLATE, so a checkpoint entered in
+    // one realm can run a microtask enqueued by ANOTHER realm — and ACTIVE_REALMS
+    // only knows the draining realm, not the one whose microtask is live. So a
+    // nested Reset/DisposeContext during a checkpoint is refused for EVERY realm
+    // (we can't tell which is mid-flight on the V8 stack); see Reset/DisposeContext.
+    static DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+// Run a microtask checkpoint with DRAINING set (nesting-safe via save/restore),
+// so a nested Reset/DisposeContext issued by a drained microtask is refused.
+fn checkpoint_draining(scope: &mut v8::PinScope<'_, '_>) {
+    let prev = DRAINING.with(|d| d.replace(true));
+    scope.perform_microtask_checkpoint();
+    DRAINING.with(|d| d.set(prev));
+}
+
+// The kAuto end-of-script microtask drain, done by the binding: only at the
+// OUTERMOST request (nested ops run at V8 call depth > 0 and must not drain),
+// only in :auto mode. Called inside the request's watchdog bracket and in the
+// request's ContextScope, so a runaway continuation is time-capped and
+// terminable.
+// The kAuto end-of-script microtask drain (only at the outermost request, only
+// in :auto mode). Skipped if JS is already terminating (a checkpoint under an
+// active termination is pointless). A runaway drained continuation is caught by
+// the watchdog, whose firing the caller maps to Terminated — see the |ran_js|
+// override in each JS-running arm.
+fn auto_drain(scope: &mut v8::PinScope<'_, '_>, outermost: bool) {
+    if outermost && AUTO_MICROTASKS.with(|a| a.get()) && !scope.is_execution_terminating() {
+        checkpoint_draining(scope);
+    }
+}
+
+// The shared bracket every JS-running request (Eval/Call/Attach/RunScript/
+// EvaluateModule) needs: push this request's reply onto REPLY_STACK (so a host
+// fn it calls routes back here), arm the watchdog, run |body|, then on a
+// watchdog timeout flag the leftover terminate for the outermost sweep and —
+// only if |body| actually ran JS (the bool it returns) — override its outcome
+// to Terminated. |body| owns its ContextScope, JS call, and auto_drain, and
+// returns (ran_js, outcome); the realm-disposed/unknown paths return
+// (false, Err(..)) so a raced watchdog can't poison an error for work that ran
+// no JS. Collapsing the five arms onto this keeps the terminate discipline in
+// ONE place.
+fn run_js_bracketed(
+    scope: &mut v8::PinScope<'_, '_, ()>,
+    outermost: bool,
+    timeout_ms: u64,
+    reply: &Sender<VmReply>,
+    body: impl FnOnce(&mut v8::PinScope<'_, '_, ()>, bool) -> (bool, Result<JsVal, VmError>),
+) -> Result<JsVal, VmError> {
+    REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
+    let (cancel_tx, watchdog) = start_watchdog(scope.thread_safe_handle(), timeout_ms);
+    let (ran_js, mut outcome) = body(scope, outermost);
+    if finish_watchdog(cancel_tx, watchdog) {
+        WATCHDOG_FIRED.with(|w| w.set(true));
+        if ran_js {
+            outcome = Err(VmError::Terminated);
+        }
+    }
+    REPLY_STACK.with(|s| {
+        s.borrow_mut().pop();
+    });
+    outcome
 }
 
 // Drop every module AND script compiled in `context_id` (its v8::Context is
@@ -893,6 +1152,17 @@ fn drop_context_artifacts(context_id: i32) {
     SCRIPTS.with(|s| {
         s.borrow_mut().by_id.retain(|_, (_, cid)| *cid != context_id);
     });
+    // A promise-reject recorder created in this context is unusable now.
+    STATE.with(|s| {
+        let mut s = s.borrow_mut();
+        if s
+            .promise_reject_handler
+            .as_ref()
+            .is_some_and(|(cid, _)| *cid == context_id)
+        {
+            s.promise_reject_handler = None;
+        }
+    });
 }
 
 // A script's (unbound handle, owning context id), for running it in that context.
@@ -905,10 +1175,58 @@ fn script_handle(script_id: i32) -> Option<(v8::Global<v8::UnboundScript>, i32)>
     })
 }
 
+// Park until the Ruby resolver answers with a module id, servicing any nested
+// requests that arrive meanwhile (the resolver may compile/evaluate lazily).
+// None = unresolved, a protocol violation, or the caller went away. Shared by
+// resolve_imported and dynamic_import_cb so the wait loops can't drift apart.
+fn recv_module_id(scope: &mut v8::PinScope<'_, '_, ()>, arx: &Receiver<Answer>) -> Option<i32> {
+    loop {
+        match arx.recv() {
+            Ok(Answer::ModuleId(id)) => return id,
+            Ok(Answer::Nested(request)) => {
+                service_request(scope, request);
+            }
+            _ => return None,
+        }
+    }
+}
+
 // V8 calls this per import edge during InstantiateModule. Maps the referrer to
 // its url, round-trips to the Ruby resolve block (carried on REPLY_STACK), and
 // returns the module the block named. Blocks the V8 thread on the answer, just
 // like host_fn_callback.
+// A registered module's url (the filename it was compiled with), by identity
+// against MODULES — the reverse of the id lookup. Used to give a referrer its
+// url for the resolve round-trip and to fill import.meta.url.
+fn module_url(scope: &mut v8::PinScope<'_, '_>, module: v8::Local<v8::Module>) -> Option<String> {
+    MODULES.with(|m| {
+        let m = m.borrow();
+        let hash = module.get_identity_hash().get();
+        m.by_hash
+            .get(&hash)?
+            .iter()
+            .find(|(g, _)| v8::Local::new(scope, g) == module)
+            .and_then(|(_, id)| m.by_id.get(id).map(|(_, u, _)| u.clone()))
+    })
+}
+
+// V8 calls this the first time a module reads import.meta. Fills in
+// import.meta.url with the module's compile-time url (filename); other
+// properties are left to the module system / embedder.
+unsafe extern "C" fn import_meta_cb(
+    context: v8::Local<v8::Context>,
+    module: v8::Local<v8::Module>,
+    meta: v8::Local<v8::Object>,
+) {
+    v8::callback_scope!(unsafe scope, context);
+    let Some(url) = module_url(scope, module) else {
+        return;
+    };
+    if let (Some(key), Some(val)) = (v8::String::new(scope, "url"), v8::String::new(scope, &url)) {
+        meta.create_data_property(scope, key.into(), val.into());
+    }
+}
+
 fn resolve_imported<'s>(
     context: v8::Local<'s, v8::Context>,
     specifier: v8::Local<'s, v8::String>,
@@ -917,15 +1235,7 @@ fn resolve_imported<'s>(
 ) -> Option<v8::Local<'s, v8::Module>> {
     v8::callback_scope!(unsafe scope, context);
     let spec = specifier.to_rust_string_lossy(scope);
-    let ref_url = MODULES.with(|m| {
-        let m = m.borrow();
-        let hash = referrer.get_identity_hash().get();
-        m.by_hash
-            .get(&hash)?
-            .iter()
-            .find(|(g, _)| v8::Local::new(scope, g) == referrer)
-            .and_then(|(_, id)| m.by_id.get(id).map(|(_, u, _)| u.clone()))
-    })?;
+    let ref_url = module_url(scope, referrer)?;
     let reply = REPLY_STACK.with(|s| s.borrow().last().cloned())?;
     let (atx, arx) = channel();
     reply
@@ -935,17 +1245,16 @@ fn resolve_imported<'s>(
             answer: atx,
         })
         .ok()?;
-    let dep_id = match arx.recv() {
-        Ok(Answer::ModuleId(Some(id))) => id,
-        _ => return None,
-    };
-    let here = CURRENT_CTX.with(|c| c.get());
+    let dep_id = recv_module_id(scope, &arx)?;
+    // The dep must live in the context actually being linked (this callback's
+    // own context) — the auto-link of a dynamic import runs in whatever realm
+    // import() fired in, which kAuto can detach from the request that started
+    // it. A foreign-context module would V8-CHECK-abort.
+    let here = id_of_context(scope, context);
     MODULES.with(|m| {
         let m = m.borrow();
         let (g, _, cid) = m.by_id.get(&dep_id)?;
-        // Refuse a module from another v8::Context — V8 would CHECK-abort the
-        // process; None makes it a recoverable "failed to resolve" instead.
-        if *cid != here {
+        if Some(*cid) != here {
             return None;
         }
         Some(v8::Local::new(scope, g))
@@ -955,9 +1264,9 @@ fn resolve_imported<'s>(
 // V8 calls this for a JS `import(specifier)`. Returns a Promise fulfilled with
 // the resolved module's namespace (or rejected). Round-trips to the Context's
 // dynamic_import_resolver over the current request's reply channel (REPLY_STACK)
-// — so import() only works inside an eval/call. As with instantiate, the
-// resolver must return an *already-loaded* module (compiling lazily from the
-// resolver would deadlock the parked V8 thread).
+// — so import() only works inside an eval/call. The resolver may return a
+// merely COMPILED module: per V8's host contract, link + evaluate happen here
+// (finish_dynamic_import).
 fn dynamic_import_cb<'s>(
     scope: &mut v8::PinScope<'s, '_>,
     _host_defined_options: v8::Local<'s, v8::Data>,
@@ -968,10 +1277,7 @@ fn dynamic_import_cb<'s>(
     let resolver = v8::PromiseResolver::new(scope)?;
     let promise = resolver.get_promise(scope);
     let reject = |scope: &mut v8::PinScope<'s, '_>, msg: &str| {
-        if let Some(s) = v8::String::new(scope, msg) {
-            let e = v8::Exception::error(scope, s);
-            resolver.reject(scope, e);
-        }
+        reject_with_error(scope, resolver, msg);
     };
     let spec = specifier.to_rust_string_lossy(scope);
     let referrer = resource_name.to_rust_string_lossy(scope);
@@ -994,47 +1300,145 @@ fn dynamic_import_cb<'s>(
         reject(scope, "dynamic import caller went away");
         return Some(promise);
     }
-    match arx.recv() {
-        Ok(Answer::ModuleId(Some(id))) => {
-            // The resolved module must live in the context import() ran in — a
-            // foreign-context module would V8-CHECK-abort, so reject instead.
-            let here = CURRENT_CTX.with(|c| c.get());
+    match recv_module_id(scope, &arx) {
+        Some(id) => {
+            // The resolved module must live in the context import() ACTUALLY
+            // ran in — a foreign-context module would V8-CHECK-abort. Use the
+            // scope's current context, not the request's: under kAuto a
+            // microtask queued by realm B can run import() during the drain at
+            // the end of realm A's request, so the running realm is the truth.
+            let current = scope.get_current_context();
+            let here = id_of_context(scope, current);
             let g = MODULES.with(|m| {
                 m.borrow()
                     .by_id
                     .get(&id)
-                    .filter(|(_, _, cid)| *cid == here)
+                    .filter(|(_, _, cid)| Some(*cid) == here)
                     .map(|(g, _, _)| g.clone())
             });
             match g {
-                // The module must be at least instantiated to read its namespace
-                // (get_module_namespace CHECK-aborts otherwise).
                 Some(g) => {
                     let module = v8::Local::new(scope, &g);
-                    match module.get_status() {
-                        // Only a fully-evaluated module has live exports; resolve
-                        // with its namespace.
-                        v8::ModuleStatus::Evaluated => {
-                            let ns = module.get_module_namespace();
-                            resolver.resolve(scope, ns);
-                        }
-                        // A module that threw during evaluation rejects with its
-                        // own exception, not a stale namespace.
-                        v8::ModuleStatus::Errored => {
-                            let exc = module.get_exception();
-                            resolver.reject(scope, exc);
-                        }
-                        // Not yet evaluated: its namespace bindings are in TDZ, so
-                        // reject rather than hand back an object that throws on use.
-                        _ => reject(scope, "dynamically imported module is not evaluated"),
-                    }
+                    finish_dynamic_import(scope, module, resolver);
                 }
                 None => reject(scope, "resolved module not found"),
             }
         }
-        _ => reject(scope, "import() was not resolved to a module"),
+        None => reject(scope, "import() was not resolved to a module"),
     }
     Some(promise)
+}
+
+// The on-fulfilled handler for finish_dynamic_import's native then: ignores
+// the evaluation promise's fulfilment value and returns the module namespace
+// captured as the function's data, so the import() promise fulfils with the
+// namespace once evaluation (incl. top-level await) completes.
+fn dyn_import_namespace_cb(
+    _scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    rv.set(args.data());
+}
+
+// Complete a dynamic import with the module the resolver named. V8's
+// HostImportModuleDynamicallyCallback contract makes load -> link -> evaluate
+// the HOST's responsibility, so a freshly compiled (unevaluated) module is
+// linked and evaluated right here; static imports met while linking resolve
+// through the same dynamic_import_resolver (pump's ResolveModule fallback).
+// The import() promise is settled FROM the evaluation promise, which handles
+// sync completion, a thrown error, and top-level await uniformly — and since
+// V8's Module::Evaluate is idempotent (an Evaluated module returns its
+// existing top-level promise), the registry-hit case costs nothing extra.
+fn finish_dynamic_import(
+    scope: &mut v8::PinScope<'_, '_>,
+    module: v8::Local<v8::Module>,
+    resolver: v8::Local<v8::PromiseResolver>,
+) {
+    v8::tc_scope!(let tc, scope);
+    if module.get_status() == v8::ModuleStatus::Uninstantiated {
+        // Same no-re-entrancy rule as Request::InstantiateModule: linking
+        // while another link is on the stack walks V8's half-built graph.
+        if INSTANTIATING.with(|i| i.get()) {
+            reject_with_error(
+                tc,
+                resolver,
+                "cannot link a dynamic import while another module is instantiating",
+            );
+            return;
+        }
+        INSTANTIATING.with(|i| i.set(true));
+        let linked = module.instantiate_module(tc, resolve_imported);
+        INSTANTIATING.with(|i| i.set(false));
+        if linked != Some(true) {
+            // A watchdog/terminate that landed during linking must escalate to
+            // the outer request (this nested frame must not absorb it), so
+            // leave the promise pending and return with the flag still set.
+            if tc.has_terminated() {
+                return;
+            }
+            match tc.exception() {
+                Some(exc) => {
+                    resolver.reject(tc, exc);
+                }
+                None => reject_with_error(tc, resolver, "failed to link dynamically imported module"),
+            }
+            return;
+        }
+    }
+    match module.get_status() {
+        // A module that threw during evaluation rejects with its own
+        // exception, not a stale namespace.
+        v8::ModuleStatus::Errored => {
+            let exc = module.get_exception();
+            resolver.reject(tc, exc);
+        }
+        v8::ModuleStatus::Instantiated | v8::ModuleStatus::Evaluated => {
+            match module.evaluate(tc) {
+                Some(value) => {
+                    let Ok(eval_promise) = v8::Local::<v8::Promise>::try_from(value) else {
+                        reject_with_error(tc, resolver, "module evaluation did not yield a promise");
+                        return;
+                    };
+                    // Settle the import() promise from the evaluation promise
+                    // via the NATIVE Promise::then (a V8 builtin, immune to a
+                    // user-patched Promise.prototype.then): on fulfilment hand
+                    // back the namespace, on rejection adopt the same reason.
+                    let ns = module.get_module_namespace();
+                    let fulfill = v8::Function::builder(dyn_import_namespace_cb)
+                        .data(ns)
+                        .build(tc);
+                    match fulfill.and_then(|f| eval_promise.then(tc, f)) {
+                        Some(chained) => {
+                            resolver.resolve(tc, chained.into());
+                        }
+                        // Termination during then escalates; otherwise fail.
+                        None if tc.has_terminated() => {}
+                        None => reject_with_error(tc, resolver, "failed to settle dynamic import"),
+                    }
+                }
+                // Termination escalates to the outer request (leave pending).
+                None if tc.has_terminated() => {}
+                None => match tc.exception() {
+                    Some(exc) => {
+                        resolver.reject(tc, exc);
+                    }
+                    None => reject_with_error(
+                        tc,
+                        resolver,
+                        "dynamically imported module failed to evaluate",
+                    ),
+                },
+            }
+        }
+        // Mid-link/mid-evaluation on this very stack (a cycle back into an
+        // in-flight module): refuse cleanly rather than corrupt the walk.
+        _ => reject_with_error(
+            tc,
+            resolver,
+            "dynamically imported module is busy (instantiating/evaluating)",
+        ),
+    }
 }
 
 // Per-request watchdog, split so neither half borrows the isolate (it runs off
@@ -1073,6 +1477,7 @@ fn v8_thread_main(
     handle_tx: Sender<v8::IsolateHandle>,
     host_namespace: Option<String>,
     snapshot: Option<Vec<u8>>,
+    explicit_microtasks: bool,
 ) {
     init_v8();
     // A snapshot blob bakes globalThis state into the isolate: the first
@@ -1082,28 +1487,132 @@ fn v8_thread_main(
         None => Default::default(),
     };
     let mut isolate = v8::Isolate::new(create_params);
-    // Explicit microtask policy: never auto-drain at end-of-script. Microtasks
-    // run only on perform_microtask_checkpoint / the host-namespace
-    // drainMicrotasks — the embedder owns the event loop (no real timers/loop).
+    // Always Explicit at the V8 level; the binding performs the kAuto
+    // end-of-script drain itself (auto_drain), so the drain stays inside the
+    // request's watchdog bracket and honours TerminateExecution. Relying on
+    // V8's own kAuto would put the drain outside our bracket — and worse,
+    // V8's auto-drain inside Function::Call does not stop on termination, so
+    // a timed-out call that re-queues a microtask would spin forever. The
+    // :auto/:explicit distinction lives in AUTO_MICROTASKS (read by
+    // auto_drain): :auto drains at the outermost request, :explicit only on
+    // perform_microtask_checkpoint / the host-namespace drainMicrotasks.
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
+    AUTO_MICROTASKS.with(|a| a.set(!explicit_microtasks));
     // JS import() routes here; rejects unless a dynamic_import_resolver is set.
     isolate.set_host_import_module_dynamically_callback(dynamic_import_cb);
+    // Fills import.meta.url (the module's compile-time filename) on first access.
+    isolate.set_host_initialize_import_meta_object_callback(import_meta_cb);
+    // Unhandled-rejection notifications route to the JS recorder, if one was
+    // registered via NS.setPromiseRejectHandler (no-op otherwise).
+    isolate.set_promise_reject_callback(promise_reject_cb);
     let _ = handle_tx.send(isolate.thread_safe_handle());
-    // mut: reset_realm swaps this for a fresh Context in the same warm isolate.
-    let mut main_context = {
+    // Boot the main realm (id 0) into the thread-local STATE, where
+    // service_request — callable with only a scope in hand — can reach it.
+    // The host-namespace name goes in first so new_realm can read it.
+    {
         v8::scope!(let scope, &mut isolate);
-        let context = v8::Context::new(scope, Default::default());
-        v8::Global::new(scope, context)
-    };
-    if let Some(ref name) = host_namespace {
-        install_host_namespace(&mut isolate, &main_context, name);
+        STATE.with(|s| {
+            *s.borrow_mut() = V8State {
+                main_context: None,
+                contexts: HashMap::new(),
+                next_context_id: 1,
+                host_namespace,
+                security_token: None,
+                promise_reject_handler: None,
+            };
+        });
+        let main_context = new_realm(scope, 0);
+        STATE.with(|s| s.borrow_mut().main_context = Some(main_context));
     }
-    // Extra contexts from create_context, keyed by id (1, 2, ...). The main realm
-    // is id 0 and lives in `main_context` so reset_realm can swap it freely.
-    let mut contexts: HashMap<i32, v8::Global<v8::Context>> = HashMap::new();
-    let mut next_context_id: i32 = 1;
 
     while let Ok(request) = rx.recv() {
+        v8::scope!(let scope, &mut isolate);
+        if service_request(scope, request) {
+            break;
+        }
+    }
+    // Every v8::Global parked in this thread's TLS registries must die before
+    // the isolate it points into. Clear them here explicitly: thread-exit TLS
+    // destructors would run AFTER `isolate` drops below.
+    STATE.with(|s| *s.borrow_mut() = V8State::default());
+    MODULES.with(|m| *m.borrow_mut() = ModuleReg::default());
+    SCRIPTS.with(|s| *s.borrow_mut() = ScriptReg::default());
+    drop(isolate);
+}
+
+// Service ONE request on the V8 thread; returns true when the isolate should
+// shut down (Request::Dispose). This is the single dispatcher for BOTH the
+// main request loop and the nested wait loops (host_fn_callback /
+// resolve_imported / dynamic_import_cb), so EVERY op — not just eval/call —
+// works re-entrantly from inside a host proc or module resolver. Anything
+// less deadlocks the rendezvous: the Ruby thread waits on the V8 thread,
+// which waits on that same Ruby thread's answer.
+fn service_request(scope: &mut v8::PinScope<'_, '_, ()>, request: Request) -> bool {
+    // True when no other request is suspended beneath this one — the frame
+    // that owns terminate-flag cleanup (see WATCHDOG_FIRED).
+    let outermost = REPLY_STACK.with(|s| s.borrow().is_empty());
+    // Clear any terminate left over from BEFORE this request. An
+    // Isolate#terminate fired while the V8 thread was idle (no JS running)
+    // arms the isolate-global flag but no WATCHDOG_FIRED, so the end-of-request
+    // sweep would miss it and the next eval would abort spuriously — and an
+    // idle terminate isn't even observable via is_execution_terminating() yet,
+    // so cancel unconditionally. Only at the outermost frame: a terminate aimed
+    // at a SUSPENDED outer frame must survive a nested request.
+    if outermost {
+        scope.cancel_terminate_execution();
+    }
+    // Mark the realm this request runs in active while it is on the stack, so
+    // Reset/DisposeContext can refuse to pull a live realm out from under a
+    // suspended frame.
+    let realm = request_realm(&request);
+    if let Some(id) = realm {
+        ACTIVE_REALMS.with(|a| a.borrow_mut().push(id));
+    }
+    let dispose = dispatch_one(scope, request, outermost);
+    if realm.is_some() {
+        ACTIVE_REALMS.with(|a| {
+            a.borrow_mut().pop();
+        });
+    }
+    // Sweep a leftover terminate flag once the whole request stack has
+    // unwound (see WATCHDOG_FIRED for why nested frames must not cancel).
+    if outermost && WATCHDOG_FIRED.with(|w| w.replace(false)) {
+        scope.cancel_terminate_execution();
+    }
+    dispose
+}
+
+// The realm a request will run in (None for realm-independent ops); feeds
+// ACTIVE_REALMS above.
+fn request_realm(request: &Request) -> Option<i32> {
+    match request {
+        Request::Eval { context_id, .. }
+        | Request::Call { context_id, .. }
+        | Request::Attach { context_id, .. }
+        | Request::CompileModule { context_id, .. }
+        | Request::CompileScript { context_id, .. } => Some(*context_id),
+        Request::DrainMicrotasks { .. } => Some(0),
+        Request::InstantiateModule { module_id, .. }
+        | Request::EvaluateModule { module_id, .. }
+        | Request::ModuleNamespace { module_id, .. } => {
+            module_handle(*module_id).map(|(_, cid)| cid)
+        }
+        Request::RunScript { script_id, .. } => script_handle(*script_id).map(|(_, cid)| cid),
+        Request::Reset { .. }
+        | Request::CreateContext { .. }
+        | Request::DisposeContext { .. }
+        | Request::ModuleStatus { .. }
+        | Request::DisposeModule { .. }
+        | Request::DisposeScript { .. }
+        | Request::Dispose => None,
+    }
+}
+
+fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermost: bool) -> bool {
+    // A request-scoped handle scope, so handles created while servicing a
+    // nested request don't pile up in the suspended callback's scope.
+    v8::scope!(let scope, &mut *scope);
+    {
         match request {
             Request::Eval {
                 context_id,
@@ -1112,23 +1621,17 @@ fn v8_thread_main(
                 timeout_ms,
                 reply,
             } => {
-                REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
-                CURRENT_CTX.with(|c| c.set(context_id));
-                let (cancel_tx, watchdog) = start_watchdog(isolate.thread_safe_handle(), timeout_ms);
-                let outcome = match context_for(&main_context, &contexts, context_id) {
-                    Some(ctx) => {
-                        v8::scope!(let scope, &mut isolate);
-                        let context = v8::Local::new(scope, &ctx);
-                        let scope = &mut v8::ContextScope::new(scope, context);
-                        run_source(scope, &source, &filename)
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
+                    match context_for(context_id) {
+                        Some(ctx) => {
+                            let context = v8::Local::new(scope, &ctx);
+                            let scope = &mut v8::ContextScope::new(scope, context);
+                            let out = run_source(scope, &source, &filename);
+                            auto_drain(scope, outermost);
+                            (true, out)
+                        }
+                        None => (false, Err(VmError::Runtime("realm disposed or unknown".into()))),
                     }
-                    None => Err(VmError::Runtime("realm disposed or unknown".into())),
-                };
-                if finish_watchdog(cancel_tx, watchdog) {
-                    isolate.cancel_terminate_execution();
-                }
-                REPLY_STACK.with(|s| {
-                    s.borrow_mut().pop();
                 });
                 let _ = reply.send(VmReply::Done(outcome));
             }
@@ -1140,25 +1643,19 @@ fn v8_thread_main(
                 timeout_ms,
                 reply,
             } => {
-                // REPLY_STACK so a host fn invoked by the called function routes
-                // back to this request's waiter, exactly like Eval.
-                REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
-                CURRENT_CTX.with(|c| c.set(context_id));
-                let (cancel_tx, watchdog) = start_watchdog(isolate.thread_safe_handle(), timeout_ms);
-                let outcome = match context_for(&main_context, &contexts, context_id) {
-                    Some(ctx) => {
-                        v8::scope!(let scope, &mut isolate);
-                        let context = v8::Local::new(scope, &ctx);
-                        let scope = &mut v8::ContextScope::new(scope, context);
-                        call_function(scope, &name, &args, void)
+                // The bracket pushes REPLY_STACK so a host fn invoked by the
+                // called function routes back to this request's waiter.
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
+                    match context_for(context_id) {
+                        Some(ctx) => {
+                            let context = v8::Local::new(scope, &ctx);
+                            let scope = &mut v8::ContextScope::new(scope, context);
+                            let out = call_function(scope, &name, args, void);
+                            auto_drain(scope, outermost);
+                            (true, out)
+                        }
+                        None => (false, Err(VmError::Runtime("realm disposed or unknown".into()))),
                     }
-                    None => Err(VmError::Runtime("realm disposed or unknown".into())),
-                };
-                if finish_watchdog(cancel_tx, watchdog) {
-                    isolate.cancel_terminate_execution();
-                }
-                REPLY_STACK.with(|s| {
-                    s.borrow_mut().pop();
                 });
                 let _ = reply.send(VmReply::Done(outcome));
             }
@@ -1167,17 +1664,15 @@ fn v8_thread_main(
                 // ruby), so push the reply onto REPLY_STACK exactly like Eval,
                 // or that callback would find no waiter and silently no-op.
                 REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
-                CURRENT_CTX.with(|c| c.set(0)); // the checkpoint runs in the main context
-                let (cancel_tx, watchdog) = start_watchdog(isolate.thread_safe_handle(), timeout_ms);
-                {
-                    v8::scope!(let scope, &mut isolate);
-                    let context = v8::Local::new(scope, &main_context);
+                let (cancel_tx, watchdog) = start_watchdog(scope.thread_safe_handle(), timeout_ms);
+                if let Some(ctx) = context_for(0) {
+                    let context = v8::Local::new(scope, &ctx);
                     let scope = &mut v8::ContextScope::new(scope, context);
-                    scope.perform_microtask_checkpoint();
+                    checkpoint_draining(scope);
                 }
                 let fired = finish_watchdog(cancel_tx, watchdog);
                 if fired {
-                    isolate.cancel_terminate_execution();
+                    WATCHDOG_FIRED.with(|w| w.set(true));
                 }
                 REPLY_STACK.with(|s| {
                     s.borrow_mut().pop();
@@ -1193,75 +1688,108 @@ fn v8_thread_main(
                 context_id,
                 name,
                 host_fn_id,
+                timeout_ms,
                 reply,
             } => {
-                let outcome = match context_for(&main_context, &contexts, context_id) {
-                    Some(ctx) => {
-                        v8::scope!(let scope, &mut isolate);
-                        let context = v8::Local::new(scope, &ctx);
-                        let scope = &mut v8::ContextScope::new(scope, context);
-                        let external = v8::External::new(scope, host_fn_id as *mut c_void);
-                        match v8::Function::builder(host_fn_callback)
-                            .data(external.into())
-                            .build(scope)
-                        {
-                            // A dotted name (e.g. "MiniRacer.foo") attaches under
-                            // a namespace object, creating missing intermediates,
-                            // so host fns needn't pollute the bare global.
-                            Some(function) => attach_at_path(scope, context, &name, function),
-                            None => Err(VmError::Runtime("failed to build function".into())),
+                // attach_at_path writes onto globalThis (and walks a dotted
+                // path), which can fire a user-defined accessor or Proxy trap —
+                // arbitrary JS. So it goes through the same bracket as Eval: a
+                // host fn the trap calls routes back, and a looping trap is
+                // time-capped.
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
+                    match context_for(context_id) {
+                        Some(ctx) => {
+                            let context = v8::Local::new(scope, &ctx);
+                            let scope = &mut v8::ContextScope::new(scope, context);
+                            let external = v8::External::new(scope, host_fn_id as *mut c_void);
+                            let out = match v8::Function::builder(host_fn_callback)
+                                .data(external.into())
+                                .build(scope)
+                            {
+                                // A dotted name (e.g. "MiniRacer.foo") attaches
+                                // under a namespace object, creating missing
+                                // intermediates, so host fns needn't pollute the
+                                // bare global.
+                                Some(function) => attach_at_path(scope, context, &name, function),
+                                None => Err(VmError::Runtime("failed to build function".into())),
+                            };
+                            auto_drain(scope, outermost);
+                            (true, out)
                         }
+                        None => (false, Err(VmError::Runtime("realm disposed or unknown".into()))),
                     }
-                    None => Err(VmError::Runtime("realm disposed or unknown".into())),
-                };
+                });
                 let _ = reply.send(VmReply::Done(outcome));
             }
             Request::Reset { context_id, reply } => {
-                if context_id != 0 && !contexts.contains_key(&context_id) {
+                let known = context_id == 0
+                    || STATE.with(|s| s.borrow().contexts.contains_key(&context_id));
+                if DRAINING.with(|d| d.get()) {
+                    // A microtask from ANY realm may be mid-flight on the stack;
+                    // swapping a v8::Context out from under it corrupts state.
+                    let _ = reply.send(VmReply::Done(Err(VmError::Runtime(
+                        "cannot reset a realm during a microtask checkpoint".into(),
+                    ))));
+                } else if !known {
                     let _ = reply.send(VmReply::Done(Err(VmError::Runtime(
                         "context disposed or unknown".into(),
                     ))));
-                    continue;
-                }
-                let fresh = {
-                    v8::scope!(let scope, &mut isolate);
-                    let context = v8::Context::new(scope, Default::default());
-                    v8::Global::new(scope, context)
-                };
-                if let Some(ref name) = host_namespace {
-                    install_host_namespace(&mut isolate, &fresh, name);
-                }
-                if context_id == 0 {
-                    main_context = fresh;
+                } else if ACTIVE_REALMS.with(|a| a.borrow().contains(&context_id)) {
+                    // Swapping the v8::Context behind a suspended frame would
+                    // drop its in-flight modules/scripts and let the realm id
+                    // refer to a different context than the one on the stack
+                    // (defeating the cross-context import guards).
+                    let _ = reply.send(VmReply::Done(Err(VmError::Runtime(
+                        "cannot reset a realm while a request for it is suspended on the V8 stack"
+                            .into(),
+                    ))));
                 } else {
-                    contexts.insert(context_id, fresh);
+                    let fresh = new_realm(scope, context_id);
+                    STATE.with(|s| {
+                        let mut s = s.borrow_mut();
+                        if context_id == 0 {
+                            s.main_context = Some(fresh);
+                        } else {
+                            s.contexts.insert(context_id, fresh);
+                        }
+                    });
+                    // Drop modules bound to this context — their realm just changed.
+                    drop_context_artifacts(context_id);
+                    let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
                 }
-                // Drop modules bound to this context — their realm just changed.
-                drop_context_artifacts(context_id);
-                let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
             }
             Request::CreateContext { reply } => {
-                let id = next_context_id;
-                next_context_id += 1;
-                let fresh = {
-                    v8::scope!(let scope, &mut isolate);
-                    let context = v8::Context::new(scope, Default::default());
-                    v8::Global::new(scope, context)
-                };
-                if let Some(ref name) = host_namespace {
-                    install_host_namespace(&mut isolate, &fresh, name);
-                }
-                contexts.insert(id, fresh);
+                let id = STATE.with(|s| {
+                    let mut s = s.borrow_mut();
+                    let id = s.next_context_id;
+                    s.next_context_id += 1;
+                    id
+                });
+                let fresh = new_realm(scope, id);
+                STATE.with(|s| s.borrow_mut().contexts.insert(id, fresh));
                 let _ = reply.send(VmReply::Done(Ok(JsVal::Int(id as i64))));
             }
             Request::DisposeContext { context_id, reply } => {
-                // Dropping the Global lets V8 collect the context. id 0 is the
-                // default context and never disposed independently.
-                contexts.remove(&context_id);
-                // Reclaim the modules compiled in it (else they leak until
-                // isolate teardown).
-                drop_context_artifacts(context_id);
-                let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
+                if DRAINING.with(|d| d.get()) {
+                    // Same hazard as Reset: a microtask from any realm may be live.
+                    let _ = reply.send(VmReply::Done(Err(VmError::Runtime(
+                        "cannot dispose a realm during a microtask checkpoint".into(),
+                    ))));
+                } else if ACTIVE_REALMS.with(|a| a.borrow().contains(&context_id)) {
+                    // Same hazard as Reset: a suspended frame still runs in it.
+                    let _ = reply.send(VmReply::Done(Err(VmError::Runtime(
+                        "cannot dispose a realm while a request for it is suspended on the V8 stack"
+                            .into(),
+                    ))));
+                } else {
+                    // Dropping the Global lets V8 collect the context. id 0 is the
+                    // default context and never disposed independently.
+                    STATE.with(|s| s.borrow_mut().contexts.remove(&context_id));
+                    // Reclaim the modules compiled in it (else they leak until
+                    // isolate teardown).
+                    drop_context_artifacts(context_id);
+                    let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
+                }
             }
             Request::CompileModule {
                 context_id,
@@ -1271,11 +1799,9 @@ fn v8_thread_main(
                 produce_cache,
                 reply,
             } => {
-                CURRENT_CTX.with(|c| c.set(context_id));
-                let outcome = match context_for(&main_context, &contexts, context_id) {
+                let outcome = match context_for(context_id) {
                     None => Err(VmError::Runtime("context disposed or unknown".into())),
                     Some(cx) => {
-                    v8::scope!(let scope, &mut isolate);
                     let context = v8::Local::new(scope, &cx);
                     let scope = &mut v8::ContextScope::new(scope, context);
                     v8::tc_scope!(let tc, scope);
@@ -1365,53 +1891,94 @@ fn v8_thread_main(
                 let _ = reply.send(VmReply::ModuleCompiled(outcome));
             }
             Request::InstantiateModule { module_id, reply } => {
-                // REPLY_STACK so resolve_imported can round-trip per import edge.
-                REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
-                let outcome = match module_handle(module_id) {
-                    None => Err(VmError::Runtime("unknown module".into())),
-                    Some((g, cid)) => match context_for(&main_context, &contexts, cid) {
-                        None => Err(VmError::Runtime("module's context is gone".into())),
-                        Some(cx) => {
-                            CURRENT_CTX.with(|c| c.set(cid));
-                            v8::scope!(let scope, &mut isolate);
-                            let context = v8::Local::new(scope, &cx);
-                            let scope = &mut v8::ContextScope::new(scope, context);
-                            let module = v8::Local::new(scope, &g);
-                            v8::tc_scope!(let tc, scope);
-                            match module.instantiate_module(tc, resolve_imported) {
-                                Some(true) => Ok(JsVal::Undefined),
-                                _ if tc.has_terminated() => Err(VmError::Terminated),
-                                _ => {
-                                    let exc = tc.exception();
-                                    let stack = tc.stack_trace();
-                                    Err(capture_js_error(tc, exc, stack))
+                // V8's module instantiation is NOT re-entrant: a nested
+                // instantiate issued from a resolve block walks the outer,
+                // half-built module graph and SEGVs the process. Refuse it
+                // cleanly — a resolve block may COMPILE dependencies lazily
+                // and return them; the outer instantiate links them.
+                if INSTANTIATING.with(|i| i.get()) {
+                    let _ = reply.send(VmReply::Done(Err(VmError::Runtime(
+                        "instantiate is not re-entrant: another module is currently \
+                         instantiating (compile the dependency and return it; the outer \
+                         instantiate links it)"
+                            .into(),
+                    ))));
+                } else {
+                    INSTANTIATING.with(|i| i.set(true));
+                    // REPLY_STACK so resolve_imported can round-trip per import edge.
+                    REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
+                    let outcome = match module_handle(module_id) {
+                        None => Err(VmError::Runtime("unknown module".into())),
+                        Some((g, cid)) => match context_for(cid) {
+                            None => Err(VmError::Runtime("module's context is gone".into())),
+                            Some(cx) => {
+                                let context = v8::Local::new(scope, &cx);
+                                let scope = &mut v8::ContextScope::new(scope, context);
+                                let module = v8::Local::new(scope, &g);
+                                match module.get_status() {
+                                    // Already linked (or further along): a no-op,
+                                    // not an error — instantiate is idempotent.
+                                    v8::ModuleStatus::Instantiated
+                                    | v8::ModuleStatus::Evaluating
+                                    | v8::ModuleStatus::Evaluated => Ok(JsVal::Undefined),
+                                    // V8 CHECK-aborts on instantiating an errored
+                                    // module; surface its exception instead.
+                                    v8::ModuleStatus::Errored => Err(VmError::JsError {
+                                        message: module
+                                            .get_exception()
+                                            .to_rust_string_lossy(scope),
+                                        backtrace: vec![],
+                                    }),
+                                    _ => {
+                                        v8::tc_scope!(let tc, scope);
+                                        match module.instantiate_module(tc, resolve_imported) {
+                                            Some(true) => Ok(JsVal::Undefined),
+                                            _ if tc.has_terminated() => Err(VmError::Terminated),
+                                            _ => {
+                                                let exc = tc.exception();
+                                                let stack = tc.stack_trace();
+                                                Err(capture_js_error(tc, exc, stack))
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
-                    }
-                };
-                REPLY_STACK.with(|s| {
-                    s.borrow_mut().pop();
-                });
-                let _ = reply.send(VmReply::Done(outcome));
+                    };
+                    REPLY_STACK.with(|s| {
+                        s.borrow_mut().pop();
+                    });
+                    INSTANTIATING.with(|i| i.set(false));
+                    let _ = reply.send(VmReply::Done(outcome));
+                }
             }
-            Request::EvaluateModule { module_id, reply } => {
-                // Top-level module code may call host fns -> REPLY_STACK.
-                REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
-                let outcome = match module_handle(module_id) {
-                    None => Err(VmError::Runtime("unknown module".into())),
-                    Some((g, cid)) => match context_for(&main_context, &contexts, cid) {
-                        None => Err(VmError::Runtime("module's context is gone".into())),
+            Request::EvaluateModule { module_id, timeout_ms, reply } => {
+                // Top-level module code (and, under :auto, the microtasks its
+                // TLA continuation drains) can loop, so it runs in the same
+                // watchdog/REPLY_STACK bracket as Eval/Call/RunScript.
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
+                match module_handle(module_id) {
+                    None => (false, Err(VmError::Runtime("unknown module".into()))),
+                    Some((g, cid)) => match context_for(cid) {
+                        None => (false, Err(VmError::Runtime("module's context is gone".into()))),
                         Some(cx) => {
-                            CURRENT_CTX.with(|c| c.set(cid));
-                            v8::scope!(let scope, &mut isolate);
                             let context = v8::Local::new(scope, &cx);
                             let scope = &mut v8::ContextScope::new(scope, context);
                             let module = v8::Local::new(scope, &g);
+                            // A top-level-await module's evaluate() returns a
+                            // PENDING promise that only settles once the drain
+                            // runs its continuation — remember it so we can read
+                            // its post-drain state instead of reporting a stale Ok.
+                            let mut eval_promise: Option<v8::Global<v8::Promise>> = None;
+                            // ran_js is true ONLY for the Instantiated arm that
+                            // actually calls evaluate(); the Errored/Evaluated/
+                            // non-instantiated arms run no JS, so a raced watchdog
+                            // must not override their real outcome to Terminated.
+                            let mut did_eval = false;
                             // V8 CHECK-aborts the process if evaluate runs on a
                             // module that isn't exactly Instantiated, so guard
                             // status explicitly rather than crash.
-                            match module.get_status() {
+                            let out = match module.get_status() {
                                 v8::ModuleStatus::Errored => {
                                     Err(VmError::JsError {
                                         message: module
@@ -1422,14 +1989,13 @@ fn v8_thread_main(
                                 }
                                 v8::ModuleStatus::Evaluated => Ok(JsVal::Undefined),
                                 v8::ModuleStatus::Instantiated => {
+                                    did_eval = true;
                                     v8::tc_scope!(let tc, scope);
                                     match module.evaluate(tc) {
-                                        // evaluate returns a Promise; a synchronous
-                                        // top-level throw yields a *rejected*
-                                        // promise (not None), so check it — else the
-                                        // error is silently lost. A pending (TLA) or
-                                        // fulfilled promise is left for the embedder
-                                        // to drain (explicit microtask policy).
+                                        // A synchronous top-level throw yields a
+                                        // *rejected* promise (not None); a pending
+                                        // (TLA) or fulfilled one is remembered and
+                                        // re-checked after the drain.
                                         Some(value) => match v8::Local::<v8::Promise>::try_from(value) {
                                             Ok(p) if p.state() == v8::PromiseState::Rejected => {
                                                 let reason = p.result(tc);
@@ -1437,6 +2003,10 @@ fn v8_thread_main(
                                                     message: reason.to_rust_string_lossy(tc),
                                                     backtrace: vec![],
                                                 })
+                                            }
+                                            Ok(p) => {
+                                                eval_promise = Some(v8::Global::new(tc, p));
+                                                Ok(JsVal::Undefined)
                                             }
                                             _ => Ok(JsVal::Undefined),
                                         },
@@ -1451,22 +2021,37 @@ fn v8_thread_main(
                                 _ => Err(VmError::Runtime(
                                     "module must be instantiated before evaluate".into(),
                                 )),
-                            }
+                            };
+                            auto_drain(scope, outermost);
+                            // The drain may have settled a TLA module's promise to
+                            // rejected — surface that instead of the provisional Ok.
+                            let result = if let (true, Some(g)) = (out.is_ok(), eval_promise) {
+                                let p = v8::Local::new(scope, &g);
+                                if p.state() == v8::PromiseState::Rejected {
+                                    let reason = p.result(scope);
+                                    Err(VmError::JsError {
+                                        message: reason.to_rust_string_lossy(scope),
+                                        backtrace: vec![],
+                                    })
+                                } else {
+                                    out
+                                }
+                            } else {
+                                out
+                            };
+                            (did_eval, result)
                         }
                     }
-                };
-                REPLY_STACK.with(|s| {
-                    s.borrow_mut().pop();
+                }
                 });
                 let _ = reply.send(VmReply::Done(outcome));
             }
             Request::ModuleNamespace { module_id, reply } => {
                 let outcome = match module_handle(module_id) {
                     None => Err(VmError::Runtime("unknown module".into())),
-                    Some((g, cid)) => match context_for(&main_context, &contexts, cid) {
+                    Some((g, cid)) => match context_for(cid) {
                         None => Err(VmError::Runtime("module's context is gone".into())),
                         Some(cx) => {
-                            v8::scope!(let scope, &mut isolate);
                             let context = v8::Local::new(scope, &cx);
                             let scope = &mut v8::ContextScope::new(scope, context);
                             let module = v8::Local::new(scope, &g);
@@ -1483,6 +2068,24 @@ fn v8_thread_main(
                                 }
                             }
                         }
+                    }
+                };
+                let _ = reply.send(VmReply::Done(outcome));
+            }
+            Request::ModuleStatus { module_id, reply } => {
+                let outcome = match module_handle(module_id) {
+                    None => Err(VmError::Runtime("unknown module".into())),
+                    Some((g, _cid)) => {
+                        let module = v8::Local::new(scope, &g);
+                        let name = match module.get_status() {
+                            v8::ModuleStatus::Uninstantiated => "uninstantiated",
+                            v8::ModuleStatus::Instantiating => "instantiating",
+                            v8::ModuleStatus::Instantiated => "instantiated",
+                            v8::ModuleStatus::Evaluating => "evaluating",
+                            v8::ModuleStatus::Evaluated => "evaluated",
+                            v8::ModuleStatus::Errored => "errored",
+                        };
+                        Ok(JsVal::Str(name.into()))
                     }
                 };
                 let _ = reply.send(VmReply::Done(outcome));
@@ -1505,10 +2108,9 @@ fn v8_thread_main(
                 produce_cache,
                 reply,
             } => {
-                let outcome = match context_for(&main_context, &contexts, context_id) {
+                let outcome = match context_for(context_id) {
                     None => Err(VmError::Runtime("context disposed or unknown".into())),
                     Some(cx) => {
-                        v8::scope!(let scope, &mut isolate);
                         let context = v8::Local::new(scope, &cx);
                         let scope = &mut v8::ContextScope::new(scope, context);
                         v8::tc_scope!(let tc, scope);
@@ -1589,38 +2191,33 @@ fn v8_thread_main(
                 timeout_ms,
                 reply,
             } => {
-                // REPLY_STACK so a host fn the script calls routes back, like Eval.
-                REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
-                let (cancel_tx, watchdog) = start_watchdog(isolate.thread_safe_handle(), timeout_ms);
-                let outcome = match script_handle(script_id) {
-                    None => Err(VmError::Runtime("unknown script".into())),
-                    Some((g, cid)) => match context_for(&main_context, &contexts, cid) {
-                        None => Err(VmError::Runtime("script's context is gone".into())),
-                        Some(cx) => {
-                            CURRENT_CTX.with(|c| c.set(cid));
-                            v8::scope!(let scope, &mut isolate);
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
+                    match script_handle(script_id) {
+                        None => (false, Err(VmError::Runtime("unknown script".into()))),
+                        Some((g, cid)) => match context_for(cid) {
+                            None => (false, Err(VmError::Runtime("script's context is gone".into()))),
+                            Some(cx) => {
                             let context = v8::Local::new(scope, &cx);
                             let scope = &mut v8::ContextScope::new(scope, context);
                             let unbound = v8::Local::new(scope, &g);
                             let script = unbound.bind_to_current_context(scope);
-                            v8::tc_scope!(let tc, scope);
-                            match script.run(tc) {
-                                Some(value) => Ok(js_to_jsval(tc, value)),
-                                None if tc.has_terminated() => Err(VmError::Terminated),
-                                None => {
-                                    let exc = tc.exception();
-                                    let stack = tc.stack_trace();
-                                    Err(capture_js_error(tc, exc, stack))
+                            let out = {
+                                v8::tc_scope!(let tc, scope);
+                                match script.run(tc) {
+                                    Some(value) => Ok(js_to_jsval(tc, value)),
+                                    None if tc.has_terminated() => Err(VmError::Terminated),
+                                    None => {
+                                        let exc = tc.exception();
+                                        let stack = tc.stack_trace();
+                                        Err(capture_js_error(tc, exc, stack))
+                                    }
                                 }
+                            };
+                            auto_drain(scope, outermost);
+                            (true, out)
                             }
                         }
-                    },
-                };
-                if finish_watchdog(cancel_tx, watchdog) {
-                    isolate.cancel_terminate_execution();
-                }
-                REPLY_STACK.with(|s| {
-                    s.borrow_mut().pop();
+                    }
                 });
                 let _ = reply.send(VmReply::Done(outcome));
             }
@@ -1630,29 +2227,38 @@ fn v8_thread_main(
                 });
                 let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
             }
-            Request::Dispose => break,
+            // Shuts the main loop down. Never arrives at a nested servicing
+            // site: Core::dispose bypasses dispatch and queues directly.
+            Request::Dispose => return true,
         }
     }
-    // Every v8::Global must die before the isolate it points into; dropping
-    // them here (before isolate) makes the order explicit.
-    drop(contexts);
-    drop(main_context);
-    drop(isolate);
+    false
+}
+
+// The id of |context|, read O(1) from the realm-id stamped in by new_realm.
+// None when the context is not a LIVE realm of this isolate — a context reset
+// away still carries its old stamp, so confirm the id currently maps back to
+// this very context before trusting it.
+fn id_of_context(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::Context>) -> Option<i32> {
+    let id = context
+        .get_embedder_data(scope, REALM_ID_SLOT)
+        .and_then(|v| v.int32_value(scope))?;
+    let live = context_for(id).is_some_and(|g| v8::Local::new(scope, &g) == context);
+    live.then_some(id)
 }
 
 // Pick the Global context for a realm id: 0 = main, N = an extra realm (None
 // if it was disposed or never existed). Clones the Global (cheap, refcounted)
-// so the caller can open a scope on &mut isolate without aliasing.
-fn context_for(
-    main: &v8::Global<v8::Context>,
-    contexts: &HashMap<i32, v8::Global<v8::Context>>,
-    context_id: i32,
-) -> Option<v8::Global<v8::Context>> {
-    if context_id == 0 {
-        Some(main.clone())
-    } else {
-        contexts.get(&context_id).cloned()
-    }
+// so no STATE borrow is held while the caller runs JS.
+fn context_for(context_id: i32) -> Option<v8::Global<v8::Context>> {
+    STATE.with(|s| {
+        let s = s.borrow();
+        if context_id == 0 {
+            s.main_context.clone()
+        } else {
+            s.contexts.get(&context_id).cloned()
+        }
+    })
 }
 
 // A module's (handle, owning context id), for running its ops in the right
@@ -1670,9 +2276,25 @@ fn module_handle(module_id: i32) -> Option<(v8::Global<v8::Module>, i32)> {
 // Ruby side
 // ---------------------------------------------------------------------------
 thread_local! {
-    // Answer senders for callbacks this Ruby thread is currently serving;
-    // a ctx.eval from inside a proc routes through the top as a NestedEval.
-    static NESTED: RefCell<Vec<Sender<Answer>>> = const { RefCell::new(Vec::new()) };
+    // Suspended frames this Ruby thread is currently serving (a host proc or
+    // module resolver), innermost last. Each frame is tagged with its Core's
+    // address so Core::dispatch only routes ops for THAT isolate through it —
+    // an op aimed at a different isolate must use that isolate's own queue
+    // (its V8 thread is not the suspended one).
+    static NESTED: RefCell<Vec<(usize, Sender<Answer>)>> = const { RefCell::new(Vec::new()) };
+}
+
+// Run |f| with |answer| pushed as this thread's innermost suspended frame,
+// popping it afterwards — any VM op |f| issues routes through the frame via
+// Core::dispatch. Centralised so push/pop can't fall out of balance.
+fn with_nested<R>(core: &Core, answer: &Sender<Answer>, f: impl FnOnce() -> R) -> R {
+    let tag = core as *const Core as usize;
+    NESTED.with(|n| n.borrow_mut().push((tag, answer.clone())));
+    let r = f();
+    NESTED.with(|n| {
+        n.borrow_mut().pop();
+    });
+    r
 }
 
 struct Shared {
@@ -1690,14 +2312,16 @@ struct Shared {
 struct Core {
     shared: Mutex<Shared>,
     // Shared across contexts (host_fn_id indexes this one vector). Mutex (not
-    // RefCell) because contexts of one Context may be pumped on different threads.
-    procs: Mutex<Vec<Opaque<Proc>>>,
+    // RefCell) because contexts of one Context may be pumped on different
+    // threads. Each proc is GC-rooted (marked + pinned) while live — see
+    // RootedProc/ProcSlot; reset/dispose of a realm releases its roots.
+    procs: Mutex<Vec<ProcSlot>>,
     // Default per-eval/call timeout (ms); 0 = none. eval(timeout_ms:)'s explicit
     // value overrides it. Guards against an in-V8 infinite loop without a watchdog.
     default_timeout_ms: u64,
     // Set by Context#dynamic_import_resolver=; called for a JS import() to map
-    // (specifier, referrer) to an already-loaded Module.
-    dynamic_import_resolver: Mutex<Option<Opaque<Proc>>>,
+    // (specifier, referrer) to an already-loaded Module. GC-rooted like procs.
+    dynamic_import_resolver: Mutex<Option<RootedProc>>,
 }
 
 // The V8 isolate (one per Isolate): lifecycle + the isolate-level ops
@@ -1811,18 +2435,205 @@ fn drain_microtasks(
     scope.perform_microtask_checkpoint();
 }
 
+// NS.contextGlobal(id) -> the globalThis of context |id|. Cross-context
+// access within the isolate is plain V8 (no security tokens configured), so
+// this is the embedder's `iframe.contentWindow`: the frame realm's global,
+// reachable from the parent realm. Throws on an unknown/disposed id.
+fn context_global(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Some(id) = args.get(0).int32_value(scope) else {
+        throw_js_error(scope, "contextGlobal expects a context id");
+        return;
+    };
+    match context_for(id) {
+        Some(g) => {
+            let context = v8::Local::new(scope, &g);
+            rv.set(context.global(scope).into());
+        }
+        None => throw_js_error(scope, &format!("unknown context {id}")),
+    }
+}
+
+// NS.contextOf(value) -> the id of the context |value| was created in, or
+// undefined for primitives and for objects whose context is no longer a live
+// realm (e.g. it was reset away). Lets the embedder attribute a function or
+// object to its frame.
+fn context_of(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    mut rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    let Ok(obj) = v8::Local::<v8::Object>::try_from(args.get(0)) else {
+        return; // primitive -> undefined
+    };
+    let Some(context) = obj.get_creation_context(scope) else {
+        return;
+    };
+    if let Some(id) = id_of_context(scope, context) {
+        rv.set(v8::Integer::new(scope, id).into());
+    }
+}
+
+// NS.setPromiseRejectHandler(fn | null): register (or clear) the isolate-wide
+// recorder that promise_reject_cb forwards V8's reject notifications to.
+fn set_promise_reject_handler(
+    scope: &mut v8::PinScope<'_, '_>,
+    args: v8::FunctionCallbackArguments<'_>,
+    _rv: v8::ReturnValue<'_, v8::Value>,
+) {
+    match v8::Local::<v8::Function>::try_from(args.get(0)) {
+        Ok(f) => {
+            let cid = f
+                .get_creation_context(scope)
+                .and_then(|cx| id_of_context(scope, cx))
+                .unwrap_or(0);
+            let g = v8::Global::new(scope, f);
+            STATE.with(|s| s.borrow_mut().promise_reject_handler = Some((cid, g)));
+        }
+        Err(_) => {
+            STATE.with(|s| s.borrow_mut().promise_reject_handler = None);
+        }
+    }
+}
+
+// V8 calls this synchronously on promise rejections with no handler (and the
+// later revocations when a handler IS added). Forwards
+// (event, contextId, promise, reason) to the registered JS recorder — the
+// contextId being the PROMISE's creation context, which is how the embedder
+// attributes an unhandledrejection event to the right frame. Events mirror
+// v8::PromiseRejectEvent: 0 = rejected with no handler, 1 = handler added
+// after reject, 2 = reject after resolved, 3 = resolve after resolved.
+unsafe extern "C" fn promise_reject_cb(message: v8::PromiseRejectMessage) {
+    v8::callback_scope!(unsafe scope, &message);
+    let handler = STATE.with(|s| {
+        s.borrow()
+            .promise_reject_handler
+            .as_ref()
+            .map(|(_, g)| g.clone())
+    });
+    let Some(handler) = handler else { return };
+    let promise = message.get_promise();
+    let event = match message.get_event() {
+        v8::PromiseRejectEvent::PromiseRejectWithNoHandler => 0,
+        v8::PromiseRejectEvent::PromiseHandlerAddedAfterReject => 1,
+        v8::PromiseRejectEvent::PromiseRejectAfterResolved => 2,
+        v8::PromiseRejectEvent::PromiseResolveAfterResolved => 3,
+    };
+    let context_id = promise
+        .get_creation_context(scope)
+        .and_then(|cx| id_of_context(scope, cx));
+    let handler = v8::Local::new(scope, &handler);
+    // Run the recorder in ITS OWN context (it may differ from the rejecting
+    // promise's).
+    let Some(handler_context) = handler.get_creation_context(scope) else {
+        return;
+    };
+    let scope = &mut v8::ContextScope::new(scope, handler_context);
+    let event_arg: v8::Local<v8::Value> = v8::Integer::new(scope, event).into();
+    let context_arg: v8::Local<v8::Value> = match context_id {
+        Some(id) => v8::Integer::new(scope, id).into(),
+        None => v8::undefined(scope).into(),
+    };
+    let reason: v8::Local<v8::Value> = message
+        .get_value()
+        .unwrap_or_else(|| v8::undefined(scope).into());
+    let recv: v8::Local<v8::Value> = v8::undefined(scope).into();
+    // The recorder must never break the script that happened to reject a
+    // promise — swallow anything it THROWS. But a TerminateExecution (watchdog
+    // timeout or Isolate#terminate, aimed at the surrounding script) is not an
+    // ordinary throw: the TryCatch absorbs it too, so re-assert it after the
+    // call, or the terminated outer script would resume unbounded.
+    let terminated = {
+        v8::tc_scope!(let tc, scope);
+        let _ = handler.call(tc, recv, &[event_arg, context_arg, promise.into(), reason]);
+        tc.has_terminated()
+    };
+    if terminated {
+        scope.terminate_execution();
+    }
+}
+
+// Build a fresh v8::Context and install the host namespace (from STATE) into
+// it — the single definition of "a realm of this isolate", shared by boot,
+// reset and create_context so realms can't drift apart.
+fn new_realm(scope: &mut v8::PinScope<'_, '_, ()>, id: i32) -> v8::Global<v8::Context> {
+    let fresh = {
+        let context = v8::Context::new(scope, Default::default());
+        v8::Global::new(scope, context)
+    };
+    // Stamp the realm id into the context so id_of_context is O(1) (it would
+    // otherwise scan every realm on every promise rejection / contextOf call).
+    {
+        let context = v8::Local::new(scope, &fresh);
+        let id_val: v8::Local<v8::Value> = v8::Integer::new(scope, id).into();
+        context.set_embedder_data(REALM_ID_SLOT, id_val);
+    }
+    // DESIGN DECISION: every realm of an isolate shares ONE security token, so
+    // they are all mutually same-origin — the model is "a group of same-origin
+    // frames sharing one heap", and NS.contextGlobal gives full cross-realm
+    // access exactly as same-origin `iframe.contentWindow` does. (By default V8
+    // gives each context a distinct token, which would make every cross-realm
+    // access fail its check.)
+    //
+    // This is the right model for an embedder that treats all frames as one
+    // trust domain. It is NOT a security boundary between realms: same-isolate
+    // V8 contexts never are, and here it is deliberately wide open.
+    //
+    // To distinguish origins (real cross-origin iframes), this is the extension
+    // point: give each realm a token derived from its origin (e.g. a per-origin
+    // String) instead of the shared one, so cross-origin access fails the check.
+    // Note: V8's token only does same-origin(full) vs cross-origin(deny). HTML's
+    // cross-origin allowlist (location/postMessage/...) needs AccessCheckCallback,
+    // which rusty_v8 v150 does not expose — that would need new FFI.
+    {
+        let context = v8::Local::new(scope, &fresh);
+        let token = STATE.with(|s| s.borrow().security_token.clone());
+        let token: v8::Local<v8::Value> = match token {
+            Some(t) => v8::Local::new(scope, &t),
+            None => {
+                let t: v8::Local<v8::Value> = v8::String::new(scope, "rusty_racer")
+                    .map(|s| s.into())
+                    .unwrap_or_else(|| v8::undefined(scope).into());
+                STATE.with(|s| s.borrow_mut().security_token = Some(v8::Global::new(scope, t)));
+                t
+            }
+        };
+        context.set_security_token(token);
+    }
+    if let Some(name) = STATE.with(|s| s.borrow().host_namespace.clone()) {
+        install_host_namespace(scope, &fresh, &name);
+    }
+    fresh
+}
+
 // Inject globalThis.<name> = { drainMicrotasks } into a context. Re-run on
-// reset_realm so the fresh realm keeps the namespace.
-fn install_host_namespace(isolate: &mut v8::Isolate, ctx: &v8::Global<v8::Context>, name: &str) {
-    v8::scope!(let scope, isolate);
+// reset_realm so the fresh realm keeps the namespace. Takes a scope (not the
+// isolate) so service_request can call it from nested servicing too.
+fn install_host_namespace(
+    scope: &mut v8::PinScope<'_, '_, ()>,
+    ctx: &v8::Global<v8::Context>,
+    name: &str,
+) {
+    v8::scope!(let scope, &mut *scope);
     let context = v8::Local::new(scope, ctx);
     let scope = &mut v8::ContextScope::new(scope, context);
     let ns = v8::Object::new(scope);
-    if let (Some(f), Some(k)) = (
-        v8::Function::new(scope, drain_microtasks),
-        v8::String::new(scope, "drainMicrotasks"),
-    ) {
-        ns.set(scope, k.into(), f.into());
+    let members: [(&str, Option<v8::Local<v8::Function>>); 4] = [
+        ("drainMicrotasks", v8::Function::new(scope, drain_microtasks)),
+        ("contextGlobal", v8::Function::new(scope, context_global)),
+        ("contextOf", v8::Function::new(scope, context_of)),
+        (
+            "setPromiseRejectHandler",
+            v8::Function::new(scope, set_promise_reject_handler),
+        ),
+    ];
+    for (member, function) in members {
+        if let (Some(f), Some(k)) = (function, v8::String::new(scope, member)) {
+            ns.set(scope, k.into(), f.into());
+        }
     }
     if let Some(key) = v8::String::new(scope, name) {
         let global = context.global(scope);
@@ -1881,14 +2692,21 @@ fn attach_at_path(
 }
 
 // Build a startup blob by running |code| in a throwaway isolate and snapshotting
-// its default context. Runs entirely on the calling (Ruby) thread: the
+// a default context. Runs entirely on the calling (Ruby) thread: the
 // OwnedIsolate is a local, never stored in a Send wrapper, so the !Send dedicated
 // -thread rule doesn't apply. |base| warms an existing blob further.
+//
+// |warmup| selects V8's WarmUpSnapshotDataBlob contract: |code| runs in a
+// THROWAWAY context — the point is filling the isolate's compilation cache —
+// and a FRESH context becomes the blob's default, so no heap state from the
+// warmup run is baked in (only the compiled code survives, via
+// FunctionCodeHandling::Keep). Without |warmup|, the context |code| ran in IS
+// the default: Snapshot.new deliberately bakes its globals.
 //
 // NB: unlike Eval there is no watchdog here and the GVL is held throughout, so
 // |code| must be trusted setup — an infinite loop would freeze the whole Ruby
 // VM. Snapshot/warmup code is author-controlled, so that's an accepted tradeoff.
-fn build_snapshot(code: &str, base: Option<Vec<u8>>) -> Result<Vec<u8>, String> {
+fn build_snapshot(code: &str, base: Option<Vec<u8>>, warmup: bool) -> Result<Vec<u8>, String> {
     init_v8();
     let mut creator = match base {
         Some(bytes) => v8::Isolate::snapshot_creator_from_existing_snapshot(
@@ -1905,7 +2723,7 @@ fn build_snapshot(code: &str, base: Option<Vec<u8>>) -> Result<Vec<u8>, String> 
         {
             let cscope = &mut v8::ContextScope::new(scope, context);
             if !code.is_empty() {
-                if let Err(e) = run_source(cscope, code, "<snapshot>") {
+                if let Err(e) = run_source(cscope, code, if warmup { "<warmup>" } else { "<snapshot>" }) {
                     err = Some(match e {
                         VmError::Parse(m) | VmError::Runtime(m) => m,
                         VmError::JsError { message, .. } => message,
@@ -1914,9 +2732,15 @@ fn build_snapshot(code: &str, base: Option<Vec<u8>>) -> Result<Vec<u8>, String> 
                 }
             }
         }
-        // Mark this context as the one to deserialize on boot (after the
-        // ContextScope is dropped, like denoland/rusty_v8's snapshot path).
-        scope.set_default_context(context);
+        // Mark the context to deserialize on boot (after the ContextScope is
+        // dropped, like denoland/rusty_v8's snapshot path): the one |code|
+        // mutated for a plain snapshot, a fresh one for a warmup.
+        if warmup {
+            let fresh = v8::Context::new(scope, Default::default());
+            scope.set_default_context(fresh);
+        } else {
+            scope.set_default_context(context);
+        }
     }
     // create_blob MUST run before the creator is dropped (rusty_v8 panics
     // otherwise), even when the user code failed — so consume it first, then
@@ -1935,12 +2759,13 @@ impl Isolate {
         host_namespace: Option<String>,
         snapshot: Option<magnus::typed_data::Obj<Snapshot>>,
         timeout_ms: u64,
+        explicit_microtasks: bool,
     ) -> Result<Self, Error> {
         let snapshot_bytes = snapshot.map(|s| s.blob.borrow().clone());
         let (tx, rx) = channel::<Request>();
         let (handle_tx, handle_rx) = channel::<v8::IsolateHandle>();
         std::thread::spawn(move || {
-            v8_thread_main(rx, handle_tx, host_namespace, snapshot_bytes)
+            v8_thread_main(rx, handle_tx, host_namespace, snapshot_bytes, explicit_microtasks)
         });
         let handle = handle_rx
             .recv()
@@ -1970,6 +2795,38 @@ impl Core {
             .tx
             .send(request)
             .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread is gone"))
+    }
+
+    // Deliver a request to the V8 thread. Normally via the main queue; but
+    // when this Ruby thread is inside a host proc / module resolver for THIS
+    // isolate (a NESTED frame tagged with this Core), the V8 thread is parked
+    // in that callback's answer loop and is NOT reading the queue — route
+    // through the innermost such frame instead, whose loop services any op
+    // re-entrantly (service_request). Queueing there would deadlock: the V8
+    // thread waits for the proc's answer while the proc waits for the queued
+    // request. A frame belonging to a DIFFERENT isolate is skipped: that
+    // isolate's V8 thread is the suspended one, not ours, so our queue is
+    // being read normally.
+    //
+    // NB: the frame lookup is per-Ruby-thread. An op issued from a Ruby
+    // thread *spawned inside* a proc still goes to the main queue and blocks
+    // until the outer request completes — if the proc waits on that thread,
+    // they deadlock. Re-entry is same-thread only.
+    fn dispatch(&self, ruby: &Ruby, request: Request) -> Result<(), Error> {
+        let me = self as *const Core as usize;
+        let nested = NESTED.with(|n| {
+            n.borrow()
+                .iter()
+                .rev()
+                .find(|(core, _)| *core == me)
+                .map(|(_, answer)| answer.clone())
+        });
+        match nested {
+            Some(answer) => answer
+                .send(Answer::Nested(request))
+                .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread is gone")),
+            None => self.send(ruby, request),
+        }
     }
 
     // Wait for this request's reply, serving host-fn callbacks and the
@@ -2009,7 +2866,15 @@ impl Core {
                 }) => {
                     match &module_resolve {
                         Some(resolve) => {
-                            match resolve_module_via_ruby(self, *resolve, &specifier, &referrer_url) {
+                            // The resolve block may itself call back into the VM
+                            // (e.g. compile_module for a lazily-loaded dep), so
+                            // run it under a NESTED frame like a host proc's:
+                            // those ops then route nested instead of into the
+                            // (busy) main queue.
+                            let resolved = with_nested(self, &answer, || {
+                                resolve_module_via_ruby(self, *resolve, &specifier, &referrer_url)
+                            });
+                            match resolved {
                                 Ok(id) => {
                                     let _ = answer.send(Answer::ModuleId(id));
                                 }
@@ -2023,7 +2888,25 @@ impl Core {
                             }
                         }
                         None => {
-                            let _ = answer.send(Answer::ModuleId(None));
+                            // No instantiate block on this request: the V8
+                            // thread is auto-linking a DYNAMIC import, whose
+                            // static imports resolve through the
+                            // dynamic_import_resolver. A raising resolver only
+                            // fails the import() (the surrounding request is
+                            // still owed its Done reply), like the
+                            // DynamicImport arm below.
+                            let resolver = {
+                                let guard = self.dynamic_import_resolver.lock().unwrap();
+                                guard.as_ref().map(|r| r.get())
+                            };
+                            let id = match resolver {
+                                Some(proc) => with_nested(self, &answer, || {
+                                    resolve_module_via_ruby(self, proc, &specifier, &referrer_url)
+                                })
+                                .unwrap_or(None),
+                                None => None,
+                            };
+                            let _ = answer.send(Answer::ModuleId(id));
                         }
                     }
                 }
@@ -2036,11 +2919,17 @@ impl Core {
                     // setter); reuse the same Module-id resolution as instantiate.
                     let resolver = {
                         let guard = self.dynamic_import_resolver.lock().unwrap();
-                        guard.map(|o| ruby.get_inner(o))
+                        guard.as_ref().map(|r| r.get())
                     };
                     match resolver {
                         Some(proc) => {
-                            match resolve_module_via_ruby(self, proc, &specifier, &referrer_url) {
+                            // Like ResolveModule: ops issued by the resolver
+                            // (compile/instantiate/evaluate a lazy module)
+                            // route nested through this answer sender.
+                            let resolved = with_nested(self, &answer, || {
+                                resolve_module_via_ruby(self, proc, &specifier, &referrer_url)
+                            });
+                            match resolved {
                                 Ok(id) => {
                                     let _ = answer.send(Answer::ModuleId(id));
                                 }
@@ -2079,19 +2968,19 @@ impl Core {
     ) -> Result<JsVal, String> {
         let proc = {
             let procs = self.procs.lock().unwrap();
-            let opaque = procs.get(host_fn_id).ok_or("unknown host function")?;
-            ruby.get_inner(*opaque)
+            procs
+                .get(host_fn_id)
+                .and_then(|slot| slot.proc.as_ref())
+                .ok_or("unknown host function")?
+                .get()
         };
         let ruby_args: Vec<Value> = args
             .iter()
             .map(|v| jsval_to_ruby(ruby, v))
             .collect::<Result<_, Error>>()
             .map_err(|e| e.to_string())?;
-        NESTED.with(|n| n.borrow_mut().push(answer.clone()));
-        let result: Result<Value, Error> = proc.call(ruby_args.as_slice());
-        NESTED.with(|n| {
-            n.borrow_mut().pop();
-        });
+        let result: Result<Value, Error> =
+            with_nested(self, answer, || proc.call(ruby_args.as_slice()));
         let value = result.map_err(|e| e.to_string())?;
         ruby_to_jsval(value).map_err(|e| e.to_string())
     }
@@ -2112,27 +3001,8 @@ impl Core {
             .map(|v| ruby_to_jsval(*v))
             .collect::<Result<_, _>>()?;
 
-        // Inside a proc serving a callback? Route through the suspended frame so
-        // we don't deadlock on the busy main queue (mirrors eval_t). Like nested
-        // eval, the nested call runs in the suspended frame's realm — a nested
-        // realm.call targeting a *different* realm than that frame is not
-        // supported (the common same-realm re-entry is correct).
-        let nested = NESTED.with(|n| n.borrow().last().cloned());
-        if let Some(answer) = nested {
-            let (reply_tx, reply_rx) = channel::<VmReply>();
-            answer
-                .send(Answer::NestedCall {
-                    name,
-                    args: jsargs,
-                    void,
-                    reply: reply_tx,
-                })
-                .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread is gone"))?;
-            return self.pump(ruby, reply_rx, None);
-        }
-
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.send(
+        self.dispatch(
             ruby,
             Request::Call {
                 context_id,
@@ -2148,7 +3018,7 @@ impl Core {
 
     fn drain_microtasks(&self, ruby: &Ruby) -> Result<Value, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.send(
+        self.dispatch(
             ruby,
             Request::DrainMicrotasks {
                 timeout_ms: self.default_timeout_ms,
@@ -2166,24 +3036,8 @@ impl Core {
         filename: String,
         timeout_ms: u64,
     ) -> Result<Value, Error> {
-        // Inside a proc serving a callback? Route as a nested eval through the
-        // suspended V8 frame instead of the main queue (which is busy). The
-        // nested eval runs in whatever realm that frame is already in.
-        let nested = NESTED.with(|n| n.borrow().last().cloned());
-        if let Some(answer) = nested {
-            let (reply_tx, reply_rx) = channel::<VmReply>();
-            answer
-                .send(Answer::NestedEval {
-                    source,
-                    filename,
-                    reply: reply_tx,
-                })
-                .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread is gone"))?;
-            return self.pump(ruby, reply_rx, None);
-        }
-
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.send(
+        self.dispatch(
             ruby,
             Request::Eval {
                 context_id,
@@ -2199,40 +3053,64 @@ impl Core {
     fn attach(&self, ruby: &Ruby, context_id: i32, name: String, proc: Proc) -> Result<Value, Error> {
         let host_fn_id = {
             let mut procs = self.procs.lock().unwrap();
-            procs.push(Opaque::from(proc));
+            procs.push(ProcSlot {
+                context_id,
+                proc: Some(RootedProc(BoxValue::new(proc))),
+            });
             procs.len() - 1
         };
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.send(
+        self.dispatch(
             ruby,
             Request::Attach {
                 context_id,
                 name,
                 host_fn_id,
+                timeout_ms: self.default_timeout_ms,
                 reply: reply_tx,
             },
         )?;
         self.pump(ruby, reply_rx, None)
     }
 
+    // Release the GC roots of the procs attached into |context_id| — its
+    // realm is gone (reset or disposed), so the V8-side functions that
+    // referenced them are unreachable. Runs on a Ruby thread (a RootedProc
+    // drop unregisters its GC address). The slots stay: host_fn_ids of other
+    // realms are indices into the same Vec.
+    fn release_context_procs(&self, context_id: i32) {
+        let mut procs = self.procs.lock().unwrap();
+        for slot in procs.iter_mut() {
+            if slot.context_id == context_id {
+                slot.proc = None;
+            }
+        }
+    }
+
     fn reset(&self, ruby: &Ruby, context_id: i32) -> Result<Value, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.send(ruby, Request::Reset { context_id, reply: reply_tx })?;
-        self.pump(ruby, reply_rx, None)
+        self.dispatch(ruby, Request::Reset { context_id, reply: reply_tx })?;
+        let out = self.pump(ruby, reply_rx, None)?;
+        // Only on success — a refused reset (unknown/suspended realm) keeps
+        // its attached fns callable.
+        self.release_context_procs(context_id);
+        Ok(out)
     }
 
     // Build a new context; returns its id (the V8 thread replies with an Int).
     fn create_context(&self, ruby: &Ruby) -> Result<i32, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.send(ruby, Request::CreateContext { reply: reply_tx })?;
+        self.dispatch(ruby, Request::CreateContext { reply: reply_tx })?;
         let id = self.pump(ruby, reply_rx, None)?;
         i32::try_convert(id)
     }
 
     fn dispose_context(&self, ruby: &Ruby, context_id: i32) -> Result<(), Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.send(ruby, Request::DisposeContext { context_id, reply: reply_tx })?;
-        self.pump(ruby, reply_rx, None).map(|_| ())
+        self.dispatch(ruby, Request::DisposeContext { context_id, reply: reply_tx })?;
+        self.pump(ruby, reply_rx, None)?;
+        self.release_context_procs(context_id);
+        Ok(())
     }
 
     // Thin ESM primitives. compile_module returns the new module's id.
@@ -2246,7 +3124,7 @@ impl Core {
         produce_cache: bool,
     ) -> Result<Compiled, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.send(
+        self.dispatch(
             ruby,
             Request::CompileModule {
                 context_id,
@@ -2270,31 +3148,44 @@ impl Core {
     }
 
     // instantiate carries the resolve block to pump so resolve_imported can ask
-    // it per import edge. The block must return an *already-compiled* Module (or
-    // nil): the V8 thread is parked inside InstantiateModule awaiting the answer,
-    // so compiling/instantiating lazily from within the block would deadlock the
-    // main request queue. csim pre-compiles and the block just looks up.
+    // it per import edge. The block may compile a dependency lazily — while the
+    // V8 thread is parked inside InstantiateModule, its wait loop services
+    // nested ops (service_request) — and returns the dep Module (or nil for
+    // unresolved).
     fn instantiate_module(&self, ruby: &Ruby, module_id: i32, resolve: Proc) -> Result<Value, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.send(ruby, Request::InstantiateModule { module_id, reply: reply_tx })?;
+        self.dispatch(ruby, Request::InstantiateModule { module_id, reply: reply_tx })?;
         self.pump(ruby, reply_rx, Some(resolve))
     }
 
     fn evaluate_module(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.send(ruby, Request::EvaluateModule { module_id, reply: reply_tx })?;
+        self.dispatch(
+            ruby,
+            Request::EvaluateModule {
+                module_id,
+                timeout_ms: self.default_timeout_ms,
+                reply: reply_tx,
+            },
+        )?;
         self.pump(ruby, reply_rx, None)
     }
 
     fn module_namespace(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.send(ruby, Request::ModuleNamespace { module_id, reply: reply_tx })?;
+        self.dispatch(ruby, Request::ModuleNamespace { module_id, reply: reply_tx })?;
+        self.pump(ruby, reply_rx, None)
+    }
+
+    fn module_status(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
+        let (reply_tx, reply_rx) = channel::<VmReply>();
+        self.dispatch(ruby, Request::ModuleStatus { module_id, reply: reply_tx })?;
         self.pump(ruby, reply_rx, None)
     }
 
     fn dispose_module(&self, ruby: &Ruby, module_id: i32) -> Result<(), Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.send(ruby, Request::DisposeModule { module_id, reply: reply_tx })?;
+        self.dispatch(ruby, Request::DisposeModule { module_id, reply: reply_tx })?;
         self.pump(ruby, reply_rx, None).map(|_| ())
     }
 
@@ -2309,7 +3200,7 @@ impl Core {
         produce_cache: bool,
     ) -> Result<Compiled, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.send(
+        self.dispatch(
             ruby,
             Request::CompileScript {
                 context_id,
@@ -2332,7 +3223,7 @@ impl Core {
 
     fn run_script(&self, ruby: &Ruby, script_id: i32) -> Result<Value, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.send(
+        self.dispatch(
             ruby,
             Request::RunScript {
                 script_id,
@@ -2345,12 +3236,14 @@ impl Core {
 
     fn dispose_script(&self, ruby: &Ruby, script_id: i32) -> Result<(), Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.send(ruby, Request::DisposeScript { script_id, reply: reply_tx })?;
+        self.dispatch(ruby, Request::DisposeScript { script_id, reply: reply_tx })?;
         self.pump(ruby, reply_rx, None).map(|_| ())
     }
 
     fn set_dynamic_import_resolver(&self, proc: Proc) {
-        *self.dynamic_import_resolver.lock().unwrap() = Some(Opaque::from(proc));
+        // The old RootedProc (if any) drops here, unregistering its address —
+        // we are on a Ruby thread, so that's GVL-safe.
+        *self.dynamic_import_resolver.lock().unwrap() = Some(RootedProc(BoxValue::new(proc)));
     }
 
     // Terminate whatever is running. IsolateHandle is Send + refcounted —
@@ -2374,6 +3267,13 @@ impl Core {
         // reply (it owns its own channel). Send can only fail if the V8
         // thread already exited, which is fine.
         let _ = shared.tx.send(Request::Dispose);
+        drop(shared);
+        // Release every GC root now (we are on a Ruby thread): a disposed
+        // isolate must not keep the attached procs — and whatever their
+        // closures capture — alive and pinned until the last wrapper object
+        // is itself collected.
+        self.procs.lock().unwrap().clear();
+        *self.dynamic_import_resolver.lock().unwrap() = None;
         let _ = ruby;
         Ok(())
     }
@@ -2533,7 +3433,7 @@ impl Snapshot {
             Some(v) if !v.is_nil() => String::try_convert(*v)?,
             _ => String::new(),
         };
-        let blob = build_snapshot(&code, None)
+        let blob = build_snapshot(&code, None, false)
             .map_err(|m| Error::new(err_class(&ruby, "SnapshotError"), m))?;
         Ok(Snapshot {
             blob: RefCell::new(blob),
@@ -2550,11 +3450,13 @@ impl Snapshot {
         }
     }
 
-    // warmup!(code) — re-snapshot the existing blob with extra code so its
-    // functions are pre-compiled. Spike: returns nil (csim returns self).
+    // warmup!(code) — re-snapshot the existing blob with |code| run in a
+    // throwaway context, so its functions get pre-compiled into the blob's
+    // code cache WITHOUT baking the run's heap state (V8's
+    // WarmUpSnapshotDataBlob contract). Spike: returns nil (csim returns self).
     fn warmup(ruby: &Ruby, rb_self: &Self, code: String) -> Result<(), Error> {
         let base = rb_self.blob.borrow().clone();
-        let blob = build_snapshot(&code, Some(base))
+        let blob = build_snapshot(&code, Some(base), true)
             .map_err(|m| Error::new(err_class(ruby, "SnapshotError"), m))?;
         *rb_self.blob.borrow_mut() = blob;
         Ok(())
@@ -2589,6 +3491,12 @@ impl JsModule {
     fn namespace(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
         rb_self.core.module_namespace(ruby, rb_self.module_id)
+    }
+    // The V8 module status name ("uninstantiated", ...); the lib wrapper
+    // exposes it as Module#status, a Symbol.
+    fn status(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        rb_self.core.module_status(ruby, rb_self.module_id)
     }
     // The bytecode cache produced at compile (produce_cache: true), as a binary
     // String, or nil. Persist it cross-process and pass back via cached_data:.
@@ -2753,6 +3661,16 @@ fn jsval_to_ruby_d(
         JsVal::Int(i) => (*i).into_value_with(ruby),
         JsVal::Num(n) => (*n).into_value_with(ruby),
         JsVal::Str(s) => s.clone().into_value_with(ruby),
+        // Bytes -> a binary (ASCII-8BIT) String: str_from_slice uses rb_str_new,
+        // which tags the result ASCII-8BIT — so it round-trips back to bytes.
+        // Registered under |id| so an aliased blob stays one String via Ref.
+        JsVal::Bytes { id, bytes } => {
+            let s = ruby.str_from_slice(bytes).as_value();
+            if let Some(id) = id {
+                built.insert(*id, s);
+            }
+            s
+        }
         // Reconstruct the Ruby Integer from the hex magnitude (arbitrary
         // precision); negate via Ruby so bignums stay exact.
         JsVal::BigInt { negative, words } => {
@@ -2827,6 +3745,73 @@ fn jsval_to_ruby_d(
     })
 }
 
+// A Ruby String marshalled by its encoding TAG (the tag is the type):
+//   - ASCII-8BIT (binary) -> JsVal::Bytes (a JS Uint8Array);
+//   - any text encoding   -> JsVal::Str (UTF-8). Already-UTF-8 text is taken
+//     as-is; other text encodings transcode (Ruby raises on unmappable bytes).
+//     Either way the bytes must be VALID UTF-8 — invalid bytes RAISE, never
+//     silently degrade to U+FFFD (loud failure beats silent corruption). A
+//     text String mis-tagged binary surfaces loudly too (it becomes a Uint8Array).
+fn string_to_jsval(ruby: &Ruby, s: RString) -> Result<JsVal, Error> {
+    use magnus::encoding::EncodingCapable;
+    if s.enc_get() == ruby.ascii8bit_encindex() {
+        // Binary: the bytes ARE the value (O(n) copy, no inflation). id: None —
+        // the identity-tracked path is the direct-String branch in
+        // ruby_to_jsval_d; a to_str result reaching here is transient.
+        return Ok(JsVal::Bytes {
+            id: None,
+            bytes: unsafe { s.as_slice() }.to_vec(),
+        });
+    }
+    // Text. encode('UTF-8') on an already-UTF-8 source is a no-op that does NOT
+    // validate, so skip it (one fewer copy) and let the from_utf8 check below
+    // catch invalid bytes; other encodings transcode (raising on unmappable).
+    let utf8: RString = if s.enc_get() == ruby.utf8_encindex() {
+        s
+    } else {
+        s.funcall("encode", ("UTF-8",))?
+    };
+    // Build the Rust String with a real UTF-8 check (not lossy): invalid bytes
+    // in a text-tagged String are an error, not silent U+FFFD substitution.
+    match String::from_utf8(unsafe { utf8.as_slice() }.to_vec()) {
+        Ok(s) => Ok(JsVal::Str(s)),
+        Err(_) => Err(Error::new(
+            ruby
+                .class_object()
+                .const_get::<_, ExceptionClass>("EncodingError")
+                .unwrap_or_else(|_| ruby.exception_runtime_error()),
+            "text-tagged String contains invalid UTF-8 bytes",
+        )),
+    }
+}
+
+// A JS object key must be a string. A Ruby String key crosses by its bytes as
+// UTF-8 — but unlike a binary VALUE (which becomes a Uint8Array), a key has
+// nowhere to put raw bytes, so invalid UTF-8 RAISES rather than silently
+// degrading to U+FFFD. None for a non-String (the caller then tries to_s).
+fn string_key(ruby: &Ruby, val: Value) -> Option<Result<String, Error>> {
+    let s = RString::from_value(val)?;
+    let bytes = unsafe { s.as_slice() }.to_vec();
+    Some(String::from_utf8(bytes).map_err(|_| {
+        Error::new(
+            ruby.class_object()
+                .const_get::<_, ExceptionClass>("EncodingError")
+                .unwrap_or_else(|_| ruby.exception_runtime_error()),
+            "hash key is not valid UTF-8",
+        )
+    }))
+}
+
+// A Ruby String's bytes interpreted as UTF-8 (invalid sequences become U+FFFD),
+// regardless of the encoding tag. Used for the depth-truncation to_s fallback,
+// where the value is already being lossily summarised.
+fn lossy_string(val: Value) -> Option<String> {
+    let s = RString::from_value(val)?;
+    // Copy the bytes out before any further Ruby call can move/free them.
+    let bytes = unsafe { s.as_slice() }.to_vec();
+    Some(String::from_utf8_lossy(&bytes).into_owned())
+}
+
 // Tracks Ruby containers already emitted this marshal (by object_id, which is
 // exact — no collision handling needed) so shared/cyclic structures become Refs.
 #[derive(Default)]
@@ -2888,8 +3873,49 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
     if let Ok(n) = f64::try_convert(val) {
         return Ok(JsVal::Num(n));
     }
-    if let Ok(s) = String::try_convert(val) {
-        return Ok(JsVal::Str(s));
+    // Bare Symbol -> JS string (one-way: it comes back as a Ruby String). A
+    // binary-encoded symbol surfaces the same curated EncodingError as a text
+    // String with invalid UTF-8, not magnus's raw "expected utf-8" message.
+    if let Some(sym) = magnus::Symbol::from_value(val) {
+        let name = sym.name().map_err(|_| {
+            Error::new(
+                ruby.class_object()
+                    .const_get::<_, ExceptionClass>("EncodingError")
+                    .unwrap_or_else(|_| ruby.exception_runtime_error()),
+                "symbol name is not valid UTF-8",
+            )
+        })?;
+        return Ok(JsVal::Str(name.into_owned()));
+    }
+    // Real Strings: the encoding tag is the type declaration. A binary
+    // (ASCII-8BIT) String -> bytes (JS Uint8Array), identity-tracked so an
+    // aliased blob stays one Uint8Array; any text encoding -> a JS string.
+    if let Some(rstr) = RString::from_value(val) {
+        use magnus::encoding::EncodingCapable;
+        if rstr.enc_get() == ruby.ascii8bit_encindex() {
+            // depth 0 — a binary blob is a leaf, so it stays faithful bytes even
+            // when deeply nested (never the depth-truncation-to-lossy-string);
+            // only the identity (Ref) check applies. Frozen/interned binary
+            // Strings share an object_id, so two `-"x".b` literals deliberately
+            // collapse to ONE Uint8Array (they ARE the same Ruby object).
+            let id = match rb_container_id(seen, val, 0)? {
+                RbId::New(id) => id,
+                RbId::Reuse(jv) => return Ok(jv),
+            };
+            return Ok(JsVal::Bytes {
+                id: Some(id),
+                bytes: unsafe { rstr.as_slice() }.to_vec(),
+            });
+        }
+        return string_to_jsval(&ruby, rstr);
+    }
+    // A String-like (to_str) gets the same tag-driven treatment, but its result
+    // is transient so it is not identity-tracked.
+    if val.respond_to("to_str", false).unwrap_or(false) {
+        let s: Value = val.funcall("to_str", ())?;
+        if let Some(rstr) = RString::from_value(s) {
+            return string_to_jsval(&ruby, rstr);
+        }
     }
     // Ruby Set -> JS Set. Before the Array/Hash checks (a Set is neither).
     if let Ok(set_class) = ruby.class_object().const_get::<_, magnus::RClass>("Set") {
@@ -2926,8 +3952,27 @@ fn ruby_to_jsval_d(val: Value, seen: &mut RbSeen, depth: u32) -> Result<JsVal, E
         };
         let entries = RefCell::new(Vec::new());
         hash.foreach(|k: Value, v: Value| {
-            // String/Symbol keys -> String; anything else via to_s.
-            let key = String::try_convert(k).or_else(|_| k.funcall::<_, _, String>("to_s", ()))?;
+            // String/Symbol keys -> a UTF-8 String; anything else via to_s. A JS
+            // object key has nowhere to put raw bytes, so unlike a binary VALUE
+            // (-> Uint8Array) a binary KEY with invalid UTF-8 RAISES (string_key),
+            // and a to_s returning a non-String is a loud error, not a silent "".
+            let key = match string_key(&ruby, k) {
+                Some(r) => r?,
+                None => {
+                    // A non-String key (Symbol, Integer, ...) -> to_s, then the
+                    // same UTF-8 rule.
+                    let s: Value = k.funcall("to_s", ())?;
+                    match string_key(&ruby, s) {
+                        Some(r) => r?,
+                        None => {
+                            return Err(Error::new(
+                                ruby.exception_type_error(),
+                                "hash key's to_s did not return a String",
+                            ))
+                        }
+                    }
+                }
+            };
             entries
                 .borrow_mut()
                 .push((key, ruby_to_jsval_d(v, seen, depth + 1)?));
@@ -2958,7 +4003,12 @@ fn rb_container_id(seen: &mut RbSeen, val: Value, depth: u32) -> Result<RbId, Er
         return Ok(RbId::Reuse(JsVal::Ref(*id)));
     }
     if depth >= MAX_MARSHAL_DEPTH {
-        return Ok(RbId::Reuse(JsVal::Str(val.funcall::<_, _, String>("to_s", ())?)));
+        let ruby = Ruby::get().unwrap();
+        let s: Value = val.funcall("to_s", ())?;
+        let s = lossy_string(s).ok_or_else(|| {
+            Error::new(ruby.exception_type_error(), "to_s did not return a String")
+        })?;
+        return Ok(RbId::Reuse(JsVal::Str(s)));
     }
     let id = seen.next_id;
     seen.next_id += 1;
@@ -2973,7 +4023,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     // The isolate (VM) + its isolate-level ops; hands out Contexts.
     let isolate = module.define_class("Isolate", ruby.class_object())?;
     // keyword-arg wrapper Isolate.new(snapshot:, ...) lives in lib/rusty_racer.rb
-    isolate.define_singleton_method("_new", function!(Isolate::new, 3))?;
+    isolate.define_singleton_method("_new", function!(Isolate::new, 4))?;
     isolate.define_method("context", method!(Isolate::context, 0))?;
     isolate.define_method("create_context", method!(Isolate::create_context, 0))?;
     isolate.define_method("terminate", method!(Isolate::terminate, 0))?;
@@ -3025,6 +4075,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     jsmodule.define_method("_instantiate", method!(JsModule::instantiate, 1))?;
     jsmodule.define_method("evaluate", method!(JsModule::evaluate, 0))?;
     jsmodule.define_method("namespace", method!(JsModule::namespace, 0))?;
+    jsmodule.define_method("_status", method!(JsModule::status, 0))?;
     jsmodule.define_method("cached_data", method!(JsModule::cached_data, 0))?;
     jsmodule.define_method("cache_rejected?", method!(JsModule::cache_rejected, 0))?;
     jsmodule.define_method("dispose", method!(JsModule::dispose, 0))?;

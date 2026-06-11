@@ -18,6 +18,9 @@ on:
 jobs:
   build:
     runs-on: "ubuntu-22.04"
+    # Needs write access to publish the archive as a Release asset.
+    permissions:
+      contents: write
     timeout-minutes: 180
     steps:
       - name: "Free disk space (V8 build is large)"
@@ -57,16 +60,31 @@ jobs:
           # runs; clang-sys resolves LIBCLANG_PATH lazily.
           LIBCLANG_PATH: "${{ github.workspace }}/rusty_v8/target/release/clang/lib"
         run: cargo build --release -vv
-      - name: "Stage the static archive"
+      - name: "Stage and compress the static archive"
         run: |
           set -x
           archive="$(find rusty_v8/target/release -name 'librusty_v8*.a' -size +10M | head -1)"
           test -n "$archive" || { echo "no librusty_v8.a found"; find rusty_v8/target -name '*.a' | head; exit 1; }
           mkdir -p out
-          cp "$archive" "out/librusty_v8_release_x86_64-unknown-linux-gnu.a"
+          # gzip so the asset (and every cibuildgem download) is ~tens of MB, not
+          # ~190MB. The gem's build.rs (copy_archive) auto-detects the gzip magic
+          # and inflates it, so a plain .a would also work — gzip just saves bandwidth.
+          gzip -c "$archive" > "out/librusty_v8_release_x86_64-unknown-linux-gnu.a.gz"
           ls -lh out/
-      - uses: "actions/upload-artifact@v4"
-        with:
-          name: "librusty_v8-linux-x64"
-          path: "out/*.a"
-          retention-days: 7
+      - name: "Publish as a Release asset (consumed by cibuildgem via RUSTY_V8_ARCHIVE)"
+        env:
+          GH_TOKEN: "${{ github.token }}"
+        run: |
+          set -x
+          tag="libv8-${{ inputs.rusty_v8_tag }}"
+          # Prerelease, so it never shows up as the repo's "Latest release" —
+          # those are the gem's own vX.Y.Z tags. Tolerate the release already
+          # existing (a racing re-run) but surface any OTHER create error
+          # instead of swallowing it; --clobber then replaces the asset.
+          if ! err=$(gh release create "$tag" --prerelease \
+            --title "librusty_v8 ${{ inputs.rusty_v8_tag }} (library-TLS)" \
+            --notes "library-TLS \`librusty_v8.a\` built from the denoland/rusty_v8 ${{ inputs.rusty_v8_tag }} git checkout (which has the full third_party the crates.io tarball lacks). Consumed by cibuildgem.yaml via RUSTY_V8_ARCHIVE, so the gem CI links a prebuilt V8 instead of a 30-45 min source build." 2>&1); then
+            echo "$err"
+            echo "$err" | grep -qi 'already exists' || exit 1
+          fi
+          gh release upload "$tag" out/librusty_v8_release_x86_64-unknown-linux-gnu.a.gz --clobber

@@ -56,8 +56,13 @@ iso2.context.compile_module(src, cached_data: blob)   # skips reparse
 ```
 
 Also: `Snapshot` (startup blobs), `Isolate#create_context` (an extra realm —
-isolated globals sharing the heap), `Isolate#perform_microtask_checkpoint`
-(manual event-loop control — microtasks never auto-drain), `Isolate#terminate`,
+its own globals sharing the isolate's heap; all realms are mutually
+same-origin, so with a host namespace `NS.contextGlobal(id)` reaches another
+realm's `globalThis` like a same-origin `iframe.contentWindow`, and is not an
+isolation boundary), `Isolate#perform_microtask_checkpoint` (manual drain; the
+default `microtasks: :auto` also drains at the end of each outermost
+eval/call/evaluate, while `microtasks: :explicit` leaves draining fully manual
+— there is no event loop or timers either way), `Isolate#terminate`,
 `Isolate#dynamic_import_resolver=`, `Context#reset`, `Platform.set_flags!`.
 
 ## Building

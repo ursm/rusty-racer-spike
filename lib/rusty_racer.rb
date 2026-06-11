@@ -22,12 +22,23 @@ module RustyRacer
   class Isolate
     # Keyword-arg constructor over the positional Rust primitive. A snapshot
     # (RustyRacer::Snapshot) boots the isolate with its baked-in state;
-    # timeout_ms caps each eval/call (0 = no limit) against in-V8 infinite loops.
-    def self.new(host_namespace: nil, snapshot: nil, timeout_ms: 0)
-      _new(host_namespace, snapshot, timeout_ms)
+    # timeout_ms caps each eval/call (0 = no limit) against in-V8 infinite
+    # loops. microtasks mirrors V8's kAuto/kExplicit: :auto (default) drains
+    # the microtask queue when the outermost eval/call/run/evaluate completes
+    # (the standard embedder contract); :explicit drains only on
+    # #perform_microtask_checkpoint.
+    def self.new(host_namespace: nil, snapshot: nil, timeout_ms: 0, microtasks: :auto)
+      unless %i[auto explicit].include?(microtasks)
+        raise ArgumentError, "microtasks must be :auto or :explicit, got #{microtasks.inspect}"
+      end
+
+      _new(host_namespace, snapshot, timeout_ms, microtasks == :explicit)
     end
 
-    # ->(specifier, referrer_url) { already-loaded Module } for JS import().
+    # ->(specifier, referrer_url) { Module } for JS import(). The block may
+    # return a merely compiled Module: linking and evaluation are the
+    # binding's job (V8's host contract), and static imports met while
+    # linking resolve through this same block.
     # Held in an ivar so the proc stays alive for the isolate's lifetime (the
     # native side only keeps a weak handle).
     def dynamic_import_resolver=(resolver)
@@ -67,6 +78,12 @@ module RustyRacer
 
       _instantiate(block)
       self
+    end
+
+    # The V8 module status: :uninstantiated, :instantiating, :instantiated,
+    # :evaluating, :evaluated or :errored.
+    def status
+      _status.to_sym
     end
   end
 end
