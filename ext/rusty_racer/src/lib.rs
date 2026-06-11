@@ -1904,8 +1904,11 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 reply,
             } => {
                 // Same as Attach (arbitrary JS via accessors/Proxy traps), but
-                // installs every entry under one bracket/drain. Stops at the
-                // first failure, reporting that error.
+                // installs every entry under one bracket/drain. Applied in order;
+                // stops at the first failure and reports its (name-tagged) error.
+                // NOT transactional: entries before the failure stay attached —
+                // the realm is not rolled back (matches single Attach, which also
+                // commits its one write or fails it).
                 let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
                     match context_for(context_id) {
                         Some(ctx) => {
@@ -1919,7 +1922,9 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                                     .build(scope)
                                 {
                                     Some(function) => attach_at_path(scope, context, name, function),
-                                    None => Err(VmError::Runtime("failed to build function".into())),
+                                    None => Err(VmError::Runtime(format!(
+                                        "failed to build function for `{name}`"
+                                    ))),
                                 };
                                 if out.is_err() {
                                     break;
@@ -3307,9 +3312,15 @@ impl Core {
 
     // attach_many: install several host fns in ONE round-trip to the V8 thread
     // (a fresh realm needs ~dozens; one rendezvous instead of one per fn). Slots
-    // are allocated up front so each carries a stable host_fn_id; a build/attach
-    // failure for any name aborts the batch with that error.
+    // are allocated up front so each carries a stable host_fn_id; entries are
+    // applied IN ORDER and a build/attach failure aborts the batch with that
+    // (name-tagged) error WITHOUT rolling back earlier entries (see the
+    // AttachMany arm). On that error path the unused slots are reclaimed at the
+    // next reset/dispose of the realm, like single attach.
     fn attach_many(&self, ruby: &Ruby, context_id: i32, entries: Vec<(String, Proc)>) -> Result<Value, Error> {
+        if entries.is_empty() {
+            return Ok(ruby.qnil().as_value()); // nothing to install, skip the round-trip
+        }
         let named_ids: Vec<(String, usize)> = {
             let mut procs = self.procs.lock().unwrap();
             entries
@@ -3623,7 +3634,9 @@ impl Context {
         rb_self.core.attach(ruby, rb_self.id, name, proc)
     }
     // attach_many({ "name" => proc, ... }): install every host fn in one
-    // round-trip to the V8 thread (vs one per attach).
+    // round-trip to the V8 thread (vs one per attach). Applied in the hash's
+    // insertion order; if one name fails, the names before it stay attached (not
+    // transactional). Keys must be Strings and values Procs.
     fn attach_many(ruby: &Ruby, rb_self: &Self, table: RHash) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
         let mut entries: Vec<(String, Proc)> = Vec::new();

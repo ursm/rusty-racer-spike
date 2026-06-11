@@ -299,16 +299,18 @@ class RustyRacerTest < Minitest::Test
     assert_equal 42, @ctx.eval('Ns.const()') # dotted path creates the namespace
   end
 
-  def test_attach_slots_are_reused_after_realm_dispose
-    # disposing a realm frees its proc slots; a later attach must reuse a freed
-    # slot id and map it to the NEW proc (no stale binding from the dead realm).
-    realm1 = @iso.create_context
-    realm1.attach('f', proc { 'one' })
-    assert_equal 'one', realm1.eval('f()')
-    realm1.dispose
-    realm2 = @iso.create_context
-    realm2.attach('f', proc { 'two' })
-    assert_equal 'two', realm2.eval('f()')
+  def test_reattach_after_realm_dispose_binds_the_new_proc
+    # dispose returns a realm's proc slots to the free list, so a later attach
+    # recycles a slot id. Guard that a recycled id always binds the NEW proc,
+    # never a stale binding from the dead realm. (Reuse itself is an internal
+    # optimisation, not directly observable; this pins its user-visible contract
+    # across several recycle cycles.)
+    3.times do |i|
+      realm = @iso.create_context
+      realm.attach('f', proc { "gen#{i}" })
+      assert_equal "gen#{i}", realm.eval('f()')
+      realm.dispose
+    end
   end
 
   def test_context_default_timeout
