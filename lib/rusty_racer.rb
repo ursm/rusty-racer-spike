@@ -5,8 +5,17 @@ require "set" # JS Set <-> Ruby Set marshalling needs the stdlib Set constant
 require_relative "rusty_racer/version"
 
 # Load the compiled extension (defines RustyRacer::Isolate etc.). rb-sys names
-# the init after the crate; the .so lands at rusty_racer/rusty_racer.<dlext>.
-require "rusty_racer/rusty_racer"
+# the init after the crate. A precompiled ("fat") gem ships one binary per Ruby
+# minor version under rusty_racer/<major.minor>/ (the .so is ABI-specific — a
+# 3.3 build malfunctions on 4.0), so prefer the version-specific path; the
+# source gem and a local `rake compile` produce a single rusty_racer/rusty_racer
+# instead, which the fallback loads.
+begin
+  RUBY_VERSION =~ /(\d+\.\d+)/
+  require_relative "rusty_racer/#{Regexp.last_match(1)}/rusty_racer"
+rescue LoadError
+  require "rusty_racer/rusty_racer"
+end
 
 module RustyRacer
   # JS exceptions map to these (see err_class on the Rust side).
