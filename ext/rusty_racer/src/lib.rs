@@ -3713,14 +3713,29 @@ impl Snapshot {
         })
     }
 
-    // Snapshot.load(blob) — rewrap raw bytes (no validation until boot).
-    fn load(blob: magnus::RString) -> Snapshot {
+    // Snapshot.load(blob) — rewrap raw bytes. Runs V8's own StartupData::is_valid
+    // up front so the COMMON bad blob — garbage, empty, or (most realistically)
+    // one built for a different V8 version after a gem/V8 upgrade — raises a
+    // rescuable SnapshotError here instead of tripping a FATAL CHECK that aborts
+    // the whole process at the first Isolate.new(snapshot:). NB: is_valid checks
+    // the version/structure, not a full checksum (V8 exposes no checksum verify),
+    // so a blob truncated AFTER an intact header can still slip through — pair
+    // this with a content hash (e.g. a SHA sidecar) if full integrity matters.
+    fn load(ruby: &Ruby, blob: magnus::RString) -> Result<Snapshot, Error> {
         // Safe: the slice is copied into an owned Vec before any Ruby code
         // (which could move/free the string) can run.
         let bytes = unsafe { blob.as_slice() }.to_vec();
-        Snapshot {
-            blob: RefCell::new(bytes),
+        init_v8(); // is_valid() needs V8 initialized; idempotent.
+        let data = v8::StartupData::from(bytes);
+        if data.is_empty() || !data.is_valid() {
+            return Err(Error::new(
+                err_class(ruby, "SnapshotError"),
+                "invalid V8 snapshot blob (corrupt, truncated, or built for a different V8 version)",
+            ));
         }
+        Ok(Snapshot {
+            blob: RefCell::new(data.to_vec()),
+        })
     }
 
     // warmup!(code) — re-snapshot the existing blob with |code| run in a

@@ -543,6 +543,16 @@ class RustyRacerTest < Minitest::Test
     assert_equal 7, ctx.eval("V")
   end
 
+  def test_snapshot_load_rejects_an_invalid_blob
+    # a garbage/empty blob would FATAL-CHECK-abort the process at Isolate.new;
+    # load runs V8's is_valid so it raises a rescuable SnapshotError instead.
+    assert_raises(RustyRacer::SnapshotError) { RustyRacer::Snapshot.load('') }
+    assert_raises(RustyRacer::SnapshotError) { RustyRacer::Snapshot.load("not a v8 snapshot \x00\xff" * 64) }
+    # a genuine blob still loads and boots
+    blob = RustyRacer::Snapshot.new('globalThis.OK = 1').dump
+    assert_equal 1, RustyRacer::Isolate.new(snapshot: RustyRacer::Snapshot.load(blob)).context.eval('OK')
+  end
+
   def test_snapshot_warmup_keeps_code_cache_but_not_heap_state
     # V8's WarmUpSnapshotDataBlob contract: the warmup code runs in a
     # THROWAWAY context (pre-compiling functions into the blob's code cache);
