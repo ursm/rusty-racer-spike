@@ -31,41 +31,69 @@ jobs:
       - name: "Install build prerequisites"
         run: |
           sudo apt-get update
-          sudo apt-get install -y python3 curl pkg-config libglib2.0-dev lld
-          # bindgen parses V8's bundled libc++ headers with the SYSTEM libclang
-          # (the V8 *compiler* clang is auto-downloaded separately). V8 15.0's
-          # libc++ requires "Clang 21 and later" — libclang 19 fails bindgen
-          # with "reference to unresolved using declaration". Use LLVM 21.
-          wget -qO /tmp/llvm.sh https://apt.llvm.org/llvm.sh
-          chmod +x /tmp/llvm.sh
-          sudo /tmp/llvm.sh 21
-          sudo apt-get install -y libclang-21-dev clang-21
+          # clang/libclang-dev = ubuntu-22.04's stock LLVM 14. It exists only so
+          # the v8 crate's build.rs can ATTEMPT bindgen; we do NOT consume the
+          # generated Rust bindings (see the build step — bindgen is expected to
+          # fail and is tolerated). The C++ *compiler* clang that actually builds
+          # V8 is auto-downloaded by build.rs (LLVM 23), so the system libclang
+          # version is irrelevant — installing a newer LLVM only makes bindgen
+          # fail differently and is not worth the apt.llvm.org dance.
+          sudo apt-get install -y python3 curl pkg-config libglib2.0-dev lld \
+                                  clang libclang-dev
       - uses: "dtolnay/rust-toolchain@stable"
       - name: "Clone rusty_v8 ${{ inputs.rusty_v8_tag }}"
         run: |
           git clone --depth 1 --branch "${{ inputs.rusty_v8_tag }}" \
             --recurse-submodules --shallow-submodules \
             https://github.com/denoland/rusty_v8
+      - name: "Force library-safe TLS in V8 (the whole point of this archive)"
+        working-directory: rusty_v8
+        run: |
+          set -e
+          # V8's `g_current_isolate_` is emitted with initial-exec TLS
+          # (R_X86_64_TPOFF32) unless V8_TLS_LIBRARY_MODE is on. The
+          # `-DV8_TLS_USED_IN_LIBRARY` cflag that V8_FROM_SOURCE sets does NOT
+          # reliably reach that symbol's TU, so the stock archive can't link into
+          # the gem's cdylib ("relocation R_X86_64_TPOFF32 against hidden symbol
+          # g_current_isolate_ can not be used when making a shared object").
+          # Force the macro on at the source so every TU uses the library-safe
+          # (call-based) TLS access. Verified locally: the resulting .a links and
+          # the gem suite passes; without it, linking fails.
+          hdr=v8/src/common/thread-local-storage.h
+          sed -i 's/^#define V8_TLS_LIBRARY_MODE 0$/#define V8_TLS_LIBRARY_MODE 1 \/\/ libv8-rusty: force library-safe TLS/' "$hdr"
+          grep -n 'libv8-rusty: force library-safe TLS' "$hdr" || { echo "TLS patch did not apply (header layout changed?)"; exit 1; }
       - name: "Build from source (library-TLS)"
         working-directory: rusty_v8
         env:
           V8_FROM_SOURCE: "1"
-          # Two different clangs do two different jobs here:
-          #   - COMPILE + the rust-allocator's libclang_rt.builtins use the
-          #     chromium clang the build auto-downloads (V8 15.0's toolchain is
-          #     LLVM 23; apt tops out at 21). So DON'T set CLANG_BASE_PATH — let
-          #     build.rs download it to target/release/clang.
-          #   - BINDGEN needs a real libclang.so to parse V8's libc++ headers.
-          #     The downloaded chromium clang ships only the compiler, no
-          #     libclang.so, so point bindgen at the apt-installed system
-          #     libclang-21 (21 is enough for bindgen; 19 fails with
-          #     "unresolved using declaration").
+          # The C++ compiler clang that builds V8 is auto-downloaded by build.rs
+          # (LLVM 23) — DON'T set CLANG_BASE_PATH, let it land in
+          # target/release/clang.
         run: |
-          set -e
-          libclang_dir="$(dirname "$(find /usr/lib/llvm-21 -name 'libclang.so*' 2>/dev/null | head -1)")"
-          test -n "$libclang_dir" || { echo "system libclang-21 not found"; exit 1; }
-          echo "bindgen LIBCLANG_PATH=$libclang_dir"
-          LIBCLANG_PATH="$libclang_dir" cargo build --release -vv
+          set -uo pipefail
+          # We consume ONLY librusty_v8.a — the compiled C++ V8 + rusty_v8 glue
+          # that ninja AR's near the end of the build. AFTER that, the v8 crate's
+          # build.rs runs bindgen and compiles the Rust FFI bindings, and THAT
+          # step fails: rusty_v8 150's hand-written bindings expect the
+          # anonymous-enum names a specific libclang emits, so the stock
+          # libclang-14 skews them ("cannot find value v8_String_WriteFlags_*")
+          # — exactly as it does in the local reference build. That Rust failure
+          # is irrelevant: the archive is already complete and the gem
+          # regenerates its OWN bindings at gem-build time. So tolerate a non-zero
+          # cargo exit and let the archive-existence check below be the real gate
+          # (a genuine V8 compile failure leaves no .a and still fails the job).
+          cargo build --release \
+            || echo "::warning::cargo exited non-zero — bindgen/binding skew tolerated, verifying the archive was still produced"
+          # `|| true`: GitHub runs `run:` under `bash -e -o pipefail`, where
+          # `find | head -1` can exit 141 (head closes the pipe, find gets
+          # SIGPIPE) if more than one archive ever matches — which would abort
+          # the step before the existence gate. Today exactly one matches.
+          archive="$(find target/release -name 'librusty_v8*.a' -size +10M | head -1 || true)"
+          if [ -z "$archive" ]; then
+            echo "::error::librusty_v8.a was not produced — real V8 build failure"
+            find target -name '*.a' | head; exit 1
+          fi
+          echo "librusty_v8.a present: $archive ($(du -h "$archive" | cut -f1))"
       - name: "Stage and compress the static archive"
         run: |
           set -x
