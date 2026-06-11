@@ -74,10 +74,47 @@ impl RootedProc {
 
 // One attach()'d host fn: the realm it was attached into — so resetting or
 // disposing that realm can release the GC root — and the rooted proc itself
-// (None once released; the slot stays because host_fn_ids index this Vec).
+// (None once released; the slot index stays valid as a host_fn_id).
 struct ProcSlot {
     context_id: i32,
     proc: Option<RootedProc>,
+}
+
+// The isolate's host-fn registry, indexed by host_fn_id. `free` lists slots
+// emptied by release_context_procs so a later attach reuses them instead of
+// growing `slots` forever — a long-lived process that re-navigates iframe
+// realms would otherwise leak one slot per attach. Reuse is safe because a slot
+// is only freed when its realm (and the V8 functions that carried its id) is
+// gone, so no stale V8 external can still call a recycled id.
+#[derive(Default)]
+struct ProcTable {
+    slots: Vec<ProcSlot>,
+    free: Vec<usize>,
+}
+
+impl ProcTable {
+    // Take a free slot if one exists, else grow. Returns the host_fn_id.
+    fn alloc(&mut self, slot: ProcSlot) -> usize {
+        if let Some(id) = self.free.pop() {
+            self.slots[id] = slot;
+            id
+        } else {
+            self.slots.push(slot);
+            self.slots.len() - 1
+        }
+    }
+
+    // Release every live proc attached into |context_id| (its realm is gone),
+    // returning each slot to the free list. Idempotent: an already-released slot
+    // has proc == None and is skipped, so it can't be double-freed.
+    fn release(&mut self, context_id: i32) {
+        for (id, slot) in self.slots.iter_mut().enumerate() {
+            if slot.context_id == context_id && slot.proc.is_some() {
+                slot.proc = None;
+                self.free.push(id);
+            }
+        }
+    }
 }
 
 // Look up a RustyRacer::<name> exception class at raise time. The classes are
@@ -186,6 +223,14 @@ enum Request {
         context_id: i32,
         name: String,
         host_fn_id: usize,
+        timeout_ms: u64,
+        reply: Sender<VmReply>,
+    },
+    // Batch attach: install many (name, host_fn_id) host fns in one round-trip
+    // (a fresh realm needs ~dozens). Same semantics as Attach, applied in order.
+    AttachMany {
+        context_id: i32,
+        entries: Vec<(String, usize)>,
         timeout_ms: u64,
         reply: Sender<VmReply>,
     },
@@ -1719,6 +1764,7 @@ fn request_realm(request: &Request) -> Option<i32> {
         Request::Eval { context_id, .. }
         | Request::Call { context_id, .. }
         | Request::Attach { context_id, .. }
+        | Request::AttachMany { context_id, .. }
         | Request::CompileModule { context_id, .. }
         | Request::CompileScript { context_id, .. } => Some(*context_id),
         Request::DrainMicrotasks { .. } => Some(0),
@@ -1843,6 +1889,42 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                                 Some(function) => attach_at_path(scope, context, &name, function),
                                 None => Err(VmError::Runtime("failed to build function".into())),
                             };
+                            auto_drain(scope, outermost);
+                            (true, out)
+                        }
+                        None => (false, Err(VmError::Runtime("realm disposed or unknown".into()))),
+                    }
+                });
+                let _ = reply.send(VmReply::Done(outcome));
+            }
+            Request::AttachMany {
+                context_id,
+                entries,
+                timeout_ms,
+                reply,
+            } => {
+                // Same as Attach (arbitrary JS via accessors/Proxy traps), but
+                // installs every entry under one bracket/drain. Stops at the
+                // first failure, reporting that error.
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
+                    match context_for(context_id) {
+                        Some(ctx) => {
+                            let context = v8::Local::new(scope, &ctx);
+                            let scope = &mut v8::ContextScope::new(scope, context);
+                            let mut out = Ok(JsVal::Undefined);
+                            for (name, host_fn_id) in &entries {
+                                let external = v8::External::new(scope, *host_fn_id as *mut c_void);
+                                out = match v8::Function::builder(host_fn_callback)
+                                    .data(external.into())
+                                    .build(scope)
+                                {
+                                    Some(function) => attach_at_path(scope, context, name, function),
+                                    None => Err(VmError::Runtime("failed to build function".into())),
+                                };
+                                if out.is_err() {
+                                    break;
+                                }
+                            }
                             auto_drain(scope, outermost);
                             (true, out)
                         }
@@ -2445,11 +2527,12 @@ struct Core {
     // import resolver — Context owns an Arc<Core> and &self can't recover it.
     me: Weak<Core>,
     shared: Mutex<Shared>,
-    // Shared across contexts (host_fn_id indexes this one vector). Mutex (not
+    // Shared across contexts (host_fn_id indexes ProcTable.slots). Mutex (not
     // RefCell) because contexts of one Context may be pumped on different
     // threads. Each proc is GC-rooted (marked + pinned) while live — see
-    // RootedProc/ProcSlot; reset/dispose of a realm releases its roots.
-    procs: Mutex<Vec<ProcSlot>>,
+    // RootedProc/ProcSlot; reset/dispose of a realm releases its roots and
+    // recycles their slots (ProcTable.free).
+    procs: Mutex<ProcTable>,
     // Default per-eval/call timeout (ms); 0 = none. eval(timeout_ms:)'s explicit
     // value overrides it. Guards against an in-V8 infinite loop without a watchdog.
     default_timeout_ms: u64,
@@ -2912,7 +2995,7 @@ impl Isolate {
                     handle,
                     disposed: false,
                 }),
-                procs: Mutex::new(Vec::new()),
+                procs: Mutex::new(ProcTable::default()),
                 default_timeout_ms: timeout_ms,
                 dynamic_import_resolver: Mutex::new(None),
             }),
@@ -3121,6 +3204,7 @@ impl Core {
         let proc = {
             let procs = self.procs.lock().unwrap();
             procs
+                .slots
                 .get(host_fn_id)
                 .and_then(|slot| slot.proc.as_ref())
                 .ok_or("unknown host function")?
@@ -3203,14 +3287,10 @@ impl Core {
     }
 
     fn attach(&self, ruby: &Ruby, context_id: i32, name: String, proc: Proc) -> Result<Value, Error> {
-        let host_fn_id = {
-            let mut procs = self.procs.lock().unwrap();
-            procs.push(ProcSlot {
-                context_id,
-                proc: Some(RootedProc(BoxValue::new(proc))),
-            });
-            procs.len() - 1
-        };
+        let host_fn_id = self.procs.lock().unwrap().alloc(ProcSlot {
+            context_id,
+            proc: Some(RootedProc(BoxValue::new(proc))),
+        });
         let (reply_tx, reply_rx) = channel::<VmReply>();
         self.dispatch(
             ruby,
@@ -3225,18 +3305,44 @@ impl Core {
         self.pump(ruby, reply_rx, None)
     }
 
+    // attach_many: install several host fns in ONE round-trip to the V8 thread
+    // (a fresh realm needs ~dozens; one rendezvous instead of one per fn). Slots
+    // are allocated up front so each carries a stable host_fn_id; a build/attach
+    // failure for any name aborts the batch with that error.
+    fn attach_many(&self, ruby: &Ruby, context_id: i32, entries: Vec<(String, Proc)>) -> Result<Value, Error> {
+        let named_ids: Vec<(String, usize)> = {
+            let mut procs = self.procs.lock().unwrap();
+            entries
+                .into_iter()
+                .map(|(name, proc)| {
+                    let id = procs.alloc(ProcSlot {
+                        context_id,
+                        proc: Some(RootedProc(BoxValue::new(proc))),
+                    });
+                    (name, id)
+                })
+                .collect()
+        };
+        let (reply_tx, reply_rx) = channel::<VmReply>();
+        self.dispatch(
+            ruby,
+            Request::AttachMany {
+                context_id,
+                entries: named_ids,
+                timeout_ms: self.default_timeout_ms,
+                reply: reply_tx,
+            },
+        )?;
+        self.pump(ruby, reply_rx, None)
+    }
+
     // Release the GC roots of the procs attached into |context_id| — its
     // realm is gone (reset or disposed), so the V8-side functions that
     // referenced them are unreachable. Runs on a Ruby thread (a RootedProc
     // drop unregisters its GC address). The slots stay: host_fn_ids of other
     // realms are indices into the same Vec.
     fn release_context_procs(&self, context_id: i32) {
-        let mut procs = self.procs.lock().unwrap();
-        for slot in procs.iter_mut() {
-            if slot.context_id == context_id {
-                slot.proc = None;
-            }
-        }
+        self.procs.lock().unwrap().release(context_id);
     }
 
     fn reset(&self, ruby: &Ruby, context_id: i32) -> Result<Value, Error> {
@@ -3424,7 +3530,11 @@ impl Core {
         // isolate must not keep the attached procs — and whatever their
         // closures capture — alive and pinned until the last wrapper object
         // is itself collected.
-        self.procs.lock().unwrap().clear();
+        {
+            let mut procs = self.procs.lock().unwrap();
+            procs.slots.clear();
+            procs.free.clear();
+        }
         *self.dynamic_import_resolver.lock().unwrap() = None;
         let _ = ruby;
         Ok(())
@@ -3511,6 +3621,17 @@ impl Context {
     fn attach(ruby: &Ruby, rb_self: &Self, name: String, proc: Proc) -> Result<Value, Error> {
         rb_self.check_live(ruby)?;
         rb_self.core.attach(ruby, rb_self.id, name, proc)
+    }
+    // attach_many({ "name" => proc, ... }): install every host fn in one
+    // round-trip to the V8 thread (vs one per attach).
+    fn attach_many(ruby: &Ruby, rb_self: &Self, table: RHash) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        let mut entries: Vec<(String, Proc)> = Vec::new();
+        table.foreach(|name: String, proc: Proc| {
+            entries.push((name, proc));
+            Ok(magnus::r_hash::ForEach::Continue)
+        })?;
+        rb_self.core.attach_many(ruby, rb_self.id, entries)
     }
     // Swap this context's globals for a fresh realm (csim's per-visit reset).
     fn reset(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
@@ -3780,7 +3901,7 @@ fn resolve_module_via_ruby(
     initiating_context: Option<i32>,
 ) -> Result<Option<i32>, Error> {
     let ruby = Ruby::get().unwrap();
-    let ret: Value = match initiating_context.and_then(|id| core.me.upgrade().map(|c| (c, id))) {
+    let ret: Value = match core.me.upgrade().zip(initiating_context) {
         Some((core_arc, id)) => {
             let ctx = Context {
                 core: core_arc,
@@ -4213,6 +4334,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     context.define_method("call", method!(Context::call, -1))?;
     context.define_method("call_void", method!(Context::call_void, -1))?;
     context.define_method("attach", method!(Context::attach, 2))?;
+    context.define_method("attach_many", method!(Context::attach_many, 1))?;
     context.define_method("reset", method!(Context::reset, 0))?;
     context.define_method("id", method!(Context::id, 0))?;
     // keyword-arg wrappers Context#compile_module / #compile (source, ...) in lib.

@@ -288,6 +288,29 @@ class RustyRacerTest < Minitest::Test
     assert_equal "hi bob", ctx.eval('Helpers.greet("bob")')
   end
 
+  def test_attach_many_installs_all_in_one_call
+    @ctx.attach_many(
+      'add'      => proc {|a, b| a + b },
+      'greet'    => proc {|who| "hi #{who}" },
+      'Ns.const' => proc { 42 }
+    )
+    assert_equal 7, @ctx.eval('add(3, 4)')
+    assert_equal 'hi bob', @ctx.eval('greet("bob")')
+    assert_equal 42, @ctx.eval('Ns.const()') # dotted path creates the namespace
+  end
+
+  def test_attach_slots_are_reused_after_realm_dispose
+    # disposing a realm frees its proc slots; a later attach must reuse a freed
+    # slot id and map it to the NEW proc (no stale binding from the dead realm).
+    realm1 = @iso.create_context
+    realm1.attach('f', proc { 'one' })
+    assert_equal 'one', realm1.eval('f()')
+    realm1.dispose
+    realm2 = @iso.create_context
+    realm2.attach('f', proc { 'two' })
+    assert_equal 'two', realm2.eval('f()')
+  end
+
   def test_context_default_timeout
     ctx = RustyRacer::Isolate.new(timeout_ms: 50).context
     assert_raises(RustyRacer::ScriptTerminatedError) { ctx.eval("for(;;){}") }
