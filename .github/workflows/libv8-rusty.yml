@@ -1,12 +1,18 @@
-# libv8-rusty: build a *library-TLS* librusty_v8.a from the denoland/rusty_v8
-# GIT checkout (V8_FROM_SOURCE defaults to V8_TLS_USED_IN_LIBRARY on linux, and
-# the git tree has the full third_party the crates.io tarball lacks). The gem
-# build then points RUSTY_V8_ARCHIVE at this artifact instead of downloading
-# Deno's bin-TLS prebuilt. Linux x86_64 first; widen later.
+# libv8-rusty: build *library-TLS* librusty_v8.a archives from the denoland/
+# rusty_v8 GIT checkout (which has the full third_party the crates.io tarball
+# lacks), for cibuildgem to link instead of Deno's bin-TLS prebuilt.
 #
-# Heavy + iteration-prone: a full V8 source build needs lots of disk/RAM/time.
-# First run is exploratory — expect to tune disk cleanup, the LLVM version, and
-# the artifact path.
+# Builds BOTH linux arches on x86_64 hosts:
+#   - x86_64-unknown-linux-gnu: native.
+#   - aarch64-unknown-linux-gnu: CROSS-compiled. A native arm64 host can't build
+#     V8 from source — rusty_v8 downloads chromium's x86_64-only toolchain, so an
+#     arm64 runner dies "Exec format error" on the bundled rustc. Cross from
+#     x86_64 instead: setting CARGO_BUILD_TARGET makes the v8 build.rs add
+#     target_cpu="arm64" + use_sysroot=true and download chromium's arm64 sysroot.
+# macOS/Windows are NOT built here (macOS uses Deno's stock prebuilt; the TLS
+# problem is linux-specific).
+#
+# Heavy: a full V8 source build needs lots of disk/RAM/time (~1h per leg).
 name: "libv8-rusty (library-TLS librusty_v8.a)"
 on:
   workflow_dispatch:
@@ -16,9 +22,39 @@ on:
         required: true
         default: "v150.0.0"
 jobs:
+  # Create the release ONCE up front so the parallel build legs don't race on
+  # `gh release create` (concurrent creates can fail the loser with a
+  # non-"already exists" error, or leave a window before the release is visible
+  # to a leg's upload). Each build leg then only uploads its own arch asset.
+  create_release:
+    runs-on: "ubuntu-latest"
+    permissions:
+      contents: write
+    steps:
+      - name: "Ensure the prerelease exists"
+        env:
+          GH_TOKEN: "${{ github.token }}"
+          GH_REPO: "${{ github.repository }}"
+        run: |
+          set -x
+          tag="libv8-${{ inputs.rusty_v8_tag }}"
+          # Prerelease, so it never shows as the repo's "Latest release" (those
+          # are the gem's own vX.Y.Z tags). Tolerate it already existing (a
+          # re-run) but surface any OTHER create error.
+          if ! err=$(gh release create "$tag" --prerelease \
+            --title "librusty_v8 ${{ inputs.rusty_v8_tag }} (library-TLS)" \
+            --notes "library-TLS \`librusty_v8.a\` archives (x86_64 + aarch64) built from the denoland/rusty_v8 ${{ inputs.rusty_v8_tag }} git checkout. Consumed by cibuildgem.yaml via RUSTY_V8_ARCHIVE so the gem CI links a prebuilt V8 instead of a ~1h source build." 2>&1); then
+            echo "$err"
+            echo "$err" | grep -qi 'already exists' || exit 1
+          fi
   build:
+    needs: create_release
+    strategy:
+      fail-fast: false
+      matrix:
+        # `cross` is just for the log/name; both run on an x86_64 host.
+        target: ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
     runs-on: "ubuntu-22.04"
-    # Needs write access to publish the archive as a Release asset.
     permissions:
       contents: write
     timeout-minutes: 180
@@ -34,13 +70,14 @@ jobs:
           # clang/libclang-dev = ubuntu-22.04's stock LLVM 14. It exists only so
           # the v8 crate's build.rs can ATTEMPT bindgen; we do NOT consume the
           # generated Rust bindings (see the build step — bindgen is expected to
-          # fail and is tolerated). The C++ *compiler* clang that actually builds
-          # V8 is auto-downloaded by build.rs (LLVM 23), so the system libclang
-          # version is irrelevant — installing a newer LLVM only makes bindgen
-          # fail differently and is not worth the apt.llvm.org dance.
+          # fail and is tolerated). The C++ compiler clang that actually builds V8
+          # is auto-downloaded by build.rs (LLVM 23, and it cross-compiles to
+          # arm64), so the system libclang version is irrelevant.
           sudo apt-get install -y python3 curl pkg-config libglib2.0-dev lld \
                                   clang libclang-dev
       - uses: "dtolnay/rust-toolchain@stable"
+        with:
+          targets: "${{ matrix.target }}"
       - name: "Clone rusty_v8 ${{ inputs.rusty_v8_tag }}"
         run: |
           git clone --depth 1 --branch "${{ inputs.rusty_v8_tag }}" \
@@ -50,79 +87,79 @@ jobs:
         working-directory: rusty_v8
         run: |
           set -e
-          # V8's `g_current_isolate_` is emitted with initial-exec TLS
-          # (R_X86_64_TPOFF32) unless V8_TLS_LIBRARY_MODE is on. The
-          # `-DV8_TLS_USED_IN_LIBRARY` cflag that V8_FROM_SOURCE sets does NOT
-          # reliably reach that symbol's TU, so the stock archive can't link into
-          # the gem's cdylib ("relocation R_X86_64_TPOFF32 against hidden symbol
-          # g_current_isolate_ can not be used when making a shared object").
-          # Force the macro on at the source so every TU uses the library-safe
-          # (call-based) TLS access. Verified locally: the resulting .a links and
-          # the gem suite passes; without it, linking fails.
+          # V8's `g_current_isolate_` is emitted with initial-exec TLS unless
+          # V8_TLS_LIBRARY_MODE is on. The `-DV8_TLS_USED_IN_LIBRARY` cflag that
+          # V8_FROM_SOURCE sets does NOT reliably reach that symbol's TU, so the
+          # stock archive can't link into the gem's cdylib ("relocation
+          # R_X86_64_TPOFF32 against hidden symbol g_current_isolate_ ..."). Force
+          # the macro on at the source (arch-independent) so every TU uses the
+          # library-safe call-based TLS access.
           hdr=v8/src/common/thread-local-storage.h
           sed -i 's/^#define V8_TLS_LIBRARY_MODE 0$/#define V8_TLS_LIBRARY_MODE 1 \/\/ libv8-rusty: force library-safe TLS/' "$hdr"
           grep -n 'libv8-rusty: force library-safe TLS' "$hdr" || { echo "TLS patch did not apply (header layout changed?)"; exit 1; }
-      - name: "Build from source (library-TLS)"
+      - name: "Build from source (library-TLS) for ${{ matrix.target }}"
         working-directory: rusty_v8
         env:
           V8_FROM_SOURCE: "1"
-          # The C++ compiler clang that builds V8 is auto-downloaded by build.rs
-          # (LLVM 23) — DON'T set CLANG_BASE_PATH, let it land in
-          # target/release/clang.
         run: |
           set -uo pipefail
+          # aarch64 cross-compiles from this x86_64 host: CARGO_BUILD_TARGET makes
+          # build.rs add target_cpu="arm64" + download the arm64 sysroot, and the
+          # archive lands under target/<triple>/release/. x86_64 builds natively
+          # with NO target override (keeps the proven path exactly, archive under
+          # target/release/). The find below is scoped to each leg's own dir.
+          if [ "${{ matrix.target }}" != "x86_64-unknown-linux-gnu" ]; then
+            export CARGO_BUILD_TARGET="${{ matrix.target }}"
+          fi
           # We consume ONLY librusty_v8.a — the compiled C++ V8 + rusty_v8 glue
           # that ninja AR's near the end of the build. AFTER that, the v8 crate's
           # build.rs runs bindgen and compiles the Rust FFI bindings, and THAT
-          # step fails: rusty_v8 150's hand-written bindings expect the
-          # anonymous-enum names a specific libclang emits, so the stock
-          # libclang-14 skews them ("cannot find value v8_String_WriteFlags_*")
-          # — exactly as it does in the local reference build. That Rust failure
-          # is irrelevant: the archive is already complete and the gem
-          # regenerates its OWN bindings at gem-build time. So tolerate a non-zero
-          # cargo exit and let the archive-existence check below be the real gate
-          # (a genuine V8 compile failure leaves no .a and still fails the job).
+          # step fails (the stock libclang-14 skews rusty_v8 150's hand-written
+          # binding names). That Rust failure is irrelevant: the archive is
+          # already complete and the gem regenerates its OWN bindings at gem-build
+          # time. So tolerate a non-zero cargo exit and gate on the archive below.
           cargo build --release \
             || echo "::warning::cargo exited non-zero — bindgen/binding skew tolerated, verifying the archive was still produced"
-          # `|| true`: GitHub runs `run:` under `bash -e -o pipefail`, where
-          # `find | head -1` can exit 141 (head closes the pipe, find gets
-          # SIGPIPE) if more than one archive ever matches — which would abort
-          # the step before the existence gate. Today exactly one matches.
-          archive="$(find target/release -name 'librusty_v8*.a' -size +10M | head -1 || true)"
+          # Scope the find to THIS build's output dir (native: target/release;
+          # cross: target/<triple>/release) so a stale/host archive on a warm
+          # cache can't be picked up instead of the current build's.
+          out_dir="target${CARGO_BUILD_TARGET:+/$CARGO_BUILD_TARGET}/release"
+          archive="$(find "$out_dir" -name 'librusty_v8*.a' -size +10M | head -1 || true)"
           if [ -z "$archive" ]; then
             echo "::error::librusty_v8.a was not produced — real V8 build failure"
             find target -name '*.a' | head; exit 1
           fi
-          echo "librusty_v8.a present: $archive ($(du -h "$archive" | cut -f1))"
+          # Fail fast if the cross build silently produced the wrong arch — else
+          # we'd publish an x86_64 .a as the aarch64 asset and only discover it
+          # when the arm64 gem link fails downstream (the size gate never checks
+          # the ELF machine).
+          case "${CARGO_BUILD_TARGET:-x86_64-unknown-linux-gnu}" in
+            aarch64-*) want="aarch64" ;;
+            *)         want="x86-64" ;;
+          esac
+          ar p "$archive" "$(ar t "$archive" | grep -m1 '\.o$')" > /tmp/probe.o
+          file /tmp/probe.o | grep -qi "$want" || { echo "::error::archive arch is not $want: $(file /tmp/probe.o)"; exit 1; }
+          echo "ARCHIVE=rusty_v8/$archive" >> "$GITHUB_ENV"
+          echo "librusty_v8.a present ($want): $archive ($(du -h "$archive" | cut -f1))"
       - name: "Stage and compress the static archive"
         run: |
           set -x
-          archive="$(find rusty_v8/target/release -name 'librusty_v8*.a' -size +10M | head -1)"
-          test -n "$archive" || { echo "no librusty_v8.a found"; find rusty_v8/target -name '*.a' | head; exit 1; }
+          test -n "${ARCHIVE:-}" || { echo "::error::ARCHIVE not set by the build step"; exit 1; }
           mkdir -p out
           # gzip so the asset (and every cibuildgem download) is ~tens of MB, not
-          # ~190MB. The gem's build.rs (copy_archive) auto-detects the gzip magic
-          # and inflates it, so a plain .a would also work — gzip just saves bandwidth.
-          gzip -c "$archive" > "out/librusty_v8_release_x86_64-unknown-linux-gnu.a.gz"
+          # ~190MB. The gem's build.rs (copy_archive) auto-detects the gzip magic.
+          gzip -c "$ARCHIVE" > "out/librusty_v8_release_${{ matrix.target }}.a.gz"
           ls -lh out/
-      - name: "Publish as a Release asset (consumed by cibuildgem via RUSTY_V8_ARCHIVE)"
+      - name: "Upload the arch-specific archive to the release"
         env:
           GH_TOKEN: "${{ github.token }}"
           # This job never checks out rusty_racer (it only clones rusty_v8 into a
-          # subdir), so there's no .git for `gh` to infer the repo from — it would
-          # die "not a git repository". Point it at the repo explicitly.
+          # subdir), so there's no .git for `gh` to infer the repo from. Point it
+          # at the repo explicitly.
           GH_REPO: "${{ github.repository }}"
         run: |
           set -x
           tag="libv8-${{ inputs.rusty_v8_tag }}"
-          # Prerelease, so it never shows up as the repo's "Latest release" —
-          # those are the gem's own vX.Y.Z tags. Tolerate the release already
-          # existing (a racing re-run) but surface any OTHER create error
-          # instead of swallowing it; --clobber then replaces the asset.
-          if ! err=$(gh release create "$tag" --prerelease \
-            --title "librusty_v8 ${{ inputs.rusty_v8_tag }} (library-TLS)" \
-            --notes "library-TLS \`librusty_v8.a\` built from the denoland/rusty_v8 ${{ inputs.rusty_v8_tag }} git checkout (which has the full third_party the crates.io tarball lacks). Consumed by cibuildgem.yaml via RUSTY_V8_ARCHIVE, so the gem CI links a prebuilt V8 instead of a 30-45 min source build." 2>&1); then
-            echo "$err"
-            echo "$err" | grep -qi 'already exists' || exit 1
-          fi
-          gh release upload "$tag" out/librusty_v8_release_x86_64-unknown-linux-gnu.a.gz --clobber
+          # The release was created by create_release; each leg uploads its own
+          # distinct per-target asset (--clobber replaces it on a re-run).
+          gh release upload "$tag" "out/librusty_v8_release_${{ matrix.target }}.a.gz" --clobber
