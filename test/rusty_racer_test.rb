@@ -518,6 +518,19 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2, @ctx.eval("1 + 1") # realm usable after reset
   end
 
+  def test_reset_replays_the_snapshot
+    # reset gives a FRESH context, and on a snapshotted isolate that context is
+    # re-deserialized from the snapshot — so the snapshot's baked-in state (and
+    # its precompiled code cache) returns, while runtime mutations are dropped.
+    # This is the contract warm-compile relies on: reset == back to the snapshot.
+    iso = RustyRacer::Isolate.new(snapshot: RustyRacer::Snapshot.new('globalThis.X = 42'))
+    ctx = iso.context
+    assert_equal 42, ctx.eval('globalThis.X')
+    ctx.eval('globalThis.X = 99')
+    ctx.reset
+    assert_equal 42, ctx.eval('globalThis.X') # snapshot value restored, not 99
+  end
+
   def test_snapshot_bakes_globals_into_a_booted_context
     snap = RustyRacer::Snapshot.new(<<~JS)
       globalThis.GREETING = "from snapshot";

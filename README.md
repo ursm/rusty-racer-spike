@@ -65,6 +65,27 @@ eval/call/evaluate, while `microtasks: :explicit` leaves draining fully manual
 — there is no event loop or timers either way), `Isolate#terminate`,
 `Isolate#dynamic_import_resolver=`, `Context#reset`, `Platform.set_flags!`.
 
+### `Context#reset`
+
+`reset` swaps the realm's `globalThis` for a fresh `v8::Context`, reusing the
+warm isolate (csim's per-visit reset). Its contract:
+
+- **The snapshot is replayed.** On a snapshotted isolate the fresh context is
+  re-deserialized from the snapshot, so the snapshot's baked-in globals — and
+  its precompiled code cache — come back. `reset` means "back to the snapshot"
+  (or to an empty realm, with no snapshot).
+- **Runtime mutations are dropped.** Anything set on the realm at runtime is gone.
+- **Host fns are dropped.** Functions `attach`/`attach_many`'d into the realm are
+  released (their GC roots freed); re-attach them after a reset.
+- **Modules and classic scripts are dropped.** Handles compiled in the realm die
+  with the old context.
+- **The realm id and the shared same-origin token are preserved** — the id keeps
+  addressing the realm, now backed by the fresh context.
+- **`reset` is refused (raises), leaving the realm untouched, when** a microtask
+  checkpoint is draining, the realm is unknown/disposed, or a request for it is
+  suspended on the V8 stack (e.g. resetting a realm from inside one of its own
+  host fns).
+
 ## Building
 
 The stock `v8` crate prebuilt links as a binary (initial-exec TLS), which a Ruby
