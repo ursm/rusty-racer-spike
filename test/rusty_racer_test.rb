@@ -710,7 +710,7 @@ class RustyRacerTest < Minitest::Test
   end
 
   def test_import_meta_url_on_dynamically_imported_module
-    @iso.dynamic_import_resolver = ->(spec, _ref) {
+    @iso.dynamic_import_resolver = ->(spec, _ref, _ctx) {
       @ctx.compile_module('globalThis.DU = import.meta.url;', filename: spec)
     }
     t = deadline_thread {
@@ -789,7 +789,7 @@ class RustyRacerTest < Minitest::Test
     dep = ctx.compile_module("export const v = 7;", filename: "/dep.js")
     dep.instantiate { |_s, _r| nil }
     dep.evaluate
-    iso.dynamic_import_resolver = ->(specifier, _referrer) { specifier == "/dep.js" ? dep : nil }
+    iso.dynamic_import_resolver = ->(specifier, _referrer, _ctx) { specifier == "/dep.js" ? dep : nil }
 
     ctx.eval(<<~JS, filename: "/main.js")
       globalThis.OUT = null;
@@ -803,7 +803,7 @@ class RustyRacerTest < Minitest::Test
   def test_dynamic_import_auto_links_and_evaluates_a_compiled_module
     # V8's host contract: the resolver may return a merely COMPILED module —
     # linking and evaluating are the binding's job
-    @iso.dynamic_import_resolver = ->(spec, _ref) { @ctx.compile_module('export const v = 7;', filename: spec) }
+    @iso.dynamic_import_resolver = ->(spec, _ref, _ctx) { @ctx.compile_module('export const v = 7;', filename: spec) }
     t = deadline_thread {
       @ctx.eval('globalThis.OUT = null; import("/m.js").then(m => { globalThis.OUT = m.v }, e => { globalThis.OUT = String(e) });')
     }
@@ -817,7 +817,7 @@ class RustyRacerTest < Minitest::Test
       '/app.js' => 'import {x} from "/dep.js"; export const v = x + 1;',
       '/dep.js' => 'export const x = 41;'
     }
-    @iso.dynamic_import_resolver = ->(spec, _ref) {
+    @iso.dynamic_import_resolver = ->(spec, _ref, _ctx) {
       sources[spec] && @ctx.compile_module(sources[spec], filename: spec)
     }
     t = deadline_thread {
@@ -828,8 +828,28 @@ class RustyRacerTest < Minitest::Test
     assert_equal 42, @ctx.eval('globalThis.OUT')
   end
 
+  def test_dynamic_import_resolver_receives_the_initiating_realm
+    # import() from an extra realm hands the resolver THAT realm's Context (the
+    # 3rd arg), so iframe-style imports resolve/compile in their own realm
+    # instead of the main one. .id identifies the realm.
+    realm = @iso.create_context
+    seen = []
+    @iso.dynamic_import_resolver = ->(spec, _ref, ctx) {
+      seen << ctx.id
+      ctx.compile_module('export const v = 7;', filename: spec)
+    }
+    t = deadline_thread {
+      realm.eval('globalThis.OUT = null; import("/m.js").then(m => { globalThis.OUT = m.v }, e => { globalThis.OUT = String(e) });')
+    }
+    flunk 'dynamic import from an extra realm deadlocked' unless t.join(10)
+    t.value
+    assert_equal 7, realm.eval('globalThis.OUT')
+    assert_equal [realm.id], seen, 'resolver did not receive the initiating realm'
+    refute_equal 0, realm.id, 'the extra realm must not be the main realm'
+  end
+
   def test_dynamic_import_evaluation_error_rejects_the_promise
-    @iso.dynamic_import_resolver = ->(spec, _ref) {
+    @iso.dynamic_import_resolver = ->(spec, _ref, _ctx) {
       @ctx.compile_module('throw new Error("module boom");', filename: spec)
     }
     t = deadline_thread {
@@ -843,7 +863,7 @@ class RustyRacerTest < Minitest::Test
   def test_dynamic_import_top_level_await_completes
     # the import() promise is settled FROM the evaluation promise, so a
     # top-level await module hands out its namespace only once it finished
-    @iso.dynamic_import_resolver = ->(spec, _ref) {
+    @iso.dynamic_import_resolver = ->(spec, _ref, _ctx) {
       @ctx.compile_module('await Promise.resolve(); export const v = 5;', filename: spec)
     }
     t = deadline_thread {
@@ -858,7 +878,7 @@ class RustyRacerTest < Minitest::Test
     # the binding settles import() via the native Promise::then builtin, so a
     # user-patched Promise.prototype.then cannot break the link/evaluate of an
     # imported module (the module's own side effects still happen)
-    @iso.dynamic_import_resolver = ->(spec, _ref) {
+    @iso.dynamic_import_resolver = ->(spec, _ref, _ctx) {
       @ctx.compile_module('globalThis.SIDE = "ran"; export const v = 7;', filename: spec)
     }
     @ctx.eval('Promise.prototype.then = function(){ throw new Error("patched") }')
@@ -872,7 +892,7 @@ class RustyRacerTest < Minitest::Test
     # to the outer eval (the import callback must not absorb it), not vanish
     iso = RustyRacer::Isolate.new(timeout_ms: 200)
     ctx = iso.context
-    iso.dynamic_import_resolver = ->(spec, _ref) { ctx.compile_module('for(;;){}', filename: spec) }
+    iso.dynamic_import_resolver = ->(spec, _ref, _ctx) { ctx.compile_module('for(;;){}', filename: spec) }
     assert_raises(RustyRacer::ScriptTerminatedError) { ctx.eval('import("/spin.js"); 1') }
     assert_equal 2, ctx.eval('1 + 1')
   end
@@ -885,7 +905,7 @@ class RustyRacerTest < Minitest::Test
     iso = RustyRacer::Isolate.new(host_namespace: 'NS')
     ctx = iso.context
     frame = iso.create_context
-    iso.dynamic_import_resolver = ->(spec, _ref) {
+    iso.dynamic_import_resolver = ->(spec, _ref, _ctx) {
       frame.compile_module('export const v = 99;', filename: spec)
     }
     # queue the frame's import behind a resolver the main realm will trigger
@@ -904,7 +924,7 @@ class RustyRacerTest < Minitest::Test
   end
 
   def test_dynamic_import_unresolved_static_dep_rejects
-    @iso.dynamic_import_resolver = ->(spec, _ref) {
+    @iso.dynamic_import_resolver = ->(spec, _ref, _ctx) {
       spec == '/app.js' ? @ctx.compile_module('import {x} from "/missing.js";', filename: spec) : nil
     }
     t = deadline_thread {
@@ -1234,7 +1254,7 @@ class RustyRacerTest < Minitest::Test
     dep = @ctx.compile_module('export const v = 7;', filename: '/dep.js')
     dep.instantiate {|_s, _r| nil }
     dep.evaluate
-    @iso.dynamic_import_resolver = ->(specifier, _referrer) { specifier == '/dep.js' ? dep : nil }
+    @iso.dynamic_import_resolver = ->(specifier, _referrer, _ctx) { specifier == '/dep.js' ? dep : nil }
     GC.compact
     @ctx.eval('globalThis.OUT = null; import("/dep.js").then(m => { globalThis.OUT = m.v });')
     @iso.perform_microtask_checkpoint
@@ -1447,7 +1467,7 @@ class RustyRacerTest < Minitest::Test
   def test_lazy_load_inside_dynamic_import_resolver
     # the dynamic-import resolver may compile + instantiate + evaluate the
     # module on demand (the suspended import() frame services all three)
-    @iso.dynamic_import_resolver = lambda {|specifier, _referrer|
+    @iso.dynamic_import_resolver = lambda {|specifier, _referrer, _ctx|
       m = @ctx.compile_module('export const v = 7;', filename: specifier)
       m.instantiate {|_s, _r| nil }
       m.evaluate

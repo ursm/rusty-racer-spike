@@ -39,7 +39,7 @@ use std::ffi::c_void;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, Sender};
-use std::sync::{Arc, Condvar, Mutex, Once};
+use std::sync::{Arc, Condvar, Mutex, Once, Weak};
 use std::time::{Duration, Instant};
 
 use magnus::block::Proc;
@@ -289,17 +289,24 @@ enum VmReply {
         answer: Sender<Answer>,
     },
     // instantiate's per-edge resolve: ask the Ruby resolve block for the module
-    // that |specifier| (imported by |referrer_url|) refers to.
+    // that |specifier| (imported by |referrer_url|) refers to. |initiating_context|
+    // is the realm being linked — passed to the dynamic_import_resolver (which
+    // auto-links a dynamic import's static deps) so it can resolve per-realm;
+    // the static instantiate block ignores it (its contract stays 2-arg).
     ResolveModule {
         specifier: String,
         referrer_url: String,
+        initiating_context: i32,
         answer: Sender<Answer>,
     },
     // JS did import(specifier): ask the Context's dynamic_import_resolver for an
-    // already-loaded module to fulfil the import() promise.
+    // already-loaded module to fulfil the import() promise. |initiating_context|
+    // is the realm import() actually fired in (handed to the resolver as a
+    // Context so iframe imports resolve in the iframe's realm, not the main one).
     DynamicImport {
         specifier: String,
         referrer_url: String,
+        initiating_context: i32,
         answer: Sender<Answer>,
     },
 }
@@ -1236,21 +1243,25 @@ fn resolve_imported<'s>(
     v8::callback_scope!(unsafe scope, context);
     let spec = specifier.to_rust_string_lossy(scope);
     let ref_url = module_url(scope, referrer)?;
+    // The realm being linked (this callback's own context). Computed up front so
+    // it both rides along to the dynamic_import_resolver AND backs the
+    // foreign-context check below; for a real module context it is always Some.
+    let here = id_of_context(scope, context);
     let reply = REPLY_STACK.with(|s| s.borrow().last().cloned())?;
     let (atx, arx) = channel();
     reply
         .send(VmReply::ResolveModule {
             specifier: spec,
             referrer_url: ref_url,
+            initiating_context: here.unwrap_or(0),
             answer: atx,
         })
         .ok()?;
     let dep_id = recv_module_id(scope, &arx)?;
-    // The dep must live in the context actually being linked (this callback's
-    // own context) — the auto-link of a dynamic import runs in whatever realm
-    // import() fired in, which kAuto can detach from the request that started
-    // it. A foreign-context module would V8-CHECK-abort.
-    let here = id_of_context(scope, context);
+    // The dep must live in the context actually being linked — the auto-link of
+    // a dynamic import runs in whatever realm import() fired in, which kAuto can
+    // detach from the request that started it. A foreign-context module would
+    // V8-CHECK-abort.
     MODULES.with(|m| {
         let m = m.borrow();
         let (g, _, cid) = m.by_id.get(&dep_id)?;
@@ -1281,6 +1292,10 @@ fn dynamic_import_cb<'s>(
     };
     let spec = specifier.to_rust_string_lossy(scope);
     let referrer = resource_name.to_rust_string_lossy(scope);
+    // The realm import() fired in — handed to the resolver as a Context so it can
+    // resolve/compile the module in the right realm (e.g. an iframe's), not the
+    // main one.
+    let initiating = id_of_context(scope, scope.get_current_context()).unwrap_or(0);
     let reply = match REPLY_STACK.with(|s| s.borrow().last().cloned()) {
         Some(r) => r,
         None => {
@@ -1293,6 +1308,7 @@ fn dynamic_import_cb<'s>(
         .send(VmReply::DynamicImport {
             specifier: spec,
             referrer_url: referrer,
+            initiating_context: initiating,
             answer: atx,
         })
         .is_err()
@@ -2424,6 +2440,10 @@ struct Shared {
 // last wrapper is gone — no GC-mark bookkeeping (mini_racer's Realm has to mark
 // its parent Context by hand; here the type system does it).
 struct Core {
+    // Weak self-handle so a &Core method can mint an Arc<Core> again (built via
+    // Arc::new_cyclic). Needed to hand a fresh Context wrapper to the dynamic
+    // import resolver — Context owns an Arc<Core> and &self can't recover it.
+    me: Weak<Core>,
     shared: Mutex<Shared>,
     // Shared across contexts (host_fn_id indexes this one vector). Mutex (not
     // RefCell) because contexts of one Context may be pumped on different
@@ -2885,7 +2905,8 @@ impl Isolate {
             .recv()
             .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread failed to boot"))?;
         Ok(Isolate {
-            core: Arc::new(Core {
+            core: Arc::new_cyclic(|me| Core {
+                me: me.clone(),
                 shared: Mutex::new(Shared {
                     tx,
                     handle,
@@ -2976,6 +2997,7 @@ impl Core {
                 Ok(VmReply::ResolveModule {
                     specifier,
                     referrer_url,
+                    initiating_context,
                     answer,
                 }) => {
                     match &module_resolve {
@@ -2984,9 +3006,10 @@ impl Core {
                             // (e.g. compile_module for a lazily-loaded dep), so
                             // run it under a NESTED frame like a host proc's:
                             // those ops then route nested instead of into the
-                            // (busy) main queue.
+                            // (busy) main queue. The static instantiate block
+                            // keeps its 2-arg contract (None).
                             let resolved = with_nested(self, &answer, || {
-                                resolve_module_via_ruby(self, *resolve, &specifier, &referrer_url)
+                                resolve_module_via_ruby(self, *resolve, &specifier, &referrer_url, None)
                             });
                             match resolved {
                                 Ok(id) => {
@@ -3015,7 +3038,13 @@ impl Core {
                             };
                             let id = match resolver {
                                 Some(proc) => with_nested(self, &answer, || {
-                                    resolve_module_via_ruby(self, proc, &specifier, &referrer_url)
+                                    resolve_module_via_ruby(
+                                        self,
+                                        proc,
+                                        &specifier,
+                                        &referrer_url,
+                                        Some(initiating_context),
+                                    )
                                 })
                                 .unwrap_or(None),
                                 None => None,
@@ -3027,6 +3056,7 @@ impl Core {
                 Ok(VmReply::DynamicImport {
                     specifier,
                     referrer_url,
+                    initiating_context,
                     answer,
                 }) => {
                     // Read the Context's dynamic_import_resolver (set via the
@@ -3039,9 +3069,17 @@ impl Core {
                         Some(proc) => {
                             // Like ResolveModule: ops issued by the resolver
                             // (compile/instantiate/evaluate a lazy module)
-                            // route nested through this answer sender.
+                            // route nested through this answer sender. The
+                            // resolver gets the initiating realm as a 3rd Context
+                            // arg so iframe imports resolve in the iframe's realm.
                             let resolved = with_nested(self, &answer, || {
-                                resolve_module_via_ruby(self, proc, &specifier, &referrer_url)
+                                resolve_module_via_ruby(
+                                    self,
+                                    proc,
+                                    &specifier,
+                                    &referrer_url,
+                                    Some(initiating_context),
+                                )
                             });
                             match resolved {
                                 Ok(id) => {
@@ -3735,9 +3773,24 @@ fn resolve_module_via_ruby(
     resolve: Proc,
     specifier: &str,
     referrer_url: &str,
+    // Some(realm id) for the dynamic_import_resolver: it then receives the
+    // initiating realm as a 3rd Context arg so it can resolve per-realm. None for
+    // the static instantiate block, whose (specifier, referrer_url) contract is
+    // unchanged.
+    initiating_context: Option<i32>,
 ) -> Result<Option<i32>, Error> {
     let ruby = Ruby::get().unwrap();
-    let ret: Value = resolve.call((specifier, referrer_url))?;
+    let ret: Value = match initiating_context.and_then(|id| core.me.upgrade().map(|c| (c, id))) {
+        Some((core_arc, id)) => {
+            let ctx = Context {
+                core: core_arc,
+                id,
+                disposed: AtomicBool::new(false),
+            };
+            resolve.call((specifier, referrer_url, ctx))?
+        }
+        None => resolve.call((specifier, referrer_url))?,
+    };
     if ret.is_nil() {
         return Ok(None); // legitimately unresolved
     }

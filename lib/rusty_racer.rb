@@ -35,10 +35,14 @@ module RustyRacer
       _new(host_namespace, snapshot, timeout_ms, microtasks == :explicit)
     end
 
-    # ->(specifier, referrer_url) { Module } for JS import(). The block may
-    # return a merely compiled Module: linking and evaluation are the
-    # binding's job (V8's host contract), and static imports met while
-    # linking resolve through this same block.
+    # ->(specifier, referrer_url, context) { Module } for JS import(). |context|
+    # is the realm import() actually fired in (the Context, not just its id), so
+    # an import() from an extra realm resolves/compiles in THAT realm rather than
+    # the main one — return e.g. context.compile_module(src, filename: specifier).
+    # The block may return a merely compiled Module: linking and evaluation are
+    # the binding's job (V8's host contract), and static imports met while linking
+    # resolve through this same block (also with the realm as the 3rd arg).
+    # (Module#instantiate's own resolve block keeps its 2-arg form.)
     # Held in an ivar so the proc stays alive for the isolate's lifetime (the
     # native side only keeps a weak handle).
     def dynamic_import_resolver=(resolver)
