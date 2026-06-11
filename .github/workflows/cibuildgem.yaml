@@ -3,7 +3,7 @@
 #   - links a PREBUILT library-TLS librusty_v8.a (see RUSTY_V8_ARCHIVE) instead of
 #     a 30-45 min V8 source build on every run. That archive is built once per V8
 #     version by libv8-rusty.yml and published as a Release asset.
-#   - first milestone = compile + test_native (proves the extension links as a
+#   - scope so far = compile + test_native (proves the extension links as a
 #     cdylib and the suite passes). cross/install/release/macOS deferred.
 name: "Package gem with precompiled binaries"
 on:

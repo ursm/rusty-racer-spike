@@ -3,9 +3,9 @@
 require "minitest/autorun"
 require "rusty_racer"
 
-# The stage-2 probes as a suite cibuildgem runs natively on each platform —
-# proving the from-source V8 build links and runs, not just compiles. Mapped to
-# the mini_racer-csim audit's hang classes where relevant.
+# The probe suite cibuildgem runs natively on each platform — proving the
+# from-source V8 build links and runs, not just compiles. Mapped to the
+# mini_racer-csim audit's hang classes where relevant.
 class RustyRacerTest < Minitest::Test
   def setup
     @iso = RustyRacer::Isolate.new

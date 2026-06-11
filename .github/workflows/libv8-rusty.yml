@@ -1,4 +1,4 @@
-# M1 — libv8-rusty: build a *library-TLS* librusty_v8.a from the denoland/rusty_v8
+# libv8-rusty: build a *library-TLS* librusty_v8.a from the denoland/rusty_v8
 # GIT checkout (V8_FROM_SOURCE defaults to V8_TLS_USED_IN_LIBRARY on linux, and
 # the git tree has the full third_party the crates.io tarball lacks). The gem
 # build then points RUSTY_V8_ARCHIVE at this artifact instead of downloading
@@ -7,7 +7,7 @@
 # Heavy + iteration-prone: a full V8 source build needs lots of disk/RAM/time.
 # First run is exploratory — expect to tune disk cleanup, the LLVM version, and
 # the artifact path.
-name: "M1 libv8-rusty (library-TLS librusty_v8.a)"
+name: "libv8-rusty (library-TLS librusty_v8.a)"
 on:
   workflow_dispatch:
     inputs:
