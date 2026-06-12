@@ -73,16 +73,27 @@ module RustyRacer
 
     # Compile a classic <script>; returns a RustyRacer::Script to #run.
     # cached_data:/produce_cache: are the bytecode cache (see #compile_module).
-    def compile(source, filename: '<compile>', cached_data: nil, produce_cache: false)
-      _compile(source, filename, cached_data, produce_cache)
+    # eager: (see #compile_module).
+    def compile(source, filename: '<compile>', cached_data: nil, produce_cache: false, eager: false)
+      _compile(source, filename, cached_data, produce_cache, eager)
     end
 
     # Compile an ES module; returns a RustyRacer::Module to instantiate/evaluate.
     # cached_data: a binary bytecode cache to consume (skip reparse); the result
     # reports #cache_rejected? if stale. produce_cache: collect a fresh cache,
     # readable via Module#cached_data for cross-process reuse.
-    def compile_module(source, filename: '<compile_module>', cached_data: nil, produce_cache: false)
-      _compile_module(source, filename, cached_data, produce_cache)
+    #
+    # eager: (default false) compiles every function up front
+    # (CompileOptions::EagerCompile) instead of V8's default lazy top-level-only
+    # compile. It roughly doubles compile time and uses more memory, so it's only
+    # worth it when producing a cache to reuse. Ignored when cached_data: is given
+    # (V8 forbids consuming a cache and eager-compiling at once). NOTE: as of
+    # V8-150, create_code_cache at compile time still doesn't serialize the eager
+    # inner functions, so eager: alone doesn't change the cache yet — it's a
+    # forward-looking, semantically-correct switch. For a cache that DOES carry
+    # inner functions, run the script/module and call #create_code_cache.
+    def compile_module(source, filename: '<compile_module>', cached_data: nil, produce_cache: false, eager: false)
+      _compile_module(source, filename, cached_data, produce_cache, eager)
     end
   end
 

@@ -262,6 +262,10 @@ enum Request {
         cached_data: Option<Vec<u8>>,
         // Produce a fresh bytecode cache to hand back (Module#cached_data).
         produce_cache: bool,
+        // Eager-compile every function up front (CompileOptions::EagerCompile)
+        // instead of V8's default lazy top-level-only compile. Ignored when
+        // cached_data is set (V8 forbids ConsumeCodeCache + EagerCompile).
+        eager: bool,
         reply: Sender<VmReply>,
     },
     // instantiate: V8 walks imports, calling back to the Ruby resolve block
@@ -298,6 +302,7 @@ enum Request {
         filename: String,
         cached_data: Option<Vec<u8>>,
         produce_cache: bool,
+        eager: bool,
         reply: Sender<VmReply>,
     },
     // Bind the script to its context and run it; returns the completion value.
@@ -308,6 +313,19 @@ enum Request {
     },
     DisposeScript {
         script_id: i32,
+        reply: Sender<VmReply>,
+    },
+    // Serialize a bytecode cache from a compiled handle's CURRENT compile state
+    // (Script#create_code_cache / Module#create_code_cache). Called after run/
+    // evaluate, it captures the inner functions V8 lazily compiled while running
+    // — the only way (as of V8-150) to get inner-function bytecode into a cache,
+    // since create_code_cache at compile time only sees the top level.
+    ScriptCodeCache {
+        script_id: i32,
+        reply: Sender<VmReply>,
+    },
+    ModuleCodeCache {
+        module_id: i32,
         reply: Sender<VmReply>,
     },
     Dispose,
@@ -327,6 +345,9 @@ enum VmReply {
     // compile_module / compile's richer reply (id + produced cache + rejected).
     ModuleCompiled(Result<Compiled, VmError>),
     ScriptCompiled(Result<Compiled, VmError>),
+    // Script#/Module#create_code_cache: the serialized bytes, or None when V8
+    // can't produce a cache (or the handle's realm is gone).
+    CodeCache(Result<Option<Vec<u8>>, VmError>),
     // JS called host fn |id|; run the proc and send the answer back.
     Callback {
         host_fn_id: usize,
@@ -1033,6 +1054,30 @@ fn module_origin<'s>(scope: &v8::PinScope<'s, '_>, url: &str) -> v8::ScriptOrigi
     v8::ScriptOrigin::new(
         scope, name.into(), 0, 0, false, -1, None, false, false, /*is_module*/ true, None,
     )
+}
+
+// The (Source, CompileOptions) pair shared by the module and script compile
+// handlers: consume a supplied bytecode cache (skip reparse), else eager-compile
+// every function up front, else compile lazily (V8's default — only the top
+// level). A supplied cache wins over `eager`: V8's CompileOptionsIsValid forbids
+// ConsumeCodeCache + EagerCompile together, so `eager` is ignored on the consume
+// path. (Source is an owned struct — V8 copies the origin in — so returning it
+// across this fn boundary keeps the same handle-lifetime contract as inlining.)
+fn compile_source<'s>(
+    code: v8::Local<'s, v8::String>,
+    origin: &v8::ScriptOrigin<'s>,
+    cached_data: &Option<Vec<u8>>,
+    eager: bool,
+) -> (v8::script_compiler::Source, v8::script_compiler::CompileOptions) {
+    use v8::script_compiler::{CompileOptions, Source};
+    match cached_data {
+        Some(bytes) => (
+            Source::new_with_cached_data(code, Some(origin), v8::script_compiler::CachedData::new(bytes)),
+            CompileOptions::ConsumeCodeCache,
+        ),
+        None if eager => (Source::new(code, Some(origin)), CompileOptions::EagerCompile),
+        None => (Source::new(code, Some(origin)), CompileOptions::NoCompileOptions),
+    }
 }
 
 // Registry for the thin compile_module/instantiate API: each compiled module is
@@ -1780,6 +1825,8 @@ fn request_realm(request: &Request) -> Option<i32> {
         | Request::ModuleStatus { .. }
         | Request::DisposeModule { .. }
         | Request::DisposeScript { .. }
+        | Request::ScriptCodeCache { .. }
+        | Request::ModuleCodeCache { .. }
         | Request::Dispose => None,
     }
 }
@@ -2014,6 +2061,7 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 filename,
                 cached_data,
                 produce_cache,
+                eager,
                 reply,
             } => {
                 let outcome = match context_for(context_id) {
@@ -2026,22 +2074,11 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                         None => Err(VmError::Runtime("module source too large".into())),
                         Some(code) => {
                             let origin = module_origin(tc, &filename);
-                            // Consume a supplied bytecode cache (skip reparse) or
-                            // compile fresh.
-                            let (mut src, opts) = match &cached_data {
-                                Some(bytes) => (
-                                    v8::script_compiler::Source::new_with_cached_data(
-                                        code,
-                                        Some(&origin),
-                                        v8::script_compiler::CachedData::new(bytes),
-                                    ),
-                                    v8::script_compiler::CompileOptions::ConsumeCodeCache,
-                                ),
-                                None => (
-                                    v8::script_compiler::Source::new(code, Some(&origin)),
-                                    v8::script_compiler::CompileOptions::NoCompileOptions,
-                                ),
-                            };
+                            // Consume a supplied bytecode cache (skip reparse),
+                            // eager-compile every function, or compile fresh
+                            // (lazy). cached_data wins: V8 forbids combining
+                            // ConsumeCodeCache with EagerCompile.
+                            let (mut src, opts) = compile_source(code, &origin, &cached_data, eager);
                             let compiled = v8::script_compiler::compile_module2(
                                 tc,
                                 &mut src,
@@ -2323,6 +2360,7 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 filename,
                 cached_data,
                 produce_cache,
+                eager,
                 reply,
             } => {
                 let outcome = match context_for(context_id) {
@@ -2335,20 +2373,7 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                             None => Err(VmError::Runtime("script source too large".into())),
                             Some(code) => {
                                 let origin = script_origin(tc, &filename);
-                                let (mut src, opts) = match &cached_data {
-                                    Some(bytes) => (
-                                        v8::script_compiler::Source::new_with_cached_data(
-                                            code,
-                                            Some(&origin),
-                                            v8::script_compiler::CachedData::new(bytes),
-                                        ),
-                                        v8::script_compiler::CompileOptions::ConsumeCodeCache,
-                                    ),
-                                    None => (
-                                        v8::script_compiler::Source::new(code, Some(&origin)),
-                                        v8::script_compiler::CompileOptions::NoCompileOptions,
-                                    ),
-                                };
+                                let (mut src, opts) = compile_source(code, &origin, &cached_data, eager);
                                 match v8::script_compiler::compile_unbound_script(
                                     tc,
                                     &mut src,
@@ -2443,6 +2468,41 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                     s.borrow_mut().by_id.remove(&script_id);
                 });
                 let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
+            }
+            // Serialize the script's CURRENT compile state. The stored handle is
+            // the UnboundScript, which V8 fills in with inner-function bytecode as
+            // run() lazily compiles them — so calling this after run() captures
+            // the functions that actually executed (a warm cache). None when V8
+            // can't serialize, or when the realm was reset/disposed out from under
+            // the script (its handle is gone): produce nil, not an error.
+            Request::ScriptCodeCache { script_id, reply } => {
+                let outcome = match script_handle(script_id) {
+                    None => Ok(None),
+                    Some((g, _cid)) => {
+                        let unbound = v8::Local::new(scope, &g);
+                        Ok(unbound.create_code_cache().map(|c| c.to_vec()))
+                    }
+                };
+                let _ = reply.send(VmReply::CodeCache(outcome));
+            }
+            // Same, for a module: get_unbound_module_script gives the shared
+            // compiled script, which evaluate() fills with inner-function bytecode.
+            // It needs the module's context entered (unlike UnboundScript), so
+            // a gone realm yields nil.
+            Request::ModuleCodeCache { module_id, reply } => {
+                let outcome = match module_handle(module_id).and_then(|(g, cid)| {
+                    context_for(cid).map(|cx| (g, cx))
+                }) {
+                    None => Ok(None),
+                    Some((g, cx)) => {
+                        let context = v8::Local::new(scope, &cx);
+                        let scope = &mut v8::ContextScope::new(scope, context);
+                        let module = v8::Local::new(scope, &g);
+                        let unbound = module.get_unbound_module_script(scope);
+                        Ok(unbound.create_code_cache().map(|c| c.to_vec()))
+                    }
+                };
+                let _ = reply.send(VmReply::CodeCache(outcome));
             }
             // Shuts the main loop down. Never arrives at a nested servicing
             // site: Core::dispose bypasses dispatch and queues directly.
@@ -3067,8 +3127,11 @@ impl Core {
             match message {
                 Ok(VmReply::Done(Ok(val))) => return jsval_to_ruby(ruby, &val),
                 Ok(VmReply::Done(Err(e))) => return Err(vm_err(ruby, e)),
-                // compile_module / compile receive these directly, never via pump.
-                Ok(VmReply::ModuleCompiled(_)) | Ok(VmReply::ScriptCompiled(_)) => {
+                // compile_module / compile / create_code_cache receive these
+                // directly, never via pump.
+                Ok(VmReply::ModuleCompiled(_))
+                | Ok(VmReply::ScriptCompiled(_))
+                | Ok(VmReply::CodeCache(_)) => {
                     return Err(Error::new(
                         ruby.exception_runtime_error(),
                         "unexpected compile reply",
@@ -3402,6 +3465,7 @@ impl Core {
         filename: String,
         cached_data: Option<Vec<u8>>,
         produce_cache: bool,
+        eager: bool,
     ) -> Result<Compiled, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
         self.dispatch(
@@ -3412,6 +3476,7 @@ impl Core {
                 filename,
                 cached_data,
                 produce_cache,
+                eager,
                 reply: reply_tx,
             },
         )?;
@@ -3478,6 +3543,7 @@ impl Core {
         filename: String,
         cached_data: Option<Vec<u8>>,
         produce_cache: bool,
+        eager: bool,
     ) -> Result<Compiled, Error> {
         let (reply_tx, reply_rx) = channel::<VmReply>();
         self.dispatch(
@@ -3488,6 +3554,7 @@ impl Core {
                 filename,
                 cached_data,
                 produce_cache,
+                eager,
                 reply: reply_tx,
             },
         )?;
@@ -3518,6 +3585,22 @@ impl Core {
         let (reply_tx, reply_rx) = channel::<VmReply>();
         self.dispatch(ruby, Request::DisposeScript { script_id, reply: reply_tx })?;
         self.pump(ruby, reply_rx, None).map(|_| ())
+    }
+
+    // Serialize a fresh bytecode cache from a compiled handle's current state
+    // (Script#/Module#create_code_cache). Pure serialization — no host callbacks
+    // — so receive directly off the GVL like compile_script. None = V8 couldn't
+    // produce one (or the realm is gone).
+    fn script_code_cache(&self, ruby: &Ruby, script_id: i32) -> Result<Option<Vec<u8>>, Error> {
+        let (reply_tx, reply_rx) = channel::<VmReply>();
+        self.dispatch(ruby, Request::ScriptCodeCache { script_id, reply: reply_tx })?;
+        recv_code_cache(ruby, reply_rx)
+    }
+
+    fn module_code_cache(&self, ruby: &Ruby, module_id: i32) -> Result<Option<Vec<u8>>, Error> {
+        let (reply_tx, reply_rx) = channel::<VmReply>();
+        self.dispatch(ruby, Request::ModuleCodeCache { module_id, reply: reply_tx })?;
+        recv_code_cache(ruby, reply_rx)
     }
 
     fn set_dynamic_import_resolver(&self, proc: Proc) {
@@ -3669,12 +3752,13 @@ impl Context {
         filename: String,
         cached_data: Option<magnus::RString>,
         produce_cache: bool,
+        eager: bool,
     ) -> Result<JsModule, Error> {
         rb_self.check_live(ruby)?;
         let cache_in = binary_bytes(ruby, cached_data)?;
         let cm = rb_self
             .core
-            .compile_module(ruby, rb_self.id, source, filename, cache_in, produce_cache)?;
+            .compile_module(ruby, rb_self.id, source, filename, cache_in, produce_cache, eager)?;
         Ok(JsModule {
             core: rb_self.core.clone(),
             module_id: cm.id,
@@ -3683,8 +3767,8 @@ impl Context {
             cache_rejected: cm.cache_rejected,
         })
     }
-    // compile(source, filename:, cached_data:, produce_cache:) -> Script: a
-    // classic <script>. Same cache semantics as compile_module.
+    // compile(source, filename:, cached_data:, produce_cache:, eager:) -> Script:
+    // a classic <script>. Same cache semantics as compile_module.
     fn compile(
         ruby: &Ruby,
         rb_self: &Self,
@@ -3692,12 +3776,13 @@ impl Context {
         filename: String,
         cached_data: Option<magnus::RString>,
         produce_cache: bool,
+        eager: bool,
     ) -> Result<Script, Error> {
         rb_self.check_live(ruby)?;
         let cache_in = binary_bytes(ruby, cached_data)?;
         let cs = rb_self
             .core
-            .compile_script(ruby, rb_self.id, source, filename, cache_in, produce_cache)?;
+            .compile_script(ruby, rb_self.id, source, filename, cache_in, produce_cache, eager)?;
         Ok(Script {
             core: rb_self.core.clone(),
             script_id: cs.id,
@@ -3813,15 +3898,21 @@ impl JsModule {
     // The bytecode cache produced at compile (produce_cache: true), as a binary
     // String, or nil. Persist it cross-process and pass back via cached_data:.
     fn cached_data(ruby: &Ruby, rb_self: &Self) -> Value {
-        match &rb_self.cached_data {
-            Some(bytes) => ruby.str_from_slice(bytes).as_value(),
-            None => ruby.qnil().as_value(),
-        }
+        code_cache_value(ruby, rb_self.cached_data.as_ref())
     }
     // True if a cached_data: supplied at compile was stale/incompatible and V8
     // recompiled from source instead.
     fn cache_rejected(&self) -> bool {
         self.cache_rejected
+    }
+    // Serialize a bytecode cache from the module's CURRENT compile state, as a
+    // binary String (or nil if V8 can't). Called AFTER #evaluate it captures the
+    // inner functions V8 compiled while running — the warm-cache the compile-time
+    // produce_cache: can't include (see Script#create_code_cache).
+    fn create_code_cache(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        let bytes = rb_self.core.module_code_cache(ruby, rb_self.module_id)?;
+        Ok(code_cache_value(ruby, bytes.as_ref()))
     }
     fn dispose(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
         if rb_self.disposed.swap(true, Ordering::SeqCst) {
@@ -3849,13 +3940,20 @@ impl Script {
         rb_self.core.run_script(ruby, rb_self.script_id)
     }
     fn cached_data(ruby: &Ruby, rb_self: &Self) -> Value {
-        match &rb_self.cached_data {
-            Some(bytes) => ruby.str_from_slice(bytes).as_value(),
-            None => ruby.qnil().as_value(),
-        }
+        code_cache_value(ruby, rb_self.cached_data.as_ref())
     }
     fn cache_rejected(&self) -> bool {
         self.cache_rejected
+    }
+    // Serialize a bytecode cache from the script's CURRENT compile state, as a
+    // binary String (or nil if V8 can't). Unlike compile(produce_cache: true) —
+    // which caches only the top level, since V8 compiles inner functions lazily —
+    // calling this AFTER #run captures the inner functions that actually ran, the
+    // same warm-cache a browser keeps. Persist it and feed it back via cached_data:.
+    fn create_code_cache(ruby: &Ruby, rb_self: &Self) -> Result<Value, Error> {
+        rb_self.check_live(ruby)?;
+        let bytes = rb_self.core.script_code_cache(ruby, rb_self.script_id)?;
+        Ok(code_cache_value(ruby, bytes.as_ref()))
     }
     fn dispose(ruby: &Ruby, rb_self: &Self) -> Result<(), Error> {
         if rb_self.disposed.swap(true, Ordering::SeqCst) {
@@ -3866,6 +3964,28 @@ impl Script {
     }
     fn disposed(&self) -> bool {
         self.disposed.load(Ordering::SeqCst)
+    }
+}
+
+// A bytecode cache as a binary (ASCII-8BIT) Ruby String, or nil when there's
+// none — the shared return shape of #cached_data and #create_code_cache.
+fn code_cache_value(ruby: &Ruby, bytes: Option<&Vec<u8>>) -> Value {
+    match bytes {
+        Some(b) => ruby.str_from_slice(b).as_value(),
+        None => ruby.qnil().as_value(),
+    }
+}
+
+// Await a ScriptCodeCache/ModuleCodeCache reply off the GVL (it runs no JS, so
+// no host callbacks to service — a direct recv, not pump).
+fn recv_code_cache(ruby: &Ruby, reply_rx: Receiver<VmReply>) -> Result<Option<Vec<u8>>, Error> {
+    match without_gvl(|| reply_rx.recv()) {
+        Ok(VmReply::CodeCache(Ok(bytes))) => Ok(bytes),
+        Ok(VmReply::CodeCache(Err(e))) => Err(vm_err(ruby, e)),
+        _ => Err(Error::new(
+            ruby.exception_runtime_error(),
+            "V8 thread went away mid-cache",
+        )),
     }
 }
 
@@ -4387,8 +4507,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     context.define_method("reset", method!(Context::reset, 0))?;
     context.define_method("id", method!(Context::id, 0))?;
     // keyword-arg wrappers Context#compile_module / #compile (source, ...) in lib.
-    context.define_method("_compile_module", method!(Context::compile_module, 4))?;
-    context.define_method("_compile", method!(Context::compile, 4))?;
+    context.define_method("_compile_module", method!(Context::compile_module, 5))?;
+    context.define_method("_compile", method!(Context::compile, 5))?;
     context.define_method("dispose", method!(Context::dispose, 0))?;
     context.define_method("disposed?", method!(Context::disposed, 0))?;
 
@@ -4397,6 +4517,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     script.define_method("run", method!(Script::run, 0))?;
     script.define_method("cached_data", method!(Script::cached_data, 0))?;
     script.define_method("cache_rejected?", method!(Script::cache_rejected, 0))?;
+    script.define_method("create_code_cache", method!(Script::create_code_cache, 0))?;
     script.define_method("dispose", method!(Script::dispose, 0))?;
     script.define_method("disposed?", method!(Script::disposed, 0))?;
 
@@ -4416,6 +4537,7 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
     jsmodule.define_method("_status", method!(JsModule::status, 0))?;
     jsmodule.define_method("cached_data", method!(JsModule::cached_data, 0))?;
     jsmodule.define_method("cache_rejected?", method!(JsModule::cache_rejected, 0))?;
+    jsmodule.define_method("create_code_cache", method!(JsModule::create_code_cache, 0))?;
     jsmodule.define_method("dispose", method!(JsModule::dispose, 0))?;
     jsmodule.define_method("disposed?", method!(JsModule::disposed, 0))?;
 

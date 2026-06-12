@@ -48,6 +48,71 @@ class RustyRacerTest < Minitest::Test
     assert_equal 3, s.run
   end
 
+  def test_script_create_code_cache_captures_inner_functions_after_run
+    # compile-time produce_cache only sees the lazily-compiled top level. Running
+    # the script compiles the inner functions that execute; create_code_cache
+    # after run serializes them too -- a warm cache, like a browser keeps.
+    src = <<~JS
+      function add(a, b) { return a + b }
+      function mul(a, b) { return a * b }
+      globalThis.RESULT = (() => { let s = 0; for (let i = 0; i < 5; i++) s = add(s, mul(i, 2)); return s })()
+    JS
+    s = @ctx.compile(src, filename: '/c.js', produce_cache: true)
+    cold = s.create_code_cache
+    assert_equal Encoding::ASCII_8BIT, cold.encoding
+    assert_equal s.cached_data.bytesize, cold.bytesize # both top-level only
+
+    assert_equal 20, s.run
+    warm = s.create_code_cache
+    assert_operator warm.bytesize, :>, cold.bytesize # inner functions now included
+
+    # the warm cache is a valid input cache: accepted (not rejected) and runs.
+    s2 = RustyRacer::Isolate.new.context.compile(src, filename: '/c.js', cached_data: warm)
+    assert_equal false, s2.cache_rejected?
+    assert_equal 20, s2.run
+  end
+
+  def test_script_create_code_cache_raises_after_dispose
+    s = @ctx.compile('1')
+    s.dispose
+    assert_raises(::RuntimeError) { s.create_code_cache }
+  end
+
+  def test_create_code_cache_is_nil_when_the_realm_is_gone
+    # reset clears the script's compiled handle from the realm's registry. The
+    # Ruby Script is still live (not disposed), but there's nothing to serialize,
+    # so create_code_cache reports nil rather than raising.
+    s = @ctx.compile('function f(){ return 1 }; f()')
+    s.run
+    @ctx.reset
+    assert_nil s.create_code_cache
+  end
+
+  def test_eager_compile_runs_and_is_ignored_when_consuming_a_cache
+    # eager compiles every function up front; it still runs identically.
+    assert_equal 1, @ctx.compile('function f(){ return 1 }; f()', eager: true).run
+    assert_instance_of RustyRacer::Module, @ctx.compile_module('export const x = 1', eager: true)
+
+    # eager is incompatible with consuming a cache (V8 forbids the combo); when
+    # cached_data: is given, eager is ignored rather than erroring or rejecting.
+    blob = @ctx.compile('1 + 2', produce_cache: true).cached_data
+    s = @ctx.compile('1 + 2', cached_data: blob, eager: true)
+    assert_equal false, s.cache_rejected?
+    assert_equal 3, s.run
+  end
+
+  def test_eager_does_not_change_the_compile_time_cache_on_v8_150
+    # Pins the documented V8-150 behaviour: create_code_cache at COMPILE time
+    # doesn't serialize eager-compiled inner functions, so eager: produces a
+    # byte-identical compile-time cache. This is expected to start FAILING when a
+    # future V8 does serialize them — at which point eager: stops being a no-op
+    # for produce_cache: and the docs/comments need revisiting.
+    src = 'function a(){ return 1 }; function b(){ return 2 }; a() + b()'
+    plain = @ctx.compile(src, filename: '/e.js', produce_cache: true).cached_data
+    eager = @ctx.compile(src, filename: '/e.js', produce_cache: true, eager: true).cached_data
+    assert_equal plain.bytesize, eager.bytesize
+  end
+
   def test_classic_script_run_honours_timeout
     iso = RustyRacer::Isolate.new(timeout_ms: 50)
     s = iso.context.compile("for(;;){}", filename: "/spin.js")
@@ -1061,6 +1126,49 @@ class RustyRacerTest < Minitest::Test
     m = @ctx.compile_module("export const x = 1;")
     assert_nil m.cached_data
     assert_equal false, m.cache_rejected?
+  end
+
+  def test_module_create_code_cache_captures_inner_functions_after_evaluate
+    # As with Script#create_code_cache: evaluate compiles the inner functions
+    # that run, so create_code_cache after evaluate carries more than the
+    # compile-time top-level-only cache.
+    src = <<~JS
+      function add(a, b) { return a + b }
+      function mul(a, b) { return a * b }
+      export const result = (() => { let s = 0; for (let i = 0; i < 5; i++) s = add(s, mul(i, 2)); return s })()
+    JS
+    m = @ctx.compile_module(src, filename: '/m.js', produce_cache: true)
+    m.instantiate {|_s, _r| nil }
+    cold = m.create_code_cache
+    assert_equal Encoding::ASCII_8BIT, cold.encoding
+
+    m.evaluate
+    warm = m.create_code_cache
+    assert_operator warm.bytesize, :>, cold.bytesize
+
+    ctx2 = RustyRacer::Isolate.new.context
+    m2 = ctx2.compile_module(src, filename: '/m.js', cached_data: warm)
+    assert_equal false, m2.cache_rejected?
+    m2.instantiate {|_s, _r| nil }
+    m2.evaluate
+    assert_equal 20, m2.namespace['result']
+  end
+
+  def test_module_create_code_cache_raises_after_dispose
+    m = @ctx.compile_module('export const x = 1;')
+    m.dispose
+    assert_raises(::RuntimeError) { m.create_code_cache }
+  end
+
+  def test_create_code_cache_on_an_errored_module_is_safe
+    # A module that threw at evaluate is :errored, but its compiled top-level
+    # script still exists — create_code_cache serializes that rather than
+    # aborting the process (get_unbound_module_script is status-independent).
+    m = @ctx.compile_module('throw new Error("boom"); export const x = 1;', filename: '/err.js')
+    m.instantiate {|_s, _r| nil }
+    assert_raises(RustyRacer::RuntimeError) { m.evaluate }
+    assert_equal :errored, m.status
+    refute_nil m.create_code_cache
   end
 
   def test_module_status_follows_the_lifecycle

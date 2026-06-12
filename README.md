@@ -53,6 +53,12 @@ app.namespace["r"]                       # => 42
 # Bytecode cache for cross-process boot:
 blob = ctx.compile_module(src, produce_cache: true).cached_data
 iso2.context.compile_module(src, cached_data: blob)   # skips reparse
+
+# Warm cache: run/evaluate first, then create_code_cache picks up the inner
+# functions V8 compiled while running (produce_cache only sees the top level).
+s = ctx.compile(src, filename: "/app.js")
+s.run
+warm = s.create_code_cache                            # includes hot inner fns
 ```
 
 Also: `Snapshot` (startup blobs), `Isolate#create_context` (an extra realm —
