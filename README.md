@@ -4,8 +4,10 @@ Embed [V8](https://v8.dev/) in Ruby, built on [rusty_v8](https://crates.io/crate
 (the `v8` crate) and [Magnus](https://github.com/matsadler/magnus) via
 [rb-sys](https://github.com/oxidize-rb/rb-sys).
 
-> Early and experimental — the API still moves. A dedicated V8 thread per
-> `Context`, with Ruby threads rendezvousing over channels.
+> Early and experimental — the API still moves. Each `Isolate` runs V8 in-thread
+> on the Ruby thread that created it (the GVL is released around the JS run), and
+> is **thread-confined**: every operation must happen on that owner thread, or it
+> raises. `Isolate#terminate` is the exception — it is safe from any thread.
 
 ## What it can do
 
