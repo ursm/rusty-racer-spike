@@ -1130,7 +1130,6 @@ const REALM_ID_SLOT: i32 = 0;
 // `istate(scope)`, so it's automatically per-isolate with no thread-local
 // keying. Accessed in SHORT bursts (never held across a JS run) so a re-entrant
 // host callback can borrow it again — same discipline the old thread_locals had.
-#[allow(dead_code)]
 struct IsolateState {
     realms: V8State,
     modules: ModuleReg,
@@ -1158,7 +1157,6 @@ struct IsolateState {
     watchdog: Arc<WatchdogShared>,
 }
 
-#[allow(dead_code)]
 impl IsolateState {
     fn new(host_namespace: Option<String>, auto_microtasks: bool) -> Self {
         IsolateState {
@@ -1215,7 +1213,6 @@ fn isolates() -> &'static Mutex<HashMap<u32, SendIso>> {
     ISOLATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-#[allow(dead_code)]
 static NEXT_ISOLATE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 // Run a microtask checkpoint with DRAINING set (nesting-safe via save/restore),
@@ -3071,11 +3068,12 @@ impl Core {
     // so other Ruby threads proceed and a host callback can reacquire the GVL
     // (with_gvl) to run its proc. The reply is service_request's return value
     // (no channel). Asserts the owner thread (a foreign-thread use would SEGV).
-    fn run(&self, ruby: &Ruby, request: Request) -> Result<VmReply, Error> {
-        // Bind by the RUBY thread, not the native one: Ruby's M:N scheduler can
-        // run one Ruby thread on different native threads over time, so a native
-        // ThreadId is unstable. A different Ruby thread, though, means concurrent
-        // use of a !Locker isolate — refuse it.
+    // Refuse an op that must not touch the isolate: from a foreign Ruby thread
+    // (M:N moves a Ruby thread across native threads, so we bind by the RUBY
+    // thread, not a native ThreadId — a different Ruby thread means concurrent
+    // use of a !Locker isolate) or after disposal. Callers that reach the
+    // isolate (slot or scope) MUST pass this first.
+    fn ensure_owner_and_live(&self, ruby: &Ruby) -> Result<(), Error> {
         if current_ruby_thread() != self.owner {
             return Err(Error::new(
                 ruby.exception_runtime_error(),
@@ -3085,6 +3083,11 @@ impl Core {
         if self.shared.lock().unwrap().disposed {
             return Err(Error::new(ruby.exception_runtime_error(), "disposed context"));
         }
+        Ok(())
+    }
+
+    fn run(&self, ruby: &Ruby, request: Request) -> Result<VmReply, Error> {
+        self.ensure_owner_and_live(ruby)?;
         let iso = self.iso_ptr.0;
         let depth = self.depth.fetch_add(1, Ordering::SeqCst);
         // EVERYTHING that touches V8 — enter, the scope, the JS run, the scope
@@ -3322,38 +3325,43 @@ impl Core {
         }
     }
 
-    // Park (or clear) Module#instantiate's resolve block in the slot so
-    // resolve_imported — a V8 callback with only a scope — can find it during
-    // linking. Setting also clears any stale resolver error. Pure slot access,
-    // no V8 handles, so reach it through the raw isolate ptr directly.
-    fn set_instantiate_resolve(&self, resolve: Option<Proc>) {
-        let st = unsafe { &mut *self.iso_ptr.0 }
-            .get_slot_mut::<IsolateState>()
-            .expect("IsolateState missing from isolate slot");
-        st.instantiate_resolve = resolve.map(|p| RootedProc(BoxValue::new(p)));
-        st.instantiate_resolve_err = None;
-    }
-
-    fn take_instantiate_resolve_err(&self) -> Option<Exception> {
-        unsafe { &mut *self.iso_ptr.0 }
-            .get_slot_mut::<IsolateState>()
-            .expect("IsolateState missing from isolate slot")
-            .instantiate_resolve_err
-            .take()
-            .map(|b| *b)
+    // Atomically swap the slot's parked instantiate resolve block + stashed
+    // resolver error, returning the previous pair. instantiate_module SAVES the
+    // outer pair and RESTORES it afterwards, so a re-entrant instantiate (issued
+    // from inside a resolve block) can't clobber the outer op's parked resolver.
+    // Pure slot access (no V8 handles), reached through the raw isolate ptr — so
+    // the caller MUST have passed ensure_owner_and_live first (iso_ptr would
+    // otherwise dangle after dispose).
+    #[allow(clippy::type_complexity)]
+    fn swap_instantiate(
+        &self,
+        resolve: Option<RootedProc>,
+        err: Option<BoxValue<Exception>>,
+    ) -> (Option<RootedProc>, Option<BoxValue<Exception>>) {
+        let st = istate!(unsafe { &mut *self.iso_ptr.0 });
+        (
+            std::mem::replace(&mut st.instantiate_resolve, resolve),
+            std::mem::replace(&mut st.instantiate_resolve_err, err),
+        )
     }
 
     // instantiate parks the resolve block in the slot so resolve_imported can ask
     // it per import edge (it may compile a dependency lazily — a re-entrant op
-    // that just recurses into run). Cleared afterwards, success or failure. A
-    // resolver that RAISED is re-raised here with its original class.
+    // that just recurses into run). A resolver that RAISED is re-raised here with
+    // its original class.
     fn instantiate_module(&self, ruby: &Ruby, module_id: i32, resolve: Proc) -> Result<Value, Error> {
-        self.set_instantiate_resolve(Some(resolve));
+        // Guard BEFORE touching the slot via iso_ptr: a foreign-thread or
+        // post-dispose call must be refused, not deref a freed/foreign isolate.
+        self.ensure_owner_and_live(ruby)?;
+        // Park ours, saving the outer op's pair to restore after (re-entrant
+        // instantiate safety).
+        let (saved_resolve, saved_err) =
+            self.swap_instantiate(Some(RootedProc(BoxValue::new(resolve))), None);
         let reply = self.run(ruby, Request::InstantiateModule { module_id });
-        let resolver_err = self.take_instantiate_resolve_err();
-        self.set_instantiate_resolve(None);
+        // Reclaim THIS op's resolver error and restore the outer op's pair.
+        let (_, resolver_err) = self.swap_instantiate(saved_resolve, saved_err);
         if let Some(exc) = resolver_err {
-            return Err(Error::from(exc));
+            return Err(Error::from(*exc));
         }
         Self::reply_value(ruby, reply?)
     }
@@ -3381,7 +3389,7 @@ impl Core {
         Self::reply_value(ruby, reply).map(|_| ())
     }
 
-    // Classic script: compile (no host callbacks -> direct recv), run, dispose.
+    // Classic script: compile, run, dispose.
     fn compile_script(
         &self,
         ruby: &Ruby,
@@ -3424,9 +3432,8 @@ impl Core {
     }
 
     // Serialize a fresh bytecode cache from a compiled handle's current state
-    // (Script#/Module#create_code_cache). Pure serialization — no host callbacks
-    // — so receive directly off the GVL like compile_script. None = V8 couldn't
-    // produce one (or the realm is gone).
+    // (Script#/Module#create_code_cache). None = V8 couldn't produce one (or the
+    // realm is gone).
     fn script_code_cache(&self, ruby: &Ruby, script_id: i32) -> Result<Option<Vec<u8>>, Error> {
         let reply = self.run(ruby, Request::ScriptCodeCache { script_id })?;
         code_cache_from_reply(ruby, reply)
@@ -3454,12 +3461,23 @@ impl Core {
         self.shared.lock().unwrap().disposed
     }
 
-    // Owner-thread isolate teardown: release GC roots, clear the slot's Globals,
-    // stop + join the watchdog, then drop the OwnedIsolate (which disposes V8).
-    // Order matters — every v8::Global must die before the isolate, and the
-    // watchdog (which holds the isolate handle) must be joined before the isolate
-    // drops so no late TerminateExecution lands. Caller has set `disposed`.
+    // Owner-thread isolate teardown: stop + join the watchdog FIRST (so no late
+    // TerminateExecution can land on the isolate while we clear and drop it),
+    // then enter the isolate, release GC roots + the slot's Globals (every
+    // v8::Global must die before the isolate, and dropping one needs the isolate
+    // entered), then drop the OwnedIsolate (which disposes V8). Caller has set
+    // `disposed`.
     fn teardown(&self) {
+        // Stop + join the watchdog before we touch the isolate, so its handle
+        // can't fire a terminate into an isolate we're mid-disposing.
+        {
+            let mut inner = self.watchdog.inner.lock().unwrap();
+            inner.shutdown = true;
+        }
+        self.watchdog.cv.notify_one();
+        if let Some(join) = self.watchdog_join.lock().unwrap().take() {
+            let _ = join.join();
+        }
         // ENTER the isolate so it is the current one: dropping v8::Globals needs
         // it entered, and OwnedIsolate's Drop asserts `self == GetCurrent()`
         // (then exits). Between ops the isolate is exited, so we must enter here.
@@ -3471,21 +3489,11 @@ impl Core {
         }
         *self.dynamic_import_resolver.lock().unwrap() = None;
         {
-            let st = unsafe { &mut *self.iso_ptr.0 }
-                .get_slot_mut::<IsolateState>()
-                .expect("IsolateState missing from isolate slot");
+            let st = istate!(unsafe { &mut *self.iso_ptr.0 });
             st.realms = V8State::default();
             st.modules = ModuleReg::default();
             st.scripts = ScriptReg::default();
             st.instantiate_resolve = None;
-        }
-        {
-            let mut inner = self.watchdog.inner.lock().unwrap();
-            inner.shutdown = true;
-        }
-        self.watchdog.cv.notify_one();
-        if let Some(join) = self.watchdog_join.lock().unwrap().take() {
-            let _ = join.join();
         }
         // Remove (and drop) the OwnedIsolate — V8 disposal runs here — AFTER the
         // watchdog joined and the Globals were cleared, while the isolate is
@@ -3775,7 +3783,11 @@ impl Snapshot {
 
 impl JsModule {
     fn check_live(&self, ruby: &Ruby) -> Result<(), Error> {
-        if self.disposed.load(Ordering::SeqCst) {
+        // Also refuse once the ISOLATE is disposed: the module's own flag stays
+        // false, but the isolate (and the slot instantiate touches via iso_ptr
+        // before run's guard) is gone — without this, instantiate after
+        // iso.dispose is a use-after-free.
+        if self.disposed.load(Ordering::SeqCst) || self.core.is_disposed() {
             return Err(Error::new(ruby.exception_runtime_error(), "disposed module"));
         }
         Ok(())
@@ -3833,7 +3845,8 @@ impl JsModule {
 
 impl Script {
     fn check_live(&self, ruby: &Ruby) -> Result<(), Error> {
-        if self.disposed.load(Ordering::SeqCst) {
+        // Also refuse once the isolate is disposed (see JsModule::check_live).
+        if self.disposed.load(Ordering::SeqCst) || self.core.is_disposed() {
             return Err(Error::new(ruby.exception_runtime_error(), "disposed script"));
         }
         Ok(())
@@ -3881,8 +3894,7 @@ fn code_cache_value(ruby: &Ruby, bytes: Option<&Vec<u8>>) -> Value {
     }
 }
 
-// Await a ScriptCodeCache/ModuleCodeCache reply off the GVL (it runs no JS, so
-// no host callbacks to service — a direct recv, not pump).
+// Map a ScriptCodeCache/ModuleCodeCache reply to its serialized bytes.
 fn code_cache_from_reply(ruby: &Ruby, reply: VmReply) -> Result<Option<Vec<u8>>, Error> {
     match reply {
         VmReply::CodeCache(Ok(bytes)) => Ok(bytes),
@@ -3940,7 +3952,7 @@ fn js_runtime_error(ruby: &Ruby, message: String, backtrace: Vec<String>) -> Err
         Err(e) => return e,
     };
     // Always set it (even to []) so an empty/absent JS stack doesn't let Ruby
-    // backfill the backtrace with host-side (pump/magnus) frames.
+    // backfill the backtrace with host-side (magnus) frames.
     let _ = exc.funcall::<_, _, Value>("set_backtrace", (backtrace,));
     match magnus::Exception::from_value(exc) {
         Some(e) => Error::from(e),

@@ -927,6 +927,46 @@ class RustyRacerTest < Minitest::Test
     assert_raises(TypeError) { app.instantiate { |_s, _r| 42 } }
   end
 
+  def test_instantiate_after_isolate_dispose_raises_not_crashes
+    # instantiate reaches the isolate slot via iso_ptr BEFORE the run() guard; a
+    # post-dispose instantiate must raise (the module's own flag stays live), not
+    # use-after-free the dropped isolate.
+    iso = RustyRacer::Isolate.new
+    m = iso.context.compile_module('export const x = 1;', filename: '/m.js')
+    iso.dispose
+    e = assert_raises(::RuntimeError) { m.instantiate { |_s, _r| nil } }
+    assert_includes e.message, 'disposed'
+  end
+
+  def test_reentrant_instantiate_does_not_clobber_outer_resolver
+    # A resolve block that itself issues a (refused) nested instantiate must not
+    # wipe the OUTER instantiate's parked resolver, or the outer's remaining
+    # import edges would silently fail to resolve.
+    dep_a = @ctx.compile_module('export const a = 1;', filename: '/a.js')
+    dep_b = @ctx.compile_module('export const b = 2;', filename: '/b.js')
+    extra = @ctx.compile_module('export const e = 9;', filename: '/e.js')
+    app = @ctx.compile_module(
+      'import {a} from "./a.js"; import {b} from "./b.js"; export const r = a + b;',
+      filename: '/app.js'
+    )
+    app.instantiate do |spec, _ref|
+      if spec == './a.js'
+        # nested instantiate is refused (not re-entrant); rescued, must not
+        # clobber the outer op's parked resolver.
+        begin
+          extra.instantiate { |_s, _r| nil }
+        rescue RustyRacer::RuntimeError
+          nil
+        end
+        dep_a
+      else
+        dep_b
+      end
+    end
+    app.evaluate
+    assert_equal 3, app.namespace['r']
+  end
+
   def test_dynamic_import_resolves_to_a_loaded_module
     # explicit mode keeps the import() continuation pending until drained
     iso = RustyRacer::Isolate.new(microtasks: :explicit)
