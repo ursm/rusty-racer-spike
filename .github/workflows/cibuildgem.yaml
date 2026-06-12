@@ -43,10 +43,13 @@ jobs:
       - uses: "actions/checkout@v5"
       - name: "On a tag push, the tag must equal lib/rusty_racer/version.rb"
         run: |
+          set -euo pipefail
           if [ "${{ github.ref_type }}" != "tag" ]; then
             echo "not a tag push — nothing to check"; exit 0
           fi
-          version=$(grep -oP 'VERSION\s*=\s*"\K[^"]+' lib/rusty_racer/version.rb)
+          # Read the constant itself (quote-agnostic, single source of truth)
+          # rather than grepping the literal — the gem's style may switch quotes.
+          version=$(ruby -Ilib -e 'require "rusty_racer/version"; print RustyRacer::VERSION')
           tag="${GITHUB_REF_NAME#v}"
           if [ "$version" != "$tag" ]; then
             echo "::error::tag v$tag != gem version $version — bump lib/rusty_racer/version.rb or retag"
@@ -168,13 +171,22 @@ jobs:
   release:
     name: "Release the gem on RubyGems"
     needs: install
+    # Never publish two runs concurrently (two tags pushed back-to-back, or a tag
+    # racing a manual dispatch): serialize the publish, don't cancel the first.
+    concurrency:
+      group: "rubygems-release"
+      cancel-in-progress: false
     # Publish on a vX.Y.Z tag push, or on a manual dispatch that ticked release.
+    # Gate on the EVENT, not github.ref_type: a workflow_dispatch launched from a
+    # tag ref also has ref_type == 'tag', which would publish even with
+    # release: false. The push trigger is tag-only (see `on:`), so event_name ==
+    # 'push' means exactly "a vX.Y.Z tag was pushed".
     # Gated behind the whole build passing: the compile/test/install needs-chain
     # is intentionally all-or-nothing — a `needs` on a matrix job requires EVERY
     # leg to succeed, so if any platform fails we publish nothing (a release
     # should ship all platforms together, not a partial set). fail-fast: false
     # still lets every leg run so we see which platform failed before re-running.
-    if: ${{ github.ref_type == 'tag' || inputs.release }}
+    if: ${{ github.event_name == 'push' || inputs.release }}
     # Trusted publishing: cibuildgem's release step runs
     # rubygems/configure-rubygems-credentials (OIDC) + `cibuildgem release`, so
     # the job needs id-token: write. `environment: release` matches the RubyGems
