@@ -40,7 +40,7 @@ jobs:
     name: "Tag matches the gem version"
     runs-on: "ubuntu-22.04"
     steps:
-      - uses: "actions/checkout@v5"
+      - uses: "actions/checkout@v6"
       - name: "On a tag push, the tag must equal lib/rusty_racer/version.rb"
         run: |
           set -euo pipefail
@@ -67,7 +67,7 @@ jobs:
     runs-on: "${{ matrix.os }}"
     steps:
       - name: "Checkout code"
-        uses: "actions/checkout@v5"
+        uses: "actions/checkout@v6"
       - name: "Point at the prebuilt library-TLS V8 (linux only)"
         # macOS links Deno's stock prebuilt rusty_v8 (no archive). Only linux
         # needs our custom library-TLS archive, so set it here (per-arch, derived
@@ -108,7 +108,7 @@ jobs:
     runs-on: "${{ matrix.os }}"
     steps:
       - name: "Checkout code"
-        uses: "actions/checkout@v5"
+        uses: "actions/checkout@v6"
       - name: "Point at the prebuilt library-TLS V8 (linux only)"
         # test_native recompiles the extension, so it links V8 too (like compile).
         # The compile job already verified the asset exists this run. KEEP THIS
