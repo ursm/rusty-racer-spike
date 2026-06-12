@@ -1172,6 +1172,92 @@ thread_local! {
     static DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
+// ---------------------------------------------------------------------------
+// In-thread execution (replaces the dedicated-V8-thread + channel model)
+// ---------------------------------------------------------------------------
+//
+// Everything the old design kept in per-V8-thread thread_locals (above) now
+// lives in ONE struct stored in the isolate's embedder slot
+// (isolate.set_slot/get_slot). Any function holding a scope reaches it via
+// `istate(scope)`, so it's automatically per-isolate with no thread-local
+// keying. Accessed in SHORT bursts (never held across a JS run) so a re-entrant
+// host callback can borrow it again — same discipline the old thread_locals had.
+#[allow(dead_code)]
+struct IsolateState {
+    realms: V8State,
+    modules: ModuleReg,
+    scripts: ScriptReg,
+    // The host-fn registry — no longer a Mutex: one isolate is driven by one
+    // (owning) thread, so there's no cross-thread contention to guard.
+    procs: ProcTable,
+    dynamic_import_resolver: Option<RootedProc>,
+    active_realms: Vec<i32>,
+    instantiating: bool,
+    watchdog_fired: bool,
+    auto_microtasks: bool,
+    draining: bool,
+    default_timeout_ms: u64,
+    // Reentry-depth: 0 at a top-level op; >0 while a host callback is on the V8
+    // stack (a nested op then bootstraps its scope via callback_scope! instead of
+    // re-borrowing the OwnedIsolate, which is already borrowed by the outer run).
+    depth: u32,
+    watchdog: Arc<WatchdogShared>,
+}
+
+#[allow(dead_code)]
+impl IsolateState {
+    fn new(host_namespace: Option<String>, default_timeout_ms: u64, auto_microtasks: bool) -> Self {
+        IsolateState {
+            realms: V8State {
+                host_namespace,
+                next_context_id: 1,
+                ..V8State::default()
+            },
+            modules: ModuleReg::default(),
+            scripts: ScriptReg::default(),
+            procs: ProcTable::default(),
+            dynamic_import_resolver: None,
+            active_realms: Vec::new(),
+            instantiating: false,
+            watchdog_fired: false,
+            auto_microtasks,
+            draining: false,
+            default_timeout_ms,
+            depth: 0,
+            watchdog: Arc::new(WatchdogShared {
+                inner: Mutex::new(WatchdogInner {
+                    frames: Vec::new(),
+                    next_generation: 0,
+                    fired_generation: None,
+                    shutdown: false,
+                }),
+                cv: Condvar::new(),
+            }),
+        }
+    }
+}
+
+// The IsolateState parked in `scope`'s isolate slot. Panics if absent — every
+// isolate the binding makes installs one at creation, so a miss is a binding bug.
+#[allow(dead_code)]
+fn istate<'a>(scope: &'a mut v8::PinScope<'_, '_>) -> &'a mut IsolateState {
+    scope
+        .get_slot_mut::<IsolateState>()
+        .expect("IsolateState missing from isolate slot")
+}
+
+// The owning thread's live OwnedIsolates, keyed by id. This is the ONLY piece
+// that must stay thread-local: OwnedIsolate is !Send and is needed by-&mut to
+// open a top-level scope, so it can't live in the (Send) magnus wrapper. The
+// wrapper holds just the id + owner ThreadId and asserts owner == current on
+// every op, so a cross-thread use raises instead of corrupting V8 (see i-c).
+thread_local! {
+    #[allow(clippy::type_complexity)]
+    static ISOLATES: RefCell<HashMap<u32, v8::OwnedIsolate>> = RefCell::new(HashMap::new());
+}
+
+static NEXT_ISOLATE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
 // Run a microtask checkpoint with DRAINING set (nesting-safe via save/restore),
 // so a nested Reset/DisposeContext issued by a drained microtask is refused.
 fn checkpoint_draining(scope: &mut v8::PinScope<'_, '_>) {
