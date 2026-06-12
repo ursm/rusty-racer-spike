@@ -1388,18 +1388,14 @@ class RustyRacerTest < Minitest::Test
   end
 
   def test_reset_releases_attached_proc_roots
-    ref = attach_capturing_proc(@ctx)
-    @ctx.reset
+    ref = capture_released_by { |_iso, ctx| ctx.reset }
     GC.start
     GC.start
     refute ref.weakref_alive?, 'reset left the attached proc (and its captures) GC-rooted'
   end
 
   def test_dispose_releases_attached_proc_roots
-    iso = RustyRacer::Isolate.new
-    ctx = iso.context
-    ref = attach_capturing_proc(ctx)
-    iso.dispose
+    ref = capture_released_by { |iso, _ctx| iso.dispose }
     GC.start
     GC.start
     refute ref.weakref_alive?, 'dispose left the attached proc (and its captures) GC-rooted'
@@ -1737,32 +1733,44 @@ class RustyRacerTest < Minitest::Test
 
   private
 
-  # Invoke ctx.call(name) on a worker thread with a deadline, so a re-entrancy
-  # deadlock fails the test instead of hanging the suite.
+  # An isolate is thread-confined: every op must run on the thread that created
+  # it. These re-entrancy/timeout tests therefore run the op on the OWNER (test)
+  # thread directly — re-entrancy is a plain Rust call stack now and can't
+  # deadlock the way the old dedicated-V8-thread + channel model could, and a
+  # runaway loop is bounded by the watchdog (which terminates from its own
+  # thread). InlineRun keeps the existing `t = deadline_thread { ... }; t.join;
+  # t.value` call sites working without spawning a (forbidden) worker thread.
+  InlineRun = Struct.new(:ok, :val) do
+    def join(_timeout = nil) = true
+    def value = ok ? val : raise(val)
+  end
+
   def call_with_deadline(ctx, name)
-    t = deadline_thread { ctx.call(name) }
-    flunk "#{name} deadlocked (nested op not serviced re-entrantly)" unless t.join(10)
-    t.value
+    ctx.call(name)
   end
 
-  # A worker thread whose (sometimes intentional) exception is re-raised at
-  # join/value rather than spammed to stderr.
   def deadline_thread(&block)
-    t = Thread.new(&block)
-    t.report_on_exception = false
-    t
+    InlineRun.new(true, block.call)
+  rescue Exception => e # rubocop:disable Lint/RescueException
+    InlineRun.new(false, e)
   end
 
-  # Attach a proc capturing a fresh object and return a WeakRef to the
-  # capture. Runs on a throwaway thread so no stack residue on the test
-  # thread keeps the object conservatively alive — after the attach, the
-  # extension's GC root must be the ONLY thing keeping it.
-  def attach_capturing_proc(ctx)
+  # Run an isolate's whole lifecycle — create, attach a proc capturing a fresh
+  # object, then |op| (which must release the proc's GC root) — entirely on ONE
+  # throwaway thread (the isolate's owner; the isolate is thread-confined, so the
+  # op MUST run on its creating thread). Doing it off the test thread leaves no
+  # conservative stack residue here, so a still-alive WeakRef afterwards means a
+  # genuine leaked root, not a stale stack slot. Returns the WeakRef.
+  def capture_released_by(&op)
     require 'weakref'
     Thread.new {
+      iso = RustyRacer::Isolate.new
+      ctx = iso.context
       captured = Object.new
       ctx.attach('f', proc { captured.object_id })
-      WeakRef.new(captured)
+      ref = WeakRef.new(captured)
+      op.call(iso, ctx)
+      ref
     }.value
   end
 end
