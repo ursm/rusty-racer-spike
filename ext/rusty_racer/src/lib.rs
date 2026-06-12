@@ -1224,14 +1224,16 @@ thread_local! {
     static ISOLATES: RefCell<HashMap<u32, v8::OwnedIsolate>> = RefCell::new(HashMap::new());
 }
 
+#[allow(dead_code)]
 static NEXT_ISOLATE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
 // Run a microtask checkpoint with DRAINING set (nesting-safe via save/restore),
 // so a nested Reset/DisposeContext issued by a drained microtask is refused.
 fn checkpoint_draining(scope: &mut v8::PinScope<'_, '_>) {
-    let prev = DRAINING.with(|d| d.replace(true));
+    let prev = istate!(scope).draining;
+    istate!(scope).draining = true;
     scope.perform_microtask_checkpoint();
-    DRAINING.with(|d| d.set(prev));
+    istate!(scope).draining = prev;
 }
 
 // The kAuto end-of-script microtask drain, done by the binding: only at the
@@ -1245,7 +1247,8 @@ fn checkpoint_draining(scope: &mut v8::PinScope<'_, '_>) {
 // the watchdog, whose firing the caller maps to Terminated — see the |ran_js|
 // override in each JS-running arm.
 fn auto_drain(scope: &mut v8::PinScope<'_, '_>, outermost: bool) {
-    if outermost && AUTO_MICROTASKS.with(|a| a.get()) && !scope.is_execution_terminating() {
+    let auto = istate!(scope).auto_microtasks;
+    if outermost && auto && !scope.is_execution_terminating() {
         checkpoint_draining(scope);
     }
 }
@@ -1268,10 +1271,10 @@ fn run_js_bracketed(
     body: impl FnOnce(&mut v8::PinScope<'_, '_, ()>, bool) -> (bool, Result<JsVal, VmError>),
 ) -> Result<JsVal, VmError> {
     REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
-    let watchdog = arm_watchdog(timeout_ms);
+    let watchdog = arm_watchdog(scope, timeout_ms);
     let (ran_js, mut outcome) = body(scope, outermost);
-    if disarm_watchdog(watchdog) {
-        WATCHDOG_FIRED.with(|w| w.set(true));
+    if disarm_watchdog(scope, watchdog) {
+        istate!(scope).watchdog_fired = true;
         if ran_js {
             outcome = Err(VmError::Terminated);
         }
@@ -1284,46 +1287,39 @@ fn run_js_bracketed(
 
 // Drop every module AND script compiled in `context_id` (its v8::Context is
 // going away — on reset or dispose — so those handles are now dead).
-fn drop_context_artifacts(context_id: i32) {
-    MODULES.with(|m| {
-        let mut m = m.borrow_mut();
-        let dead: Vec<i32> = m
-            .by_id
-            .iter()
-            .filter(|(_, (_, _, cid))| *cid == context_id)
-            .map(|(id, _)| *id)
-            .collect();
-        for id in dead {
-            m.by_id.remove(&id);
-            for bucket in m.by_hash.values_mut() {
-                bucket.retain(|(_, mid)| *mid != id);
-            }
+fn drop_context_artifacts(state: &mut IsolateState, context_id: i32) {
+    let m = &mut state.modules;
+    let dead: Vec<i32> = m
+        .by_id
+        .iter()
+        .filter(|(_, (_, _, cid))| *cid == context_id)
+        .map(|(id, _)| *id)
+        .collect();
+    for id in dead {
+        m.by_id.remove(&id);
+        for bucket in m.by_hash.values_mut() {
+            bucket.retain(|(_, mid)| *mid != id);
         }
-    });
-    SCRIPTS.with(|s| {
-        s.borrow_mut().by_id.retain(|_, (_, cid)| *cid != context_id);
-    });
+    }
+    state.scripts.by_id.retain(|_, (_, cid)| *cid != context_id);
     // A promise-reject recorder created in this context is unusable now.
-    STATE.with(|s| {
-        let mut s = s.borrow_mut();
-        if s
-            .promise_reject_handler
-            .as_ref()
-            .is_some_and(|(cid, _)| *cid == context_id)
-        {
-            s.promise_reject_handler = None;
-        }
-    });
+    if state
+        .realms
+        .promise_reject_handler
+        .as_ref()
+        .is_some_and(|(cid, _)| *cid == context_id)
+    {
+        state.realms.promise_reject_handler = None;
+    }
 }
 
 // A script's (unbound handle, owning context id), for running it in that context.
-fn script_handle(script_id: i32) -> Option<(v8::Global<v8::UnboundScript>, i32)> {
-    SCRIPTS.with(|s| {
-        s.borrow()
-            .by_id
-            .get(&script_id)
-            .map(|(g, cid)| (g.clone(), *cid))
-    })
+fn script_handle(state: &IsolateState, script_id: i32) -> Option<(v8::Global<v8::UnboundScript>, i32)> {
+    state
+        .scripts
+        .by_id
+        .get(&script_id)
+        .map(|(g, cid)| (g.clone(), *cid))
 }
 
 // Park until the Ruby resolver answers with a module id, servicing any nested
@@ -1350,15 +1346,20 @@ fn recv_module_id(scope: &mut v8::PinScope<'_, '_, ()>, arx: &Receiver<Answer>) 
 // against MODULES — the reverse of the id lookup. Used to give a referrer its
 // url for the resolve round-trip and to fill import.meta.url.
 fn module_url(scope: &mut v8::PinScope<'_, '_>, module: v8::Local<v8::Module>) -> Option<String> {
-    MODULES.with(|m| {
-        let m = m.borrow();
-        let hash = module.get_identity_hash().get();
-        m.by_hash
-            .get(&hash)?
-            .iter()
-            .find(|(g, _)| v8::Local::new(scope, g) == module)
-            .and_then(|(_, id)| m.by_id.get(id).map(|(_, u, _)| u.clone()))
-    })
+    let hash = module.get_identity_hash().get();
+    // Snapshot the hash bucket (cloned globals) so the scope is free for the
+    // Local comparison below: istate! borrows the scope and v8::Local::new
+    // needs it too, so they can't overlap in one expression.
+    let bucket = istate!(scope).modules.by_hash.get(&hash)?.clone();
+    let id = bucket
+        .iter()
+        .find(|(g, _)| v8::Local::new(&*scope, g) == module)
+        .map(|(_, id)| *id)?;
+    istate!(scope)
+        .modules
+        .by_id
+        .get(&id)
+        .map(|(_, u, _)| u.clone())
 }
 
 // V8 calls this the first time a module reads import.meta. Fills in
@@ -1406,14 +1407,14 @@ fn resolve_imported<'s>(
     // a dynamic import runs in whatever realm import() fired in, which kAuto can
     // detach from the request that started it. A foreign-context module would
     // V8-CHECK-abort.
-    MODULES.with(|m| {
-        let m = m.borrow();
-        let (g, _, cid) = m.by_id.get(&dep_id)?;
+    let g = {
+        let (g, _, cid) = istate!(scope).modules.by_id.get(&dep_id)?;
         if Some(*cid) != here {
             return None;
         }
-        Some(v8::Local::new(scope, g))
-    })
+        g.clone()
+    };
+    Some(v8::Local::new(scope, &g))
 }
 
 // V8 calls this for a JS `import(specifier)`. Returns a Promise fulfilled with
@@ -1469,13 +1470,12 @@ fn dynamic_import_cb<'s>(
             // the end of realm A's request, so the running realm is the truth.
             let current = scope.get_current_context();
             let here = id_of_context(scope, current);
-            let g = MODULES.with(|m| {
-                m.borrow()
-                    .by_id
-                    .get(&id)
-                    .filter(|(_, _, cid)| Some(*cid) == here)
-                    .map(|(g, _, _)| g.clone())
-            });
+            let g = istate!(scope)
+                .modules
+                .by_id
+                .get(&id)
+                .filter(|(_, _, cid)| Some(*cid) == here)
+                .map(|(g, _, _)| g.clone());
             match g {
                 Some(g) => {
                     let module = v8::Local::new(scope, &g);
@@ -1519,7 +1519,7 @@ fn finish_dynamic_import(
     if module.get_status() == v8::ModuleStatus::Uninstantiated {
         // Same no-re-entrancy rule as Request::InstantiateModule: linking
         // while another link is on the stack walks V8's half-built graph.
-        if INSTANTIATING.with(|i| i.get()) {
+        if istate!(tc).instantiating {
             reject_with_error(
                 tc,
                 resolver,
@@ -1527,9 +1527,9 @@ fn finish_dynamic_import(
             );
             return;
         }
-        INSTANTIATING.with(|i| i.set(true));
+        istate!(tc).instantiating = true;
         let linked = module.instantiate_module(tc, resolve_imported);
-        INSTANTIATING.with(|i| i.set(false));
+        istate!(tc).instantiating = false;
         if linked != Some(true) {
             // A watchdog/terminate that landed during linking must escalate to
             // the outer request (this nested frame must not absorb it), so
@@ -1672,23 +1672,20 @@ fn watchdog_loop(shared: Arc<WatchdogShared>, handle: v8::IsolateHandle) {
 // Arm the watchdog for this request: push a frame with its own deadline and
 // wake the loop. Returns the generation token to hand to `disarm_watchdog`
 // (None when timeout_ms is 0 — no watchdog for this request).
-fn arm_watchdog(timeout_ms: u64) -> Option<u64> {
+fn arm_watchdog(scope: &mut v8::PinScope<'_, '_, ()>, timeout_ms: u64) -> Option<u64> {
     if timeout_ms == 0 {
         return None;
     }
-    WATCHDOG.with(|w| {
-        let w = w.borrow();
-        let shared = w.as_ref()?;
-        let mut inner = shared.inner.lock().unwrap();
-        inner.next_generation += 1;
-        let generation = inner.next_generation;
-        inner.frames.push(WatchdogFrame {
-            generation,
-            deadline: Instant::now() + Duration::from_millis(timeout_ms),
-        });
-        shared.cv.notify_one();
-        Some(generation)
-    })
+    let shared = &istate!(scope).watchdog;
+    let mut inner = shared.inner.lock().unwrap();
+    inner.next_generation += 1;
+    let generation = inner.next_generation;
+    inner.frames.push(WatchdogFrame {
+        generation,
+        deadline: Instant::now() + Duration::from_millis(timeout_ms),
+    });
+    shared.cv.notify_one();
+    Some(generation)
 }
 
 // Disarm: drop THIS request's frame (leaving any outer frame still armed) and
@@ -1696,24 +1693,19 @@ fn arm_watchdog(timeout_ms: u64) -> Option<u64> {
 // Terminated and the outermost frame sweeps the leftover terminate via
 // WATCHDOG_FIRED; removing only this frame keeps a late terminate from
 // poisoning the next request without clobbering a still-running outer op.
-fn disarm_watchdog(generation: Option<u64>) -> bool {
+fn disarm_watchdog(scope: &mut v8::PinScope<'_, '_, ()>, generation: Option<u64>) -> bool {
     let Some(generation) = generation else {
         return false;
     };
-    WATCHDOG.with(|w| {
-        let w = w.borrow();
-        let Some(shared) = w.as_ref() else {
-            return false;
-        };
-        let mut inner = shared.inner.lock().unwrap();
-        inner.frames.retain(|f| f.generation != generation);
-        let fired = inner.fired_generation == Some(generation);
-        if fired {
-            inner.fired_generation = None;
-        }
-        shared.cv.notify_one();
-        fired
-    })
+    let shared = &istate!(scope).watchdog;
+    let mut inner = shared.inner.lock().unwrap();
+    inner.frames.retain(|f| f.generation != generation);
+    let fired = inner.fired_generation == Some(generation);
+    if fired {
+        inner.fired_generation = None;
+    }
+    shared.cv.notify_one();
+    fired
 }
 
 fn v8_thread_main(
@@ -1822,19 +1814,18 @@ fn service_request(scope: &mut v8::PinScope<'_, '_, ()>, request: Request) -> bo
     // Mark the realm this request runs in active while it is on the stack, so
     // Reset/DisposeContext can refuse to pull a live realm out from under a
     // suspended frame.
-    let realm = request_realm(&request);
+    let realm = request_realm(istate!(scope), &request);
     if let Some(id) = realm {
-        ACTIVE_REALMS.with(|a| a.borrow_mut().push(id));
+        istate!(scope).active_realms.push(id);
     }
     let dispose = dispatch_one(scope, request, outermost);
     if realm.is_some() {
-        ACTIVE_REALMS.with(|a| {
-            a.borrow_mut().pop();
-        });
+        istate!(scope).active_realms.pop();
     }
     // Sweep a leftover terminate flag once the whole request stack has
-    // unwound (see WATCHDOG_FIRED for why nested frames must not cancel).
-    if outermost && WATCHDOG_FIRED.with(|w| w.replace(false)) {
+    // unwound (see watchdog_fired for why nested frames must not cancel).
+    if outermost && istate!(scope).watchdog_fired {
+        istate!(scope).watchdog_fired = false;
         scope.cancel_terminate_execution();
     }
     dispose
@@ -1842,7 +1833,7 @@ fn service_request(scope: &mut v8::PinScope<'_, '_, ()>, request: Request) -> bo
 
 // The realm a request will run in (None for realm-independent ops); feeds
 // ACTIVE_REALMS above.
-fn request_realm(request: &Request) -> Option<i32> {
+fn request_realm(state: &IsolateState, request: &Request) -> Option<i32> {
     match request {
         Request::Eval { context_id, .. }
         | Request::Call { context_id, .. }
@@ -1854,9 +1845,9 @@ fn request_realm(request: &Request) -> Option<i32> {
         Request::InstantiateModule { module_id, .. }
         | Request::EvaluateModule { module_id, .. }
         | Request::ModuleNamespace { module_id, .. } => {
-            module_handle(*module_id).map(|(_, cid)| cid)
+            module_handle(state, *module_id).map(|(_, cid)| cid)
         }
-        Request::RunScript { script_id, .. } => script_handle(*script_id).map(|(_, cid)| cid),
+        Request::RunScript { script_id, .. } => script_handle(state, *script_id).map(|(_, cid)| cid),
         Request::Reset { .. }
         | Request::CreateContext { .. }
         | Request::DisposeContext { .. }
@@ -1883,7 +1874,8 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 reply,
             } => {
                 let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
-                    match context_for(context_id) {
+                    let realm = context_for(istate!(scope), context_id);
+                    match realm {
                         Some(ctx) => {
                             let context = v8::Local::new(scope, &ctx);
                             let scope = &mut v8::ContextScope::new(scope, context);
@@ -1907,7 +1899,8 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 // The bracket pushes REPLY_STACK so a host fn invoked by the
                 // called function routes back to this request's waiter.
                 let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
-                    match context_for(context_id) {
+                    let realm = context_for(istate!(scope), context_id);
+                    match realm {
                         Some(ctx) => {
                             let context = v8::Local::new(scope, &ctx);
                             let scope = &mut v8::ContextScope::new(scope, context);
@@ -1925,15 +1918,16 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 // ruby), so push the reply onto REPLY_STACK exactly like Eval,
                 // or that callback would find no waiter and silently no-op.
                 REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
-                let watchdog = arm_watchdog(timeout_ms);
-                if let Some(ctx) = context_for(0) {
+                let watchdog = arm_watchdog(scope, timeout_ms);
+                let main = context_for(istate!(scope), 0);
+                if let Some(ctx) = main {
                     let context = v8::Local::new(scope, &ctx);
                     let scope = &mut v8::ContextScope::new(scope, context);
                     checkpoint_draining(scope);
                 }
-                let fired = disarm_watchdog(watchdog);
+                let fired = disarm_watchdog(scope, watchdog);
                 if fired {
-                    WATCHDOG_FIRED.with(|w| w.set(true));
+                    istate!(scope).watchdog_fired = true;
                 }
                 REPLY_STACK.with(|s| {
                     s.borrow_mut().pop();
@@ -1958,7 +1952,8 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 // host fn the trap calls routes back, and a looping trap is
                 // time-capped.
                 let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
-                    match context_for(context_id) {
+                    let realm = context_for(istate!(scope), context_id);
+                    match realm {
                         Some(ctx) => {
                             let context = v8::Local::new(scope, &ctx);
                             let scope = &mut v8::ContextScope::new(scope, context);
@@ -1995,7 +1990,8 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 // the realm is not rolled back (matches single Attach, which also
                 // commits its one write or fails it).
                 let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
-                    match context_for(context_id) {
+                    let realm = context_for(istate!(scope), context_id);
+                    match realm {
                         Some(ctx) => {
                             let context = v8::Local::new(scope, &ctx);
                             let scope = &mut v8::ContextScope::new(scope, context);
@@ -2024,9 +2020,9 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 let _ = reply.send(VmReply::Done(outcome));
             }
             Request::Reset { context_id, reply } => {
-                let known = context_id == 0
-                    || STATE.with(|s| s.borrow().contexts.contains_key(&context_id));
-                if DRAINING.with(|d| d.get()) {
+                let known =
+                    context_id == 0 || istate!(scope).realms.contexts.contains_key(&context_id);
+                if istate!(scope).draining {
                     // A microtask from ANY realm may be mid-flight on the stack;
                     // swapping a v8::Context out from under it corrupts state.
                     let _ = reply.send(VmReply::Done(Err(VmError::Runtime(
@@ -2036,7 +2032,7 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                     let _ = reply.send(VmReply::Done(Err(VmError::Runtime(
                         "context disposed or unknown".into(),
                     ))));
-                } else if ACTIVE_REALMS.with(|a| a.borrow().contains(&context_id)) {
+                } else if istate!(scope).active_realms.contains(&context_id) {
                     // Swapping the v8::Context behind a suspended frame would
                     // drop its in-flight modules/scripts and let the realm id
                     // refer to a different context than the one on the stack
@@ -2047,37 +2043,37 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                     ))));
                 } else {
                     let fresh = new_realm(scope, context_id);
-                    STATE.with(|s| {
-                        let mut s = s.borrow_mut();
+                    {
+                        let realms = &mut istate!(scope).realms;
                         if context_id == 0 {
-                            s.main_context = Some(fresh);
+                            realms.main_context = Some(fresh);
                         } else {
-                            s.contexts.insert(context_id, fresh);
+                            realms.contexts.insert(context_id, fresh);
                         }
-                    });
+                    }
                     // Drop modules bound to this context — their realm just changed.
-                    drop_context_artifacts(context_id);
+                    drop_context_artifacts(istate!(scope), context_id);
                     let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
                 }
             }
             Request::CreateContext { reply } => {
-                let id = STATE.with(|s| {
-                    let mut s = s.borrow_mut();
-                    let id = s.next_context_id;
-                    s.next_context_id += 1;
+                let id = {
+                    let realms = &mut istate!(scope).realms;
+                    let id = realms.next_context_id;
+                    realms.next_context_id += 1;
                     id
-                });
+                };
                 let fresh = new_realm(scope, id);
-                STATE.with(|s| s.borrow_mut().contexts.insert(id, fresh));
+                istate!(scope).realms.contexts.insert(id, fresh);
                 let _ = reply.send(VmReply::Done(Ok(JsVal::Int(id as i64))));
             }
             Request::DisposeContext { context_id, reply } => {
-                if DRAINING.with(|d| d.get()) {
+                if istate!(scope).draining {
                     // Same hazard as Reset: a microtask from any realm may be live.
                     let _ = reply.send(VmReply::Done(Err(VmError::Runtime(
                         "cannot dispose a realm during a microtask checkpoint".into(),
                     ))));
-                } else if ACTIVE_REALMS.with(|a| a.borrow().contains(&context_id)) {
+                } else if istate!(scope).active_realms.contains(&context_id) {
                     // Same hazard as Reset: a suspended frame still runs in it.
                     let _ = reply.send(VmReply::Done(Err(VmError::Runtime(
                         "cannot dispose a realm while a request for it is suspended on the V8 stack"
@@ -2086,10 +2082,10 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 } else {
                     // Dropping the Global lets V8 collect the context. id 0 is the
                     // default context and never disposed independently.
-                    STATE.with(|s| s.borrow_mut().contexts.remove(&context_id));
+                    istate!(scope).realms.contexts.remove(&context_id);
                     // Reclaim the modules compiled in it (else they leak until
                     // isolate teardown).
-                    drop_context_artifacts(context_id);
+                    drop_context_artifacts(istate!(scope), context_id);
                     let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
                 }
             }
@@ -2102,7 +2098,8 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 eager,
                 reply,
             } => {
-                let outcome = match context_for(context_id) {
+                let ctx = context_for(istate!(scope), context_id);
+                let outcome = match ctx {
                     None => Err(VmError::Runtime("context disposed or unknown".into())),
                     Some(cx) => {
                     let context = v8::Local::new(scope, &cx);
@@ -2138,17 +2135,17 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                                     } else {
                                         None
                                     };
-                                    let id = MODULES.with(|m| {
-                                        let mut m = m.borrow_mut();
+                                    let hash = module.get_identity_hash().get();
+                                    let g = v8::Global::new(tc, module);
+                                    let id = {
+                                        let m = &mut istate!(tc).modules;
                                         let id = m.next_id;
                                         m.next_id += 1;
-                                        let hash = module.get_identity_hash().get();
-                                        let g = v8::Global::new(tc, module);
                                         m.by_id
                                             .insert(id, (g.clone(), filename.clone(), context_id));
                                         m.by_hash.entry(hash).or_default().push((g, id));
                                         id
-                                    });
+                                    };
                                     Ok(Compiled {
                                         id,
                                         cached_data: produced,
@@ -2188,7 +2185,7 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 // half-built module graph and SEGVs the process. Refuse it
                 // cleanly — a resolve block may COMPILE dependencies lazily
                 // and return them; the outer instantiate links them.
-                if INSTANTIATING.with(|i| i.get()) {
+                if istate!(scope).instantiating {
                     let _ = reply.send(VmReply::Done(Err(VmError::Runtime(
                         "instantiate is not re-entrant: another module is currently \
                          instantiating (compile the dependency and return it; the outer \
@@ -2196,12 +2193,13 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                             .into(),
                     ))));
                 } else {
-                    INSTANTIATING.with(|i| i.set(true));
+                    istate!(scope).instantiating = true;
                     // REPLY_STACK so resolve_imported can round-trip per import edge.
                     REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
-                    let outcome = match module_handle(module_id) {
+                    let handle = module_handle(istate!(scope), module_id);
+                    let outcome = match handle {
                         None => Err(VmError::Runtime("unknown module".into())),
-                        Some((g, cid)) => match context_for(cid) {
+                        Some((g, cid)) => match context_for(istate!(scope), cid) {
                             None => Err(VmError::Runtime("module's context is gone".into())),
                             Some(cx) => {
                                 let context = v8::Local::new(scope, &cx);
@@ -2240,7 +2238,7 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                     REPLY_STACK.with(|s| {
                         s.borrow_mut().pop();
                     });
-                    INSTANTIATING.with(|i| i.set(false));
+                    istate!(scope).instantiating = false;
                     let _ = reply.send(VmReply::Done(outcome));
                 }
             }
@@ -2249,9 +2247,10 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 // TLA continuation drains) can loop, so it runs in the same
                 // watchdog/REPLY_STACK bracket as Eval/Call/RunScript.
                 let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
-                match module_handle(module_id) {
+                let handle = module_handle(istate!(scope), module_id);
+                match handle {
                     None => (false, Err(VmError::Runtime("unknown module".into()))),
-                    Some((g, cid)) => match context_for(cid) {
+                    Some((g, cid)) => match context_for(istate!(scope), cid) {
                         None => (false, Err(VmError::Runtime("module's context is gone".into()))),
                         Some(cx) => {
                             let context = v8::Local::new(scope, &cx);
@@ -2339,9 +2338,10 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 let _ = reply.send(VmReply::Done(outcome));
             }
             Request::ModuleNamespace { module_id, reply } => {
-                let outcome = match module_handle(module_id) {
+                let handle = module_handle(istate!(scope), module_id);
+                let outcome = match handle {
                     None => Err(VmError::Runtime("unknown module".into())),
-                    Some((g, cid)) => match context_for(cid) {
+                    Some((g, cid)) => match context_for(istate!(scope), cid) {
                         None => Err(VmError::Runtime("module's context is gone".into())),
                         Some(cx) => {
                             let context = v8::Local::new(scope, &cx);
@@ -2365,7 +2365,8 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 let _ = reply.send(VmReply::Done(outcome));
             }
             Request::ModuleStatus { module_id, reply } => {
-                let outcome = match module_handle(module_id) {
+                let handle = module_handle(istate!(scope), module_id);
+                let outcome = match handle {
                     None => Err(VmError::Runtime("unknown module".into())),
                     Some((g, _cid)) => {
                         let module = v8::Local::new(scope, &g);
@@ -2383,13 +2384,11 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 let _ = reply.send(VmReply::Done(outcome));
             }
             Request::DisposeModule { module_id, reply } => {
-                MODULES.with(|m| {
-                    let mut m = m.borrow_mut();
-                    m.by_id.remove(&module_id);
-                    for bucket in m.by_hash.values_mut() {
-                        bucket.retain(|(_, id)| *id != module_id);
-                    }
-                });
+                let m = &mut istate!(scope).modules;
+                m.by_id.remove(&module_id);
+                for bucket in m.by_hash.values_mut() {
+                    bucket.retain(|(_, id)| *id != module_id);
+                }
                 let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
             }
             Request::CompileScript {
@@ -2401,7 +2400,8 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 eager,
                 reply,
             } => {
-                let outcome = match context_for(context_id) {
+                let ctx = context_for(istate!(scope), context_id);
+                let outcome = match ctx {
                     None => Err(VmError::Runtime("context disposed or unknown".into())),
                     Some(cx) => {
                         let context = v8::Local::new(scope, &cx);
@@ -2426,14 +2426,14 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                                         } else {
                                             None
                                         };
-                                        let id = SCRIPTS.with(|s| {
-                                            let mut s = s.borrow_mut();
+                                        let g = v8::Global::new(tc, unbound);
+                                        let id = {
+                                            let s = &mut istate!(tc).scripts;
                                             let id = s.next_id;
                                             s.next_id += 1;
-                                            let g = v8::Global::new(tc, unbound);
                                             s.by_id.insert(id, (g, context_id));
                                             id
-                                        });
+                                        };
                                         Ok(Compiled {
                                             id,
                                             cached_data: produced,
@@ -2472,9 +2472,10 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 reply,
             } => {
                 let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
-                    match script_handle(script_id) {
+                    let handle = script_handle(istate!(scope), script_id);
+                    match handle {
                         None => (false, Err(VmError::Runtime("unknown script".into()))),
-                        Some((g, cid)) => match context_for(cid) {
+                        Some((g, cid)) => match context_for(istate!(scope), cid) {
                             None => (false, Err(VmError::Runtime("script's context is gone".into()))),
                             Some(cx) => {
                             let context = v8::Local::new(scope, &cx);
@@ -2502,9 +2503,7 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 let _ = reply.send(VmReply::Done(outcome));
             }
             Request::DisposeScript { script_id, reply } => {
-                SCRIPTS.with(|s| {
-                    s.borrow_mut().by_id.remove(&script_id);
-                });
+                istate!(scope).scripts.by_id.remove(&script_id);
                 let _ = reply.send(VmReply::Done(Ok(JsVal::Undefined)));
             }
             // Serialize the script's CURRENT compile state. The stored handle is
@@ -2514,7 +2513,8 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
             // can't serialize, or when the realm was reset/disposed out from under
             // the script (its handle is gone): produce nil, not an error.
             Request::ScriptCodeCache { script_id, reply } => {
-                let outcome = match script_handle(script_id) {
+                let handle = script_handle(istate!(scope), script_id);
+                let outcome = match handle {
                     None => Ok(None),
                     Some((g, _cid)) => {
                         let unbound = v8::Local::new(scope, &g);
@@ -2528,9 +2528,9 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
             // It needs the module's context entered (unlike UnboundScript), so
             // a gone realm yields nil.
             Request::ModuleCodeCache { module_id, reply } => {
-                let outcome = match module_handle(module_id).and_then(|(g, cid)| {
-                    context_for(cid).map(|cx| (g, cx))
-                }) {
+                let mh = module_handle(istate!(scope), module_id);
+                let handle = mh.and_then(|(g, cid)| context_for(istate!(scope), cid).map(|cx| (g, cx)));
+                let outcome = match handle {
                     None => Ok(None),
                     Some((g, cx)) => {
                         let context = v8::Local::new(scope, &cx);
@@ -2558,33 +2558,30 @@ fn id_of_context(scope: &mut v8::PinScope<'_, '_>, context: v8::Local<v8::Contex
     let id = context
         .get_embedder_data(scope, REALM_ID_SLOT)
         .and_then(|v| v.int32_value(scope))?;
-    let live = context_for(id).is_some_and(|g| v8::Local::new(scope, &g) == context);
+    let current = context_for(istate!(scope), id);
+    let live = current.is_some_and(|g| v8::Local::new(scope, &g) == context);
     live.then_some(id)
 }
 
 // Pick the Global context for a realm id: 0 = main, N = an extra realm (None
 // if it was disposed or never existed). Clones the Global (cheap, refcounted)
 // so no STATE borrow is held while the caller runs JS.
-fn context_for(context_id: i32) -> Option<v8::Global<v8::Context>> {
-    STATE.with(|s| {
-        let s = s.borrow();
-        if context_id == 0 {
-            s.main_context.clone()
-        } else {
-            s.contexts.get(&context_id).cloned()
-        }
-    })
+fn context_for(state: &IsolateState, context_id: i32) -> Option<v8::Global<v8::Context>> {
+    if context_id == 0 {
+        state.realms.main_context.clone()
+    } else {
+        state.realms.contexts.get(&context_id).cloned()
+    }
 }
 
 // A module's (handle, owning context id), for running its ops in the right
 // v8::Context.
-fn module_handle(module_id: i32) -> Option<(v8::Global<v8::Module>, i32)> {
-    MODULES.with(|m| {
-        m.borrow()
-            .by_id
-            .get(&module_id)
-            .map(|(g, _, cid)| (g.clone(), *cid))
-    })
+fn module_handle(state: &IsolateState, module_id: i32) -> Option<(v8::Global<v8::Module>, i32)> {
+    state
+        .modules
+        .by_id
+        .get(&module_id)
+        .map(|(g, _, cid)| (g.clone(), *cid))
 }
 
 // ---------------------------------------------------------------------------
@@ -2768,7 +2765,8 @@ fn context_global(
         throw_js_error(scope, "contextGlobal expects a context id");
         return;
     };
-    match context_for(id) {
+    let realm = context_for(istate!(scope), id);
+    match realm {
         Some(g) => {
             let context = v8::Local::new(scope, &g);
             rv.set(context.global(scope).into());
@@ -2811,10 +2809,10 @@ fn set_promise_reject_handler(
                 .and_then(|cx| id_of_context(scope, cx))
                 .unwrap_or(0);
             let g = v8::Global::new(scope, f);
-            STATE.with(|s| s.borrow_mut().promise_reject_handler = Some((cid, g)));
+            istate!(scope).realms.promise_reject_handler = Some((cid, g));
         }
         Err(_) => {
-            STATE.with(|s| s.borrow_mut().promise_reject_handler = None);
+            istate!(scope).realms.promise_reject_handler = None;
         }
     }
 }
@@ -2828,12 +2826,11 @@ fn set_promise_reject_handler(
 // after reject, 2 = reject after resolved, 3 = resolve after resolved.
 unsafe extern "C" fn promise_reject_cb(message: v8::PromiseRejectMessage) {
     v8::callback_scope!(unsafe scope, &message);
-    let handler = STATE.with(|s| {
-        s.borrow()
-            .promise_reject_handler
-            .as_ref()
-            .map(|(_, g)| g.clone())
-    });
+    let handler = istate!(scope)
+        .realms
+        .promise_reject_handler
+        .as_ref()
+        .map(|(_, g)| g.clone());
     let Some(handler) = handler else { return };
     let promise = message.get_promise();
     let event = match message.get_event() {
@@ -2910,20 +2907,22 @@ fn new_realm(scope: &mut v8::PinScope<'_, '_, ()>, id: i32) -> v8::Global<v8::Co
     // which rusty_v8 v150 does not expose — that would need new FFI.
     {
         let context = v8::Local::new(scope, &fresh);
-        let token = STATE.with(|s| s.borrow().security_token.clone());
+        let token = istate!(scope).realms.security_token.clone();
         let token: v8::Local<v8::Value> = match token {
             Some(t) => v8::Local::new(scope, &t),
             None => {
                 let t: v8::Local<v8::Value> = v8::String::new(scope, "rusty_racer")
                     .map(|s| s.into())
                     .unwrap_or_else(|| v8::undefined(scope).into());
-                STATE.with(|s| s.borrow_mut().security_token = Some(v8::Global::new(scope, t)));
+                let g = v8::Global::new(scope, t);
+                istate!(scope).realms.security_token = Some(g);
                 t
             }
         };
         context.set_security_token(token);
     }
-    if let Some(name) = STATE.with(|s| s.borrow().host_namespace.clone()) {
+    let host_namespace = istate!(scope).realms.host_namespace.clone();
+    if let Some(name) = host_namespace {
         install_host_namespace(scope, &fresh, &name);
     }
     fresh
