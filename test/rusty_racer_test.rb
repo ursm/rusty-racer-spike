@@ -1441,6 +1441,21 @@ class RustyRacerTest < Minitest::Test
     refute ref.weakref_alive?, 'dispose left the attached proc (and its captures) GC-rooted'
   end
 
+  def test_deep_caller_js_overflow_throws_not_fatal
+    # In-thread V8 runs on the Ruby thread's stack, so the V8 stack limit must be
+    # reset to the current native stack each op. If it stayed fixed at a shallow
+    # first entry, entering from a deep Ruby caller false-overflows, and that bad
+    # throw trips V8's IsOnCentralStack CHECK -> a FATAL abort (the whole process
+    # dies). With the per-op reset, a JS overflow from a deep caller is a clean
+    # RangeError and the isolate keeps working.
+    @ctx.eval('globalThis.rec = function (n) { return n <= 0 ? 0 : 1 + rec(n - 1) }')
+    @ctx.eval('1 + 1') # establish a limit at a shallow frame first
+    deep = ->(n, &b) { n.zero? ? b.call : deep.call(n - 1, &b) }
+    e = deep.call(1500) { assert_raises(RustyRacer::RuntimeError) { @ctx.eval('rec(10_000_000)') } }
+    assert_includes e.message, 'call stack'
+    assert_equal 2, @ctx.eval('1 + 1')
+  end
+
   def test_isolate_is_thread_confined
     # Every op must run on the isolate's owner thread; a foreign-thread op raises
     # WrongThreadError rather than corrupting V8.

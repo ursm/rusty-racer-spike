@@ -18,3 +18,6 @@ crate-type = ["cdylib"]
 magnus = { version = "0.8", features = ["rb-sys"] }
 rb-sys = "0.9"
 v8 = "150.0.0"
+# pthread stack-bounds query, to set V8's stack limit per op relative to the
+# current native thread (in-thread V8 runs on the Ruby thread's stack).
+libc = "0.2"

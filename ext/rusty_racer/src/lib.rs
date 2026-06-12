@@ -449,6 +449,90 @@ fn error_to_exception(e: &Error) -> Option<Exception> {
     None
 }
 
+// ---------------------------------------------------------------------------
+// V8 stack limit (in-thread: V8 runs on the calling Ruby thread's stack)
+// ---------------------------------------------------------------------------
+// rusty_v8 doesn't wrap the runtime `v8::Isolate::SetStackLimit(uintptr_t)`, so
+// link the public V8 symbol directly (stable across V8 versions). It sets the
+// lowest address V8's stack may reach before it throws RangeError.
+unsafe extern "C" {
+    #[link_name = "_ZN2v87Isolate13SetStackLimitEm"]
+    fn v8__Isolate__SetStackLimit(isolate: *mut c_void, stack_limit: usize);
+}
+
+// The stack bottom is stable per NATIVE thread, but querying it (pthread, which
+// reads /proc/self/maps for the main thread on Linux) is far too slow to do per
+// op. Cache it in a native-thread-local — correct under M:N (each native thread
+// caches its own stack) and ~free after the first op on a thread.
+thread_local! {
+    static STACK_BOTTOM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn native_stack_bottom() -> usize {
+    STACK_BOTTOM.with(|c| {
+        let cached = c.get();
+        if cached != 0 {
+            return cached;
+        }
+        let bottom = query_native_stack_bottom();
+        c.set(bottom);
+        bottom
+    })
+}
+
+// Lowest valid address of the CURRENT native thread's stack (it grows DOWN
+// toward this). 0 if it can't be queried.
+#[cfg(target_os = "linux")]
+fn query_native_stack_bottom() -> usize {
+    unsafe {
+        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
+        if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
+            return 0;
+        }
+        let mut addr: *mut c_void = null_mut();
+        let mut size: libc::size_t = 0;
+        let rc = libc::pthread_attr_getstack(&attr, &mut addr, &mut size);
+        libc::pthread_attr_destroy(&mut attr);
+        if rc != 0 {
+            return 0;
+        }
+        addr as usize
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn query_native_stack_bottom() -> usize {
+    unsafe {
+        // On macOS pthread_get_stackaddr_np returns the stack BASE (highest
+        // address); the usable bottom is base - size.
+        let top = libc::pthread_get_stackaddr_np(libc::pthread_self()) as usize;
+        let size = libc::pthread_get_stacksize_np(libc::pthread_self());
+        top.saturating_sub(size)
+    }
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+fn query_native_stack_bottom() -> usize {
+    0
+}
+
+// Point V8's stack limit just above the current native thread's real stack
+// bottom, so a deep JS recursion throws RangeError ON the central stack
+// (cleanly) instead of overflowing the native stack — or, if the limit were
+// stale from a shallower entry, false-overflowing and tripping V8's
+// IsOnCentralStack CHECK (a fatal abort). Must be called with the isolate
+// ENTERED. `real_isolate` is the raw v8::Isolate* read out of iso_ptr.
+fn set_v8_stack_limit(real_isolate: *mut c_void) {
+    let bottom = native_stack_bottom();
+    if bottom == 0 {
+        return; // couldn't query — leave V8's creation-time default
+    }
+    // Reserve headroom below the limit for V8's own RangeError throw + the C++
+    // frames under the limit check.
+    const GUARD_BYTES: usize = 128 * 1024;
+    unsafe { v8__Isolate__SetStackLimit(real_isolate, bottom + GUARD_BYTES) };
+}
+
 // Little-endian u64 limbs -> big-endian hex magnitude (no sign, no "0x"). The
 // shared currency between V8 BigInt words and Ruby Integer(str, 16).
 fn words_to_hex(words: &[u64]) -> String {
@@ -3147,6 +3231,15 @@ impl Core {
         let reply: Option<VmReply> = without_gvl(|| {
             if depth == 0 {
                 unsafe { (*iso).enter() };
+                // In-thread: V8 runs on THIS native thread's stack. Re-point its
+                // stack limit at this thread's bottom before running JS — the
+                // create-time limit is fixed at a shallow (or other-thread)
+                // frame, so a deeper entry would false-overflow (and the bad
+                // throw trips V8's IsOnCentralStack CHECK -> fatal). iso_ptr is
+                // *mut v8::Isolate = *mut NonNull<RealIsolate>; the raw
+                // v8::Isolate* the C++ method wants is that NonNull's value.
+                let real_isolate = unsafe { *(iso as *const *mut c_void) };
+                set_v8_stack_limit(real_isolate);
                 let reply = std::panic::catch_unwind(AssertUnwindSafe(|| {
                     v8::scope!(let scope, unsafe { &mut *iso });
                     service_request(scope, request, true)

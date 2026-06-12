@@ -545,6 +545,7 @@ dependencies = [
 name = "rusty_racer"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "magnus",
  "rb-sys",
  "v8",
