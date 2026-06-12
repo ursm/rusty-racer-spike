@@ -16,6 +16,12 @@
 #     libv8-rusty.yml re-run, not an edit here.
 name: "Package and release the gem (precompiled V8)"
 on:
+  # Push a vX.Y.Z tag to build + publish that version (see verify_tag — the tag
+  # must match lib/rusty_racer/version.rb). workflow_dispatch stays for building
+  # without releasing (release: false) or a manual publish off a branch.
+  push:
+    tags:
+      - "v[0-9]*"
   workflow_dispatch:
     inputs:
       release:
@@ -26,7 +32,29 @@ on:
 env:
   CIBUILDGEM: 1
 jobs:
+  # Fail the whole run fast (before the ~30-min build matrix) if a release tag
+  # doesn't match the packaged version: cibuildgem publishes whatever version.rb
+  # says, NOT the tag, so a v0.2.0 tag on a 0.1.0 version.rb would silently ship
+  # 0.1.0. A no-op on workflow_dispatch (no tag to check).
+  verify_tag:
+    name: "Tag matches the gem version"
+    runs-on: "ubuntu-22.04"
+    steps:
+      - uses: "actions/checkout@v5"
+      - name: "On a tag push, the tag must equal lib/rusty_racer/version.rb"
+        run: |
+          if [ "${{ github.ref_type }}" != "tag" ]; then
+            echo "not a tag push — nothing to check"; exit 0
+          fi
+          version=$(grep -oP 'VERSION\s*=\s*"\K[^"]+' lib/rusty_racer/version.rb)
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "::error::tag v$tag != gem version $version — bump lib/rusty_racer/version.rb or retag"
+            exit 1
+          fi
+          echo "tag v$tag matches gem version $version"
   compile:
+    needs: verify_tag
     timeout-minutes: 30
     name: "Compile + package (${{ matrix.os }})"
     strategy:
@@ -140,13 +168,13 @@ jobs:
   release:
     name: "Release the gem on RubyGems"
     needs: install
-    # Only when the dispatch asked for it; gated behind the whole build passing.
-    # The compile/test/install needs-chain is intentionally all-or-nothing: a
-    # `needs` on a matrix job requires EVERY leg to succeed, so if any platform
-    # fails we publish nothing (a release should ship all platforms together, not
-    # a partial set). fail-fast: false still lets every leg run so we see which
-    # platform failed before re-running.
-    if: ${{ inputs.release }}
+    # Publish on a vX.Y.Z tag push, or on a manual dispatch that ticked release.
+    # Gated behind the whole build passing: the compile/test/install needs-chain
+    # is intentionally all-or-nothing — a `needs` on a matrix job requires EVERY
+    # leg to succeed, so if any platform fails we publish nothing (a release
+    # should ship all platforms together, not a partial set). fail-fast: false
+    # still lets every leg run so we see which platform failed before re-running.
+    if: ${{ github.ref_type == 'tag' || inputs.release }}
     # Trusted publishing: cibuildgem's release step runs
     # rubygems/configure-rubygems-credentials (OIDC) + `cibuildgem release`, so
     # the job needs id-token: write. `environment: release` matches the RubyGems
