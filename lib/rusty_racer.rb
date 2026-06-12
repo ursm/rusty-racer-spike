@@ -30,6 +30,12 @@ module RustyRacer
   class SnapshotError < Error; end
   class PlatformAlreadyInitialized < Error; end
 
+  # Raised when an Isolate (or a Context/Module/Script it handed out) is used
+  # from a thread other than the one that created it. An isolate is
+  # thread-confined: every operation must run on its owner thread. The lone
+  # exception is Isolate#terminate, which is safe from any thread.
+  class WrongThreadError < Error; end
+
   # A V8 isolate. Owns the VM and its lifecycle; hands out Contexts to run JS in.
   class Isolate
     # Keyword-arg constructor over the positional Rust primitive. A snapshot

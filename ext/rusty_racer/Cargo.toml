@@ -12,6 +12,9 @@ publish = false
 crate-type = ["cdylib"]
 
 [dependencies]
-magnus = "0.8"
+# rb-sys: exposes magnus::rb_sys (protect — catch a Ruby raise from a host
+# callback so it can't longjmp through V8 — and the raw VALUE conversions used
+# to root the owner thread).
+magnus = { version = "0.8", features = ["rb-sys"] }
 rb-sys = "0.9"
 v8 = "150.0.0"

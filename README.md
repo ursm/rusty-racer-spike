@@ -122,6 +122,27 @@ warm isolate — a per-visit reset that avoids rebuilding the VM. Its contract:
   suspended on the V8 stack (e.g. resetting a realm from inside one of its own
   host fns).
 
+## Threading
+
+An `Isolate` runs V8 **in-thread** on the Ruby thread that created it, and is
+**thread-confined**: every operation on it — and on the `Context`s, `Module`s,
+and `Script`s it hands out — must run on that owner thread. A V8 isolate is bound
+to one native thread (rusty_v8 exposes no `v8::Locker`), so using it from another
+thread raises `RustyRacer::WrongThreadError` rather than corrupting the VM.
+
+- **`Isolate#terminate` is the one exception** — it is safe to call from any
+  thread (it stops a runaway script on the owner thread).
+- **Dispose on the owner thread.** `Isolate#dispose` must run on the owner
+  thread. If the last reference to an isolate is instead garbage-collected on a
+  *different* thread (e.g. its owner thread already exited), it cannot be
+  disposed and the V8 isolate **leaks** until the process exits. To avoid this,
+  call `iso.dispose` on the owner thread before that thread ends — and watch
+  `RustyRacer.leaked_isolate_count` (and `RustyRacer.live_isolate_count`) to
+  confirm a long-running, thread-churning workload isn't leaking.
+
+One isolate per thread is the supported model; share work between threads by
+giving each thread its own isolate.
+
 ## Installation
 
 Precompiled gems bundle V8 — no V8 build, no Rust toolchain — for Ruby 3.3, 3.4,

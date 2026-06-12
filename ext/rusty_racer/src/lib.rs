@@ -74,6 +74,17 @@ impl RootedProc {
     }
 }
 
+// The owner Ruby thread, GC-ROOTED for the isolate's life. The owner check
+// compares raw Thread VALUEs (Core.owner, a usize); a Thread object is itself
+// GC-managed, so without this its slot could be freed after the thread dies and
+// REUSED by a new thread — a false owner match that would silently drive a
+// !Locker isolate from the wrong native thread. Rooting pins the VALUE so its
+// address can't alias another thread while any wrapper is alive. Send/Sync for
+// the same reason as RootedProc (only the owner thread ever touches Ruby state).
+struct RootedThread(#[allow(dead_code)] BoxValue<Value>);
+unsafe impl Send for RootedThread {}
+unsafe impl Sync for RootedThread {}
+
 // The stable raw pointer to a Core's in-thread V8 isolate, stashed in Core so
 // the runner can open a scope (and the watchdog can be addressed) without
 // borrowing the OwnedIsolate out of the ISOLATES registry. Send + Sync for the
@@ -820,7 +831,19 @@ fn host_fn_callback(
     let result: Result<JsVal, String> = with_gvl(|| {
         let ruby = Ruby::get().unwrap();
         let core = unsafe { &*core_ptr };
-        core.call_proc(&ruby, host_fn_id, &js_args)
+        // rb_protect so a Ruby exception raised during arg/return marshalling
+        // (ary_new_capa / jsval_to_ruby / ruby_to_jsval can raise on OOM etc.)
+        // is CAUGHT here instead of longjmp-ing through V8's C++ frames. The
+        // proc's own raise is already a magnus Err; this covers the rest.
+        use magnus::rb_sys::AsRawValue;
+        let mut out: Option<Result<JsVal, String>> = None;
+        match magnus::rb_sys::protect(|| {
+            out = Some(core.call_proc(&ruby, host_fn_id, &js_args));
+            ruby.qnil().as_raw()
+        }) {
+            Ok(_) => out.unwrap_or_else(|| Err("host function did not complete".into())),
+            Err(e) => Err(format!("{e}")),
+        }
     });
     match result {
         Ok(val) => {
@@ -1214,6 +1237,14 @@ fn isolates() -> &'static Mutex<HashMap<u32, SendIso>> {
 }
 
 static NEXT_ISOLATE_ID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
+
+// Count of isolates that could not be disposed because their last wrapper was
+// GC-dropped off the owner thread (see Drop for Core) — they leak the OwnedIsolate
+// (and its watchdog thread) until process exit. Exposed as
+// RustyRacer.leaked_isolate_count so a workload that churns owner threads can
+// observe the leak instead of seeing only mystery RSS growth. The cure is to
+// dispose isolates explicitly on their owner thread before that thread exits.
+static LEAKED_ISOLATES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
 // Run a microtask checkpoint with DRAINING set (nesting-safe via save/restore),
 // so a nested Reset/DisposeContext issued by a drained microtask is refused.
@@ -2509,9 +2540,12 @@ struct Core {
     shared: Mutex<Shared>,
     // The id this isolate is keyed under in the owner thread's ISOLATES registry,
     // and the owning RUBY thread (its Thread VALUE — see current_ruby_thread).
-    // Every op checks `owner == current_ruby_thread()`.
+    // Every op checks `owner == current_ruby_thread()`. `_owner_root` GC-roots
+    // that Thread VALUE so its address can't be reused by a later thread (a false
+    // owner match — see RootedThread).
     iso_id: u32,
     owner: usize,
+    _owner_root: RootedThread,
     // Stable raw ptr to the OwnedIsolate's V8 isolate (it lives in ISOLATES). The
     // runner opens its scope from this without borrowing ISOLATES across the run,
     // so a re-entrant op can't double-borrow the registry. Dereferenced only on
@@ -3033,11 +3067,17 @@ impl Isolate {
         let iso_ptr = IsoPtr(&mut **boxed as *mut v8::Isolate);
         let iso_id = NEXT_ISOLATE_ID.fetch_add(1, Ordering::SeqCst);
         isolates().lock().unwrap().insert(iso_id, SendIso(boxed));
+        // Root the owner Thread VALUE so its address can't be reused while this
+        // isolate lives (see RootedThread); the raw VALUE backs the fast per-op
+        // owner check.
+        use magnus::rb_sys::{AsRawValue, FromRawValue};
+        let owner_thread = unsafe { Value::from_raw(rb_sys::rb_thread_current()) };
         let core = Arc::new_cyclic(|me| Core {
             me: me.clone(),
             shared: Mutex::new(Shared { handle, disposed: false }),
             iso_id,
-            owner: current_ruby_thread(),
+            owner: owner_thread.as_raw() as usize,
+            _owner_root: RootedThread(BoxValue::new(owner_thread)),
             iso_ptr,
             depth: std::sync::atomic::AtomicU32::new(0),
             procs: Mutex::new(ProcTable::default()),
@@ -3076,8 +3116,9 @@ impl Core {
     fn ensure_owner_and_live(&self, ruby: &Ruby) -> Result<(), Error> {
         if current_ruby_thread() != self.owner {
             return Err(Error::new(
-                ruby.exception_runtime_error(),
-                "RustyRacer: isolate used from a thread other than the one that created it",
+                err_class(ruby, "WrongThreadError"),
+                "isolate used from a thread other than the one that created it \
+                 (an isolate is thread-confined; only #terminate is thread-safe)",
             ));
         }
         if self.shared.lock().unwrap().disposed {
@@ -3096,13 +3137,21 @@ impl Core {
         // different native thread on GVL re-acquire, and V8's enter/exit and
         // HandleScope are native-thread-bound. Between ops the isolate is exited,
         // so the next op (possibly on another native thread) just re-enters.
-        let reply = without_gvl(|| {
+        //
+        // service_request runs under catch_unwind: a Rust panic (a bug — a bad
+        // unwrap, an OOM in marshalling) would otherwise unwind through the
+        // without_gvl extern "C" trampoline and ABORT the whole Ruby VM. Catching
+        // it here keeps enter/exit + depth balanced (None below) and lets run()
+        // poison the isolate and raise instead of crashing the process.
+        use std::panic::AssertUnwindSafe;
+        let reply: Option<VmReply> = without_gvl(|| {
             if depth == 0 {
                 unsafe { (*iso).enter() };
-                let reply = {
+                let reply = std::panic::catch_unwind(AssertUnwindSafe(|| {
                     v8::scope!(let scope, unsafe { &mut *iso });
                     service_request(scope, request, true)
-                };
+                }))
+                .ok();
                 unsafe { (*iso).exit() };
                 reply
             } else {
@@ -3110,12 +3159,26 @@ impl Core {
                 // proc that issued this op, is on the V8 stack): the isolate is
                 // already entered by the depth-0 op on THIS native thread, so
                 // bootstrap onto the ambient HandleScope rather than re-enter.
-                v8::callback_scope!(unsafe scope, unsafe { &mut *iso });
-                service_request(scope, request, false)
+                std::panic::catch_unwind(AssertUnwindSafe(|| {
+                    v8::callback_scope!(unsafe scope, unsafe { &mut *iso });
+                    service_request(scope, request, false)
+                }))
+                .ok()
             }
         });
         self.depth.fetch_sub(1, Ordering::SeqCst);
-        Ok(reply)
+        match reply {
+            Some(reply) => Ok(reply),
+            None => {
+                // The op panicked: V8 may be left inconsistent, so POISON the
+                // isolate (every later op refuses) rather than risk using it.
+                self.shared.lock().unwrap().disposed = true;
+                Err(Error::new(
+                    ruby.exception_runtime_error(),
+                    "internal error: operation panicked; the isolate has been disposed",
+                ))
+            }
+        }
     }
 
     // Map a terminal reply to a Ruby value (the common eval/call/run shape).
@@ -3506,8 +3569,8 @@ impl Core {
     fn dispose(&self, ruby: &Ruby) -> Result<(), Error> {
         if current_ruby_thread() != self.owner {
             return Err(Error::new(
-                ruby.exception_runtime_error(),
-                "RustyRacer: dispose must run on the isolate's owner thread",
+                err_class(ruby, "WrongThreadError"),
+                "dispose must run on the isolate's owner thread",
             ));
         }
         {
@@ -3549,7 +3612,8 @@ impl Drop for Core {
             // LEAK the OwnedIsolate (it stays in the owner thread's ISOLATES until
             // the process exits) and only signal the watchdog to stop. Disposing
             // explicitly on the owner thread before the last wrapper drops avoids
-            // this leak.
+            // this leak; the counter makes it observable (RustyRacer.leaked_isolate_count).
+            LEAKED_ISOLATES.fetch_add(1, Ordering::Relaxed);
             {
                 let mut inner = self.watchdog.inner.lock().unwrap();
                 inner.shutdown = true;
@@ -3557,6 +3621,19 @@ impl Drop for Core {
             self.watchdog.cv.notify_one();
         }
     }
+}
+
+// RustyRacer.live_isolate_count -> Integer: isolates currently in the registry
+// (created, not yet disposed). RustyRacer.leaked_isolate_count -> Integer:
+// isolates that could not be disposed because their last wrapper was dropped off
+// the owner thread (see Drop) — a workload that churns owner threads should keep
+// this at 0 by disposing on the owner thread.
+fn live_isolate_count() -> usize {
+    isolates().lock().unwrap().len()
+}
+
+fn leaked_isolate_count() -> usize {
+    LEAKED_ISOLATES.load(Ordering::Relaxed)
 }
 
 // Thin magnus-method wrappers.
@@ -4467,5 +4544,8 @@ fn init(ruby: &Ruby) -> Result<(), Error> {
         "cached_data_version_tag",
         function!(cached_data_version_tag, 0),
     )?;
+    // Observability for the thread-confined lifecycle (see Drop for Core).
+    module.define_singleton_method("live_isolate_count", function!(live_isolate_count, 0))?;
+    module.define_singleton_method("leaked_isolate_count", function!(leaked_isolate_count, 0))?;
     Ok(())
 }

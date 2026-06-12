@@ -1441,6 +1441,35 @@ class RustyRacerTest < Minitest::Test
     refute ref.weakref_alive?, 'dispose left the attached proc (and its captures) GC-rooted'
   end
 
+  def test_isolate_is_thread_confined
+    # Every op must run on the isolate's owner thread; a foreign-thread op raises
+    # WrongThreadError rather than corrupting V8.
+    e = Thread.new { (@ctx.eval('1 + 1') rescue $!) }.value # rubocop:disable Style/RescueModifier
+    assert_instance_of RustyRacer::WrongThreadError, e
+    assert_kind_of RustyRacer::Error, e
+    # The owner thread still works (the failed foreign op didn't wedge it).
+    assert_equal 2, @ctx.eval('1 + 1')
+  end
+
+  def test_terminate_is_allowed_from_another_thread
+    # terminate is the lone thread-safe op: a watchdog-less infinite loop on the
+    # owner thread is stopped by another thread calling #terminate.
+    stopper = Thread.new { sleep 0.1; @iso.terminate }
+    assert_raises(RustyRacer::ScriptTerminatedError) { @ctx.eval('for(;;){}') }
+    stopper.join
+    @ctx.eval('1') # cancel the leftover terminate
+  end
+
+  def test_live_isolate_count_tracks_create_and_dispose
+    base = RustyRacer.live_isolate_count
+    iso = RustyRacer::Isolate.new
+    iso.context.eval('1')
+    assert_equal base + 1, RustyRacer.live_isolate_count
+    iso.dispose
+    assert_equal base, RustyRacer.live_isolate_count
+    assert_kind_of Integer, RustyRacer.leaked_isolate_count
+  end
+
   def test_attached_proc_survives_gc
     # the attached lambdas below have NO other Ruby reference: the extension
     # itself must root them (rb_gc_register_address via RootedProc) or GC
