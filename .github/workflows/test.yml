@@ -1,0 +1,48 @@
+# Run the test suite on every push to main and every PR — the fast feedback loop
+# cibuildgem.yaml (tag-only) doesn't give. It LINKS the prebuilt library-TLS V8
+# archive (no ~1h source build): linux via RUSTY_V8_ARCHIVE, macOS via the v8
+# crate's own download of Deno's _simdutf prebuilt (the `simdutf` feature appends
+# the URL suffix). Mirrors cibuildgem's compile+test, minus packaging/publish.
+name: "test"
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+
+# A new push to a branch/PR cancels its still-running test run.
+concurrency:
+  group: "test-${{ github.ref }}"
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: "test (${{ matrix.os }}, ruby ${{ matrix.ruby }})"
+    strategy:
+      fail-fast: false
+      matrix:
+        os: ["ubuntu-22.04", "ubuntu-22.04-arm", "macos-latest", "macos-26-intel"]
+        ruby: ["3.3", "3.4", "4.0"]
+    runs-on: "${{ matrix.os }}"
+    steps:
+      - uses: "actions/checkout@v6"
+      - name: "Point at the prebuilt library-TLS V8 archive (linux only)"
+        # macOS skips this: with no RUSTY_V8_ARCHIVE the v8 crate downloads Deno's
+        # _simdutf prebuilt itself (the feature is on). Linux needs OUR archive —
+        # the stock prebuilt is initial-exec TLS and can't link into a cdylib.
+        # Keep the URL derivation IN SYNC with cibuildgem.yaml.
+        if: "${{ runner.os == 'Linux' }}"
+        run: |
+          ver=$(grep -oP '^v8 = .*?"\K[0-9][0-9.]*' ext/rusty_racer/Cargo.toml)
+          case "$(uname -m)" in
+            x86_64)  triple=x86_64-unknown-linux-gnu ;;
+            aarch64) triple=aarch64-unknown-linux-gnu ;;
+            *) echo "::error::unsupported linux arch $(uname -m)"; exit 1 ;;
+          esac
+          echo "RUSTY_V8_ARCHIVE=https://github.com/${{ github.repository }}/releases/download/libv8-v${ver}/librusty_v8_simdutf_release_${triple}.a.gz" >> "$GITHUB_ENV"
+      - uses: "dtolnay/rust-toolchain@stable"
+      - uses: "ruby/setup-ruby@v1"
+        with:
+          ruby-version: "${{ matrix.ruby }}"
+          bundler-cache: true
+      - name: "Compile + test"
+        run: "bundle exec rake test"
