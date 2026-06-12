@@ -299,6 +299,38 @@ class RustyRacerTest < Minitest::Test
     assert_equal 42, @ctx.eval('Ns.const()') # dotted path creates the namespace
   end
 
+  def test_host_callback_args_survive_gc_during_marshalling
+    # When JS calls an attached proc, each arg is marshalled into fresh Ruby
+    # objects one after another. An earlier arg must stay GC-rooted while a later
+    # arg is being built (marshalling allocates Strings/Arrays/Hashes, which can
+    # trigger a GC) — a bare Vec<Value> would hide it from the mark phase and the
+    # GC would sweep it, handing the proc a dangling VALUE that corrupts the heap.
+    # GC.stress forces a GC at every allocation, so the inter-arg window is hit
+    # deterministically (without it the crash is ~2 in several hundred runs).
+    @ctx.attach('sink', proc {|a, b, c, d|
+      "#{a['k'].join(',')}|#{b.length}|#{c}|#{d.length}"
+    })
+    @ctx.eval(<<~JS)
+      function feed() {
+        return sink(
+          {k: [1, 2, 3]},
+          ['x', 'y', 'z', 'w'],
+          'hello world',
+          new Array(64).fill('z').join('')
+        )
+      }
+    JS
+
+    GC.stress = true
+    begin
+      20.times do
+        assert_equal '1,2,3|4|hello world|64', @ctx.eval('feed()')
+      end
+    ensure
+      GC.stress = false
+    end
+  end
+
   def test_reattach_after_realm_dispose_binds_the_new_proc
     # dispose returns a realm's proc slots to the free list, so a later attach
     # recycles a slot id. Guard that a recycled id always binds the NEW proc,

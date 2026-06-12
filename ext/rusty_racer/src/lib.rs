@@ -3215,13 +3215,24 @@ impl Core {
                 .ok_or("unknown host function")?
                 .get()
         };
-        let ruby_args: Vec<Value> = args
-            .iter()
-            .map(|v| jsval_to_ruby(ruby, v))
-            .collect::<Result<_, Error>>()
-            .map_err(|e| e.to_string())?;
+        // Marshal into a Ruby Array, NOT a Vec<Value>: bare Values in a heap Vec
+        // are hidden from Ruby's GC mark phase (magnus's own RArray::to_vec doc
+        // spells this out). With several args, once arg N is parked in the Vec
+        // while arg N+1's marshalling allocates — jsval_to_ruby builds Strings/
+        // Arrays/Hashes — a GC there sweeps the still-referenced arg N, and the
+        // proc then runs with a dangling VALUE that corrupts the heap and crashes
+        // later (seen as a rare host-callback SEGV with an all-libruby C trace).
+        // An RArray held as a live local keeps every element marked throughout.
+        let ruby_args = ruby.ary_new_capa(args.len());
+        for v in args {
+            ruby_args
+                .push(jsval_to_ruby(ruby, v).map_err(|e| e.to_string())?)
+                .map_err(|e| e.to_string())?;
+        }
+        // SAFETY: ruby_args is a live local (so GC keeps it and its elements) and
+        // is not mutated while the slice is borrowed — as_slice's contract.
         let result: Result<Value, Error> =
-            with_nested(self, answer, || proc.call(ruby_args.as_slice()));
+            with_nested(self, answer, || proc.call(unsafe { ruby_args.as_slice() }));
         let value = result.map_err(|e| e.to_string())?;
         ruby_to_jsval(value).map_err(|e| e.to_string())
     }
@@ -3965,6 +3976,16 @@ fn jsval_to_ruby(ruby: &Ruby, val: &JsVal) -> Result<Value, Error> {
     let mut built: HashMap<u32, Value> = HashMap::new();
     jsval_to_ruby_d(ruby, val, &mut built)
 }
+
+// `built` is a HashMap<u32, Value> — the same "bare Values in a heap container,
+// hidden from the GC mark phase" shape that's a use-after-free in call_proc. It
+// is safe HERE only because every entry is, at every allocating safepoint, ALSO
+// reachable from a live stack local: each container arm (Array/Obj/Map/Set)
+// keeps its arr/h/set as a live local while its children recurse and grafts each
+// child into it (push/aset), so the child is marked transitively; Bytes inserts
+// then immediately returns its live local `s`. So `built` never holds the sole
+// reference. This invariant is load-bearing: do NOT refactor an arm to stash a
+// value in `built` without keeping it rooted by a live local until it's grafted.
 
 fn jsval_to_ruby_d(
     ruby: &Ruby,
