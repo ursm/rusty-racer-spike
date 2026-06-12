@@ -149,7 +149,7 @@ jobs:
           ruby-version: "4.0"
       - name: "Download the compiled gems"
         # Same artifact the compile leg uploaded for this platform.
-        uses: "actions/download-artifact@v5"
+        uses: "actions/download-artifact@v8"
         with:
           name: "stage-${{ runner.os }}-${{ runner.arch }}"
       - name: "Install ONLY the precompiled platform gem, then load it"
