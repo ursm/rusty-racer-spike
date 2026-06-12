@@ -7,4 +7,4 @@ gemspec
 gem "rake"
 gem "rake-compiler"
 gem "rb_sys", "~> 0.9"
-gem "minitest", "~> 5"
+gem "minitest", "~> 6"
