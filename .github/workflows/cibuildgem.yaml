@@ -106,6 +106,10 @@ jobs:
       matrix:
         os: ["ubuntu-22.04", "ubuntu-22.04-arm", "macos-latest", "macos-26-intel"]
     runs-on: "${{ matrix.os }}"
+    # Capture the rare watchdog "leaked terminate" anomaly if it recurs here (it
+    # last surfaced on a slow runner) — prints [rusty watchdog ANOMALY] + state.
+    env:
+      RUSTY_RACER_WATCHDOG_DEBUG: "1"
     steps:
       - name: "Checkout code"
         uses: "actions/checkout@v6"

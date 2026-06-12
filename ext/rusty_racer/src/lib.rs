@@ -639,6 +639,12 @@ fn query_region_bounds(_addr: usize) -> (usize, usize) {
 // Set from RUSTY_RACER_STACK_DEBUG at init; gates the per-op stack diagnostics.
 static STACK_DEBUG: AtomicBool = AtomicBool::new(false);
 
+// Set from RUSTY_RACER_WATCHDOG_DEBUG at init (OFF by default); gates the
+// watchdog-anomaly canary in run_js_bracketed — a diagnostic for the rare
+// next-op-spuriously-terminated leak. Off in production (it would also fire on a
+// legitimate Isolate#terminate); CI turns it on so a recurrence is diagnosable.
+static WATCHDOG_DEBUG: AtomicBool = AtomicBool::new(false);
+
 // Re-point V8's stack limit at the CURRENT stack each op. In-thread V8 runs
 // wherever the Ruby code is: usually the native thread's pthread stack, but also
 // a Ruby Fiber's separate mmap'd stack (Capybara::Result is an Enumerator) that
@@ -1570,17 +1576,61 @@ fn run_js_bracketed(
     scope: &mut v8::PinScope<'_, '_, ()>,
     outermost: bool,
     timeout_ms: u64,
+    label: &'static str,
     body: impl FnOnce(&mut v8::PinScope<'_, '_, ()>, bool) -> (bool, Result<JsVal, VmError>),
 ) -> Result<JsVal, VmError> {
+    let started = Instant::now();
     let watchdog = arm_watchdog(scope, timeout_ms);
     let (ran_js, mut outcome) = body(scope, outermost);
-    if disarm_watchdog(scope, watchdog) {
+    let fired = disarm_watchdog(scope, watchdog);
+    // CANARY (RUSTY_RACER_WATCHDOG_DEBUG): the op's JS was terminated but THIS
+    // op's OWN watchdog frame did NOT fire — so a terminate LEAKED in from
+    // elsewhere (a prior op's timeout surviving both the end- and start-sweep
+    // cancels, or a user Isolate#terminate). The rare CI "next op spuriously
+    // terminated" bug lands here; dump the watchdog state + timing so a
+    // recurrence is diagnosable instead of an unreproducible mystery.
+    if WATCHDOG_DEBUG.load(Ordering::Relaxed)
+        && ran_js
+        && !fired
+        && matches!(outcome, Err(VmError::Terminated))
+    {
+        report_watchdog_anomaly(scope, label, watchdog, timeout_ms, started.elapsed());
+    }
+    if fired {
         istate!(scope).watchdog_fired = true;
         if ran_js {
             outcome = Err(VmError::Terminated);
         }
     }
     outcome
+}
+
+// Dump watchdog/terminate state on the leaked-terminate anomaly (see the CANARY
+// in run_js_bracketed). Only reached on that rare path, and only with the debug
+// flag on. elapsed_ms << timeout_ms with a clean inner = a V8-level stale
+// terminate (not the Rust bookkeeping); a non-empty inner.frames /
+// fired_generation would instead point at a frame-lifecycle bug.
+fn report_watchdog_anomaly(
+    scope: &mut v8::PinScope<'_, '_, ()>,
+    label: &str,
+    this_gen: Option<u64>,
+    timeout_ms: u64,
+    elapsed: Duration,
+) {
+    let terminating = scope.is_execution_terminating();
+    let st = istate!(scope);
+    let watchdog_fired_flag = st.watchdog_fired;
+    let inner = st.watchdog.inner.lock().unwrap();
+    let frames: Vec<u64> = inner.frames.iter().map(|f| f.generation).collect();
+    eprintln!(
+        "[rusty watchdog ANOMALY] op={label} terminated but its OWN watchdog frame \
+         did NOT fire (leaked terminate). this_gen={this_gen:?} timeout_ms={timeout_ms} \
+         elapsed_ms={:.2} is_terminating={terminating} watchdog_fired_flag={watchdog_fired_flag} \
+         inner.frames={frames:?} inner.fired_generation={:?} inner.next_generation={}",
+        elapsed.as_secs_f64() * 1000.0,
+        inner.fired_generation,
+        inner.next_generation,
+    );
 }
 
 // Drop every module AND script compiled in `context_id` (its v8::Context is
@@ -2104,7 +2154,7 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 filename,
                 timeout_ms,
             } => {
-                let outcome = run_js_bracketed(scope, outermost, timeout_ms, |scope, outermost| {
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, "eval", |scope, outermost| {
                     let realm = context_for(istate!(scope), context_id);
                     match realm {
                         Some(ctx) => {
@@ -2128,7 +2178,7 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
             } => {
                 // A host fn invoked by the called function runs inline
                 // (host_fn_callback, with_gvl) — no routing setup needed.
-                let outcome = run_js_bracketed(scope, outermost, timeout_ms, |scope, outermost| {
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, "call", |scope, outermost| {
                     let realm = context_for(istate!(scope), context_id);
                     match realm {
                         Some(ctx) => {
@@ -2176,7 +2226,7 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 // arbitrary JS. So it goes through the same bracket as Eval: a
                 // host fn the trap calls routes back, and a looping trap is
                 // time-capped.
-                let outcome = run_js_bracketed(scope, outermost, timeout_ms, |scope, outermost| {
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, "attach", |scope, outermost| {
                     let realm = context_for(istate!(scope), context_id);
                     match realm {
                         Some(ctx) => {
@@ -2213,7 +2263,7 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 // NOT transactional: entries before the failure stay attached —
                 // the realm is not rolled back (matches single Attach, which also
                 // commits its one write or fails it).
-                let outcome = run_js_bracketed(scope, outermost, timeout_ms, |scope, outermost| {
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, "attach_many", |scope, outermost| {
                     let realm = context_for(istate!(scope), context_id);
                     match realm {
                         Some(ctx) => {
@@ -2469,7 +2519,7 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 // Top-level module code (and, under :auto, the microtasks its
                 // TLA continuation drains) can loop, so it runs in the same
                 // watchdog bracket as Eval/Call/RunScript.
-                let outcome = run_js_bracketed(scope, outermost, timeout_ms, |scope, outermost| {
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, "evaluate_module", |scope, outermost| {
                 let handle = module_handle(istate!(scope), module_id);
                 match handle {
                     None => (false, Err(VmError::Runtime("unknown module".into()))),
@@ -2692,7 +2742,7 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 script_id,
                 timeout_ms,
             } => {
-                let outcome = run_js_bracketed(scope, outermost, timeout_ms, |scope, outermost| {
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, "run_script", |scope, outermost| {
                     let handle = script_handle(istate!(scope), script_id);
                     match handle {
                         None => (false, Err(VmError::Runtime("unknown script".into()))),
@@ -2923,6 +2973,10 @@ fn init_v8() {
     ONCE.call_once(|| {
         STACK_DEBUG.store(
             std::env::var_os("RUSTY_RACER_STACK_DEBUG").is_some(),
+            Ordering::Relaxed,
+        );
+        WATCHDOG_DEBUG.store(
+            std::env::var_os("RUSTY_RACER_WATCHDOG_DEBUG").is_some(),
             Ordering::Relaxed,
         );
         let platform = v8::new_default_platform(0, false).make_shared();

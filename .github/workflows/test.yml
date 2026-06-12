@@ -23,6 +23,11 @@ jobs:
         os: ["ubuntu-22.04", "ubuntu-22.04-arm", "macos-latest", "macos-26-intel"]
         ruby: ["3.3", "3.4", "4.0"]
     runs-on: "${{ matrix.os }}"
+    # Capture the rare watchdog "leaked terminate" anomaly (a next op spuriously
+    # ScriptTerminated) if it ever recurs here — prints [rusty watchdog ANOMALY]
+    # with the watchdog state + timing. Off in production; on in CI only.
+    env:
+      RUSTY_RACER_WATCHDOG_DEBUG: "1"
     steps:
       - uses: "actions/checkout@v6"
       - name: "Point at the prebuilt library-TLS V8 archive (linux only)"
