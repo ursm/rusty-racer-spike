@@ -1479,6 +1479,25 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2, @ctx.eval('1 + 1') # isolate still works on the main stack
   end
 
+  def test_fiber_eval_survives_garbage_collection
+    # V8's conservative GC walks the C stack from a marker up to its recorded
+    # stack_start; on a fiber that start is still the NATIVE thread top (a
+    # different mmap region), so a full GC during a fiber op would run the scan
+    # off the fiber's mapped stack and SEGV. The runner re-points the scan start
+    # to a live address above the op's V8 frames; allocate hard inside a fiber to
+    # trigger the scanning GC and prove it stays mapped. (Avo's Capybara filter
+    # chain hit this.)
+    out = Fiber.new do
+      last = nil
+      2_000.times do
+        last = @ctx.eval('(function () { let a = []; for (let i = 0; i < 1000; i++) a.push({ k: i, v: [i, i + 1] }); return a.length })()')
+      end
+      last
+    end.resume
+    assert_equal 1000, out
+    assert_equal 2, @ctx.eval('1 + 1')
+  end
+
   def test_isolate_is_thread_confined
     # Every op must run on the isolate's owner thread; a foreign-thread op raises
     # WrongThreadError rather than corrupting V8.

@@ -458,6 +458,62 @@ fn error_to_exception(e: &Error) -> Option<Exception> {
 unsafe extern "C" {
     #[link_name = "_ZN2v87Isolate13SetStackLimitEm"]
     fn v8__Isolate__SetStackLimit(isolate: *mut c_void, stack_limit: usize);
+    // V8's own (exported) accessors down to the conservative-GC-scan Stack
+    // object, so we can re-point its stack_start per op when V8 runs on a Ruby
+    // Fiber (see set_fiber_scan_start / discover_scan_start_field). Member fns:
+    // the first arg is `this`. The public v8::Isolate* IS i::Isolate*.
+    #[link_name = "_ZN2v88internal7Isolate4heapEv"]
+    fn v8__internal__Isolate__heap(isolate: *mut c_void) -> *mut c_void;
+    #[link_name = "_ZN2v88internal4Heap5stackEv"]
+    fn v8__internal__Heap__stack(heap: *mut c_void) -> *mut c_void;
+    // Sets the scan stack_start to v8::base::Stack::GetStackStart() (the native
+    // pthread top) — used only to positively identify the field during discovery.
+    #[link_name = "_ZN2v88internal4Heap13SetStackStartEv"]
+    fn v8__internal__Heap__SetStackStart(heap: *mut c_void);
+    #[link_name = "_ZN2v84base5Stack13GetStackStartEv"]
+    fn v8__base__Stack__GetStackStart() -> usize;
+}
+
+// Locate V8's conservative-GC-scan stack_start field
+// (heap::base::Stack::current_segment_.start) so set_fiber_scan_start can
+// re-point it per op. The scanner walks [SP, stack_start); on a Ruby Fiber V8's
+// stack_start is still the NATIVE thread top, a different region, so the walk
+// runs off the fiber's mapped top into the guard page and SEGVs (the residual
+// after the limit fix). We reach the Stack via V8's exported Isolate::heap()/
+// Heap::stack(); the field is the first word of Stack (current_segment_ is its
+// first member, .start the first field), but we VERIFY rather than trust the
+// layout: Heap::SetStackStart() writes that field to base::Stack::GetStackStart(),
+// so if poking a sentinel and re-calling SetStackStart restores the value at
+// offset 0, that word IS the field. Any mismatch returns 0 (override disabled —
+// V8 keeps its native start, i.e. the rare pre-fix crash, NEVER corruption).
+// Must run with the isolate ENTERED. `real_isolate` is the raw v8::Isolate*.
+fn discover_scan_start_field(real_isolate: *mut c_void) -> usize {
+    const SENTINEL: usize = 0xA5A5_A5A5_A5A5_A5A5;
+    unsafe {
+        let heap = v8__internal__Isolate__heap(real_isolate);
+        if heap.is_null() {
+            return 0;
+        }
+        let stack = v8__internal__Heap__stack(heap);
+        if stack.is_null() {
+            return 0;
+        }
+        let nt = v8__base__Stack__GetStackStart();
+        if nt == 0 {
+            return 0;
+        }
+        v8__internal__Heap__SetStackStart(heap); // start := nt
+        let field = stack as *mut usize; // expected &current_segment_.start
+        if field.read() != nt {
+            return 0; // offset 0 isn't the field (layout changed) — disable
+        }
+        field.write(SENTINEL);
+        v8__internal__Heap__SetStackStart(heap); // must rewrite the same word
+        if field.read() != nt {
+            return 0; // SetStackStart doesn't own offset 0 — disable
+        }
+        stack as usize
+    }
 }
 
 // The native thread's stack bounds are stable per NATIVE thread, but querying
@@ -598,15 +654,23 @@ static STACK_DEBUG: AtomicBool = AtomicBool::new(false);
 // fibers and SEGV'd). Must be called with the isolate ENTERED. `real_isolate` is
 // the raw v8::Isolate* read out of iso_ptr.
 //
-// LIMITATION (worker-thread fibers): V8's central-stack view is anchored to
-// `base::Stack::GetStackStart()` — the pthread stack top, cached per native
-// thread, with no API to retarget it. A fiber whose mmap lands ABOVE that top
-// (the common case on a NON-main native thread, whose stack sits at a lower
-// address than later fiber mmaps) is outside the view, so V8 aborts
-// (`IsOnCentralStack()`) on the next GC or throw — the stack LIMIT can't fix it.
-// On the main thread the process stack is the highest address, so every fiber is
-// below it and safe; that's the case Capybara/Avo actually hits. See README.
-fn set_v8_stack_limit(real_isolate: *mut c_void) {
+// On a fiber it ALSO re-points V8's conservative-GC-scan stack_start (via
+// scan_start_field, discovered once per isolate) to `stack_top`: Enter just set
+// it to the native top, but the scanner walks [marker, stack_start), so a native
+// start runs the scan off the fiber's mapped stack into unmapped memory and
+// SEGVs (Avo's Capybara filter chain). scan_start_field is 0 when discovery
+// failed (override disabled).
+//
+// LIMITATION (worker-thread fibers): the GC and a thrown exception ALSO
+// `CHECK(IsOnCentralStack(SP))`, which tests the SP against
+// `base::Stack::GetStackStart()` — the pthread top, cached per native thread,
+// with no API to retarget — NOT the scan start we re-point above. A fiber mmap'd
+// ABOVE that top (the common case on a NON-main native thread, whose stack sits
+// below later fiber mmaps) fails the CHECK, so V8 aborts on the next GC or throw.
+// We can fix the scan (the SEGV) but not that CHECK. On the main thread the
+// process stack is the highest address, so every fiber is below it and both the
+// scan and the CHECK are safe — the Capybara/Avo case. See README.
+fn set_v8_stack_limit(real_isolate: *mut c_void, scan_start_field: usize, stack_top: usize) {
     let sp_marker = 0u8;
     let sp = &sp_marker as *const u8 as usize;
     let (nbottom, ntop) = native_stack_bounds_cached();
@@ -640,6 +704,18 @@ fn set_v8_stack_limit(real_isolate: *mut c_void) {
         return; // couldn't determine a sane limit — leave V8's default
     }
     unsafe { v8__Isolate__SetStackLimit(real_isolate, limit) };
+    // On a fiber, re-point V8's conservative-GC-scan stack_start to `stack_top`
+    // — a live address captured by the caller ABOVE every V8 frame of this op.
+    // Enter() set the start to the NATIVE top (a different region); the scanner
+    // walks [marker, start), so a native start runs it off the fiber's mapped
+    // top into unmapped memory and SEGVs. Anchoring to stack_top keeps the whole
+    // scan range between two real stack pointers (marker..stack_top), so it's
+    // guaranteed mapped, and every V8 root (all below stack_top) is still found.
+    // (We can't use the /proc/maps region top here: that mapping isn't reliably
+    // contiguous, so the scan could still hit a hole below it.)
+    if !on_native && stack_top != 0 && scan_start_field != 0 {
+        unsafe { (scan_start_field as *mut usize).write(stack_top) };
+    }
     // Opt-in diagnostics (RUSTY_RACER_STACK_DEBUG): the SP vs the native stack
     // [nbottom, ntop], the fiber region (if any), the per-op limit, and whether
     // the SP is above the limit. A crash with sp_above_limit=false means the
@@ -2760,6 +2836,11 @@ struct Core {
     // so a re-entrant op can't double-borrow the registry. Dereferenced only on
     // the owner thread.
     iso_ptr: IsoPtr,
+    // Address of V8's conservative-GC-scan stack_start field (see
+    // discover_scan_start_field), or 0 if discovery failed. set_v8_stack_limit
+    // writes the fiber region top here per fiber op so a GC scan stays mapped.
+    // Set once at creation, then read-only; AtomicUsize for shared &Core access.
+    scan_start_field: std::sync::atomic::AtomicUsize,
     // Re-entry depth for THIS isolate, readable without a scope (the runner needs
     // it to choose the scope kind before any scope exists): 0 = top-level op
     // (open a fresh HandleScope from iso_ptr); >0 = a host callback is on the V8
@@ -3292,6 +3373,7 @@ impl Isolate {
             owner: owner_thread.as_raw() as usize,
             _owner_root: RootedThread(BoxValue::new(owner_thread)),
             iso_ptr,
+            scan_start_field: std::sync::atomic::AtomicUsize::new(0),
             depth: std::sync::atomic::AtomicU32::new(0),
             procs: Mutex::new(ProcTable::default()),
             default_timeout_ms: timeout_ms,
@@ -3303,6 +3385,15 @@ impl Isolate {
         // (host fn / module resolver), which holds only a scope, can reach Core.
         // Pure slot access — no V8 handles — so reach it through the raw ptr.
         istate!(unsafe { &mut *core.iso_ptr.0 }).core_ptr = Arc::as_ptr(&core);
+        // Discover V8's conservative-GC-scan stack_start field once now, while the
+        // isolate is still ENTERED (so Heap/Stack are reachable and Enter has set
+        // the field to the native top, which the discovery verifies against). 0 if
+        // it can't be confirmed — the fiber scan-start override then stays off.
+        {
+            let real_isolate = unsafe { *(core.iso_ptr.0 as *const *mut c_void) };
+            core.scan_start_field
+                .store(discover_scan_start_field(real_isolate), Ordering::Relaxed);
+        }
         // v8::Isolate::new ENTERED the isolate (and the boot above needed it).
         // EXIT it now: with several isolates created/disposed on one thread in
         // any order, keeping each entered for life would break V8's LIFO
@@ -3368,7 +3459,19 @@ impl Core {
                 // *mut v8::Isolate = *mut NonNull<RealIsolate>; the raw
                 // v8::Isolate* the C++ method wants is that NonNull's value.
                 let real_isolate = unsafe { *(iso as *const *mut c_void) };
-                set_v8_stack_limit(real_isolate);
+                // A live address ABOVE every V8 frame of this op (the scope and
+                // service_request below run in deeper frames). On a fiber it
+                // becomes V8's conservative-GC-scan stack_start so the scan stays
+                // within the live, mapped stack — see set_v8_stack_limit.
+                let stack_top_marker = 0u8;
+                // Word-align (down): V8 CHECKs the scan start is pointer-aligned.
+                // Down stays above all V8 frames (they're a full frame below).
+                let stack_top = (&stack_top_marker as *const u8 as usize) & !(size_of::<usize>() - 1);
+                set_v8_stack_limit(
+                    real_isolate,
+                    self.scan_start_field.load(Ordering::Relaxed),
+                    stack_top,
+                );
                 let reply = std::panic::catch_unwind(AssertUnwindSafe(|| {
                     v8::scope!(let scope, unsafe { &mut *iso });
                     service_request(scope, request, true)
