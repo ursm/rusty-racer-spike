@@ -1130,47 +1130,9 @@ struct V8State {
 // (the binding adds INTERNAL_SLOT_COUNT); nothing else here uses embedder data.
 const REALM_ID_SLOT: i32 = 0;
 
-thread_local! {
-    static STATE: RefCell<V8State> = RefCell::new(V8State::default());
-    static MODULES: RefCell<ModuleReg> = RefCell::new(ModuleReg::default());
-    static SCRIPTS: RefCell<ScriptReg> = RefCell::new(ScriptReg::default());
-    // Realm ids of requests currently on this thread's stack (the running one
-    // plus any suspended outer frames). A nested Reset/DisposeContext of an
-    // ACTIVE realm is refused: swapping/dropping the v8::Context behind a
-    // suspended frame corrupts the in-flight request's registry entries and
-    // defeats the cross-context import guards (which compare realm ids — the
-    // id would survive the swap while naming a different v8::Context).
-    static ACTIVE_REALMS: RefCell<Vec<i32>> = const { RefCell::new(Vec::new()) };
-    // True while InstantiateModule is on this thread's stack. A nested
-    // instantiate (from a resolve block) walks V8's half-built module graph
-    // and SEGVs the process, so it is refused up front — a resolve block may
-    // COMPILE lazily and let the outer instantiate resolve the imports.
-    static INSTANTIATING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    // Set when any watchdog (own or nested) fired during the current request
-    // stack. V8's terminate flag is isolate-global, so a NESTED frame must
-    // never cancel it — that could erase a termination aimed at the suspended
-    // outer JS (Isolate#terminate, or the outer request's own watchdog). A
-    // nested watchdog's termination instead escalates outward as the
-    // suspended frames resume; the OUTERMOST frame sweeps any leftover flag
-    // once the stack has unwound, so a late/unconsumed TerminateExecution
-    // cannot poison the next request (audit #3).
-    static WATCHDOG_FIRED: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    // Whether this isolate auto-drains microtasks at the end of an OUTERMOST
-    // request (the kAuto contract — HTML's "clean up after running script").
-    // We keep V8 on the Explicit policy and drain ourselves, in-bracket, so
-    // the drain is covered by the request's watchdog and honours termination
-    // (V8's own kAuto drain inside Function::Call ignores TerminateExecution,
-    // which would hang a timed-out call forever). false = the :explicit mode,
-    // where only perform_microtask_checkpoint drains.
-    static AUTO_MICROTASKS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-    // True while a microtask checkpoint (auto_drain or DrainMicrotasks) is
-    // running. V8's microtask queue is per-ISOLATE, so a checkpoint entered in
-    // one realm can run a microtask enqueued by ANOTHER realm — and ACTIVE_REALMS
-    // only knows the draining realm, not the one whose microtask is live. So a
-    // nested Reset/DisposeContext during a checkpoint is refused for EVERY realm
-    // (we can't tell which is mid-flight on the V8 stack); see Reset/DisposeContext.
-    static DRAINING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
-}
+// (STATE/MODULES/SCRIPTS/ACTIVE_REALMS/INSTANTIATING/WATCHDOG_FIRED/
+// AUTO_MICROTASKS/DRAINING moved into IsolateState in the isolate slot, reached
+// via istate!(scope). Their invariants are documented on IsolateState's fields.)
 
 // ---------------------------------------------------------------------------
 // In-thread execution (replaces the dedicated-V8-thread + channel model)
@@ -1237,13 +1199,19 @@ impl IsolateState {
     }
 }
 
-// The IsolateState parked in `scope`'s isolate slot. Panics if absent — every
-// isolate the binding makes installs one at creation, so a miss is a binding bug.
-#[allow(dead_code)]
-fn istate<'a>(scope: &'a mut v8::PinScope<'_, '_>) -> &'a mut IsolateState {
-    scope
-        .get_slot_mut::<IsolateState>()
-        .expect("IsolateState missing from isolate slot")
+// The IsolateState parked in a scope's isolate slot (a macro, not a fn, so it
+// works on any scope type — HandleScope/ContextScope/TryCatch all reach
+// get_slot_mut via deref, which a generic fn can't express over the PinScope
+// alias). Borrows the scope mutably, so use it in SHORT bursts, never held
+// across a JS run (a re-entrant host callback must be able to borrow it again).
+// Panics if absent — every isolate the binding makes installs one, so a miss is
+// a bug.
+macro_rules! istate {
+    ($scope:expr) => {
+        $scope
+            .get_slot_mut::<IsolateState>()
+            .expect("IsolateState missing from isolate slot")
+    };
 }
 
 // The owning thread's live OwnedIsolates, keyed by id. This is the ONLY piece
@@ -1699,11 +1667,7 @@ fn watchdog_loop(shared: Arc<WatchdogShared>, handle: v8::IsolateHandle) {
     }
 }
 
-thread_local! {
-    // The V8 thread's handle to its watchdog (set in v8_thread_main before the
-    // request loop). arm/disarm reach it from inside service_request.
-    static WATCHDOG: RefCell<Option<Arc<WatchdogShared>>> = const { RefCell::new(None) };
-}
+// (The watchdog Arc now lives in IsolateState; arm/disarm reach it via istate!.)
 
 // Arm the watchdog for this request: push a frame with its own deadline and
 // wake the loop. Returns the generation token to hand to `disarm_watchdog`
@@ -1777,7 +1741,6 @@ fn v8_thread_main(
     // auto_drain): :auto drains at the outermost request, :explicit only on
     // perform_microtask_checkpoint / the host-namespace drainMicrotasks.
     isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
-    AUTO_MICROTASKS.with(|a| a.set(!explicit_microtasks));
     // JS import() routes here; rejects unless a dynamic_import_resolver is set.
     isolate.set_host_import_module_dynamically_callback(dynamic_import_cb);
     // Fills import.meta.url (the module's compile-time filename) on first access.
@@ -1786,40 +1749,26 @@ fn v8_thread_main(
     // registered via NS.setPromiseRejectHandler (no-op otherwise).
     isolate.set_promise_reject_callback(promise_reject_cb);
     let _ = handle_tx.send(isolate.thread_safe_handle());
-    // One persistent watchdog thread for the isolate's whole life; requests
-    // arm/disarm it instead of each spawning their own (see WatchdogShared).
-    let watchdog_shared = Arc::new(WatchdogShared {
-        inner: Mutex::new(WatchdogInner {
-            frames: Vec::new(),
-            next_generation: 0,
-            fired_generation: None,
-            shutdown: false,
-        }),
-        cv: Condvar::new(),
-    });
+    // All per-isolate state now lives in the isolate's slot (reached anywhere via
+    // istate!(scope)). IsolateState::new seeds the host namespace + next realm id
+    // and creates the watchdog; install it, then spawn the one persistent
+    // watchdog thread (requests arm/disarm it — see WatchdogShared). The timeout
+    // here is unused in the channel model (Core still holds default_timeout_ms).
+    let state = IsolateState::new(host_namespace, 0, !explicit_microtasks);
+    let watchdog_shared = Arc::clone(&state.watchdog);
+    isolate.set_slot(state);
     let watchdog_thread = {
         let shared = Arc::clone(&watchdog_shared);
         let handle = isolate.thread_safe_handle();
         std::thread::spawn(move || watchdog_loop(shared, handle))
     };
-    WATCHDOG.with(|w| *w.borrow_mut() = Some(Arc::clone(&watchdog_shared)));
-    // Boot the main realm (id 0) into the thread-local STATE, where
-    // service_request — callable with only a scope in hand — can reach it.
-    // The host-namespace name goes in first so new_realm can read it.
+    // Boot the main realm (id 0) into the slot, where service_request — callable
+    // with only a scope in hand — reaches it. new_realm reads the host namespace
+    // from the slot (seeded above).
     {
         v8::scope!(let scope, &mut isolate);
-        STATE.with(|s| {
-            *s.borrow_mut() = V8State {
-                main_context: None,
-                contexts: HashMap::new(),
-                next_context_id: 1,
-                host_namespace,
-                security_token: None,
-                promise_reject_handler: None,
-            };
-        });
         let main_context = new_realm(scope, 0);
-        STATE.with(|s| s.borrow_mut().main_context = Some(main_context));
+        istate!(scope).realms.main_context = Some(main_context);
     }
 
     while let Ok(request) = rx.recv() {
@@ -1828,15 +1777,18 @@ fn v8_thread_main(
             break;
         }
     }
-    // Every v8::Global parked in this thread's TLS registries must die before
-    // the isolate it points into. Clear them here explicitly: thread-exit TLS
-    // destructors would run AFTER `isolate` drops below.
-    STATE.with(|s| *s.borrow_mut() = V8State::default());
-    MODULES.with(|m| *m.borrow_mut() = ModuleReg::default());
-    SCRIPTS.with(|s| *s.borrow_mut() = ScriptReg::default());
+    // Every v8::Global parked in the slot's registries must die before the
+    // isolate it points into. Clear them here explicitly (the slot's IsolateState
+    // is otherwise dropped by V8 during isolate disposal, too late for Globals).
+    {
+        v8::scope!(let scope, &mut isolate);
+        let st = istate!(scope);
+        st.realms = V8State::default();
+        st.modules = ModuleReg::default();
+        st.scripts = ScriptReg::default();
+    }
     // Stop the watchdog and join it before the isolate (whose handle it holds)
     // drops, so no terminate can land after teardown.
-    WATCHDOG.with(|w| *w.borrow_mut() = None);
     {
         let mut inner = watchdog_shared.inner.lock().unwrap();
         inner.shutdown = true;
