@@ -3484,6 +3484,13 @@ impl Core {
                 // proc that issued this op, is on the V8 stack): the isolate is
                 // already entered by the depth-0 op on THIS native thread, so
                 // bootstrap onto the ambient HandleScope rather than re-enter.
+                // The stack limit + scan-start set at depth 0 are NOT re-pointed
+                // here: reentry runs in DEEPER frames of the SAME stack, so the
+                // depth-0 values still bound it correctly. The one exception is a
+                // host callback that SWITCHES stacks — e.g. resumes a Ruby Fiber
+                // that itself evals — where the depth-0 (native) settings are
+                // stale for the fiber; that nested-fiber-under-callback case is an
+                // unsupported edge (the realistic fiber path is a depth-0 eval).
                 std::panic::catch_unwind(AssertUnwindSafe(|| {
                     v8::callback_scope!(unsafe scope, unsafe { &mut *iso });
                     service_request(scope, request, false)
