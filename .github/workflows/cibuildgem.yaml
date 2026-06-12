@@ -76,13 +76,13 @@ jobs:
         # the asset is missing (e.g. libv8-rusty.yml not yet run for this arch).
         if: "${{ runner.os == 'Linux' }}"
         run: |
-          ver=$(grep -oP '^v8 = "\K[0-9][0-9.]*' ext/rusty_racer/Cargo.toml)
+          ver=$(grep -oP '^v8 = .*?"\K[0-9][0-9.]*' ext/rusty_racer/Cargo.toml)
           case "$(uname -m)" in
             x86_64)  triple=x86_64-unknown-linux-gnu ;;
             aarch64) triple=aarch64-unknown-linux-gnu ;;
             *) echo "::error::unsupported linux arch $(uname -m)"; exit 1 ;;
           esac
-          url="https://github.com/${{ github.repository }}/releases/download/libv8-v${ver}/librusty_v8_release_${triple}.a.gz"
+          url="https://github.com/${{ github.repository }}/releases/download/libv8-v${ver}/librusty_v8_simdutf_release_${triple}.a.gz"
           curl -fsI "$url" >/dev/null || { echo "::error::$url not found — run libv8-rusty.yml for v8 ${ver} (${triple}) first"; exit 1; }
           echo "RUSTY_V8_ARCHIVE=$url" >> "$GITHUB_ENV"
           echo "linking $url"
@@ -115,13 +115,13 @@ jobs:
         # DERIVATION IN SYNC with the compile job's step above.
         if: "${{ runner.os == 'Linux' }}"
         run: |
-          ver=$(grep -oP '^v8 = "\K[0-9][0-9.]*' ext/rusty_racer/Cargo.toml)
+          ver=$(grep -oP '^v8 = .*?"\K[0-9][0-9.]*' ext/rusty_racer/Cargo.toml)
           case "$(uname -m)" in
             x86_64)  triple=x86_64-unknown-linux-gnu ;;
             aarch64) triple=aarch64-unknown-linux-gnu ;;
             *) echo "::error::unsupported linux arch $(uname -m)"; exit 1 ;;
           esac
-          echo "RUSTY_V8_ARCHIVE=https://github.com/${{ github.repository }}/releases/download/libv8-v${ver}/librusty_v8_release_${triple}.a.gz" >> "$GITHUB_ENV"
+          echo "RUSTY_V8_ARCHIVE=https://github.com/${{ github.repository }}/releases/download/libv8-v${ver}/librusty_v8_simdutf_release_${triple}.a.gz" >> "$GITHUB_ENV"
       - name: "Setup Ruby"
         uses: "ruby/setup-ruby@v1"
         with:

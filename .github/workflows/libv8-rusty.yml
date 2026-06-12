@@ -101,6 +101,12 @@ jobs:
         working-directory: rusty_v8
         env:
           V8_FROM_SOURCE: "1"
+          # Build simdutf into the archive (rusty_v8's SIMD UTF-8/UTF-16
+          # transcoding). The gem links it with the `simdutf` cargo feature for
+          # ~6-8x faster non-ASCII string marshalling; the symbols must be present
+          # in the archive or the gem link fails undefined. EXTRA_GN_ARGS is
+          # appended to the gn args by the v8 build.rs.
+          EXTRA_GN_ARGS: "rusty_v8_enable_simdutf=true"
         run: |
           set -uo pipefail
           # aarch64 cross-compiles from this x86_64 host: CARGO_BUILD_TARGET makes
@@ -148,7 +154,7 @@ jobs:
           mkdir -p out
           # gzip so the asset (and every cibuildgem download) is ~tens of MB, not
           # ~190MB. The gem's build.rs (copy_archive) auto-detects the gzip magic.
-          gzip -c "$ARCHIVE" > "out/librusty_v8_release_${{ matrix.target }}.a.gz"
+          gzip -c "$ARCHIVE" > "out/librusty_v8_simdutf_release_${{ matrix.target }}.a.gz"
           ls -lh out/
       - name: "Upload the arch-specific archive to the release"
         env:
@@ -162,4 +168,4 @@ jobs:
           tag="libv8-${{ inputs.rusty_v8_tag }}"
           # The release was created by create_release; each leg uploads its own
           # distinct per-target asset (--clobber replaces it on a re-run).
-          gh release upload "$tag" "out/librusty_v8_release_${{ matrix.target }}.a.gz" --clobber
+          gh release upload "$tag" "out/librusty_v8_simdutf_release_${{ matrix.target }}.a.gz" --clobber

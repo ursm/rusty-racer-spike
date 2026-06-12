@@ -4,7 +4,7 @@
 # libv8-rusty needed under the cibuildgem native-per-platform model).
 [package]
 name = "rusty_racer"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 publish = false
 
@@ -17,7 +17,12 @@ crate-type = ["cdylib"]
 # to root the owner thread).
 magnus = { version = "0.8", features = ["rb-sys"] }
 rb-sys = "0.9"
-v8 = "150.0.0"
+# simdutf: SIMD-accelerated UTF-8/UTF-16 transcoding in rusty_v8's String
+# conversion (to_rust_string_lossy etc.), the path every V8->Ruby string crosses.
+# ~6-8x faster marshalling for non-ASCII results (measured); ASCII is unaffected.
+# Needs the linked archive built with rusty_v8_enable_simdutf=true (libv8-rusty.yml
+# for linux; the v8 crate auto-fetches Deno's _simdutf prebuilt on macOS).
+v8 = { version = "150.0.0", features = ["simdutf"] }
 # pthread stack-bounds query, to set V8's stack limit per op relative to the
 # current native thread (in-thread V8 runs on the Ruby thread's stack).
 libc = "0.2"
