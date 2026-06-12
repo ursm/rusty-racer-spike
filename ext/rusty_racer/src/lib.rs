@@ -518,48 +518,142 @@ fn native_stack_bounds() -> (usize, usize) {
     (0, 0)
 }
 
+// Lower bound (and upper, for caching) of the memory region containing `addr`
+// — i.e. the BOTTOM of the stack `addr` is on. Used for a Ruby Fiber, whose
+// mmap'd stack pthread can't see: V8's limit must sit ABOVE this bottom or a
+// deep fiber recursion overflows the real stack and SEGVs the unmapped guard.
+// Cached per native thread keyed by the region (parsing /proc/self/maps is
+// slow): reused while successive ops stay on the same fiber. (0, 0) if unknown.
+thread_local! {
+    static FIBER_REGION: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, 0)) };
+}
+
+fn current_region_bounds_cached(addr: usize) -> (usize, usize) {
+    FIBER_REGION.with(|c| {
+        let (lo, hi) = c.get();
+        if lo != 0 && addr >= lo && addr < hi {
+            return (lo, hi);
+        }
+        let bounds = query_region_bounds(addr);
+        if bounds.0 != 0 {
+            c.set(bounds);
+        }
+        bounds
+    })
+}
+
+// The [start, end) of the /proc/self/maps mapping containing `addr`. Linux only;
+// (0, 0) elsewhere (and the caller falls back). Reads the file fresh — slow, so
+// only called on a cache miss (a new fiber).
+#[cfg(target_os = "linux")]
+fn query_region_bounds(addr: usize) -> (usize, usize) {
+    use std::io::Read;
+    let mut buf = String::new();
+    if std::fs::File::open("/proc/self/maps")
+        .and_then(|mut f| f.read_to_string(&mut buf))
+        .is_err()
+    {
+        return (0, 0);
+    }
+    for line in buf.lines() {
+        // e.g. "7f6a...000-7f6a...000 rw-p 00000000 00:00 0 ..."
+        let Some((range, _)) = line.split_once(' ') else {
+            continue;
+        };
+        let Some((lo, hi)) = range.split_once('-') else {
+            continue;
+        };
+        if let (Ok(lo), Ok(hi)) = (
+            usize::from_str_radix(lo, 16),
+            usize::from_str_radix(hi, 16),
+        ) {
+            if addr >= lo && addr < hi {
+                return (lo, hi);
+            }
+        }
+    }
+    (0, 0)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn query_region_bounds(_addr: usize) -> (usize, usize) {
+    (0, 0)
+}
+
 // Set from RUSTY_RACER_STACK_DEBUG at init; gates the per-op stack diagnostics.
 static STACK_DEBUG: AtomicBool = AtomicBool::new(false);
 
 // Re-point V8's stack limit at the CURRENT stack each op. In-thread V8 runs
 // wherever the Ruby code is: usually the native thread's pthread stack, but also
 // a Ruby Fiber's separate mmap'd stack (Capybara::Result is an Enumerator) that
-// pthread can't see. The limit MUST be below the current SP — if it's set to the
-// native bottom while we're on a fiber (a DIFFERENT, lower address region), V8
-// sees SP below the limit, declares a (false) stack overflow, and throwing it
-// trips a fatal `Check failed: IsOnCentralStack()`. So detect which stack we're
-// on by comparing the SP to the cached native bounds, and anchor the limit to
-// the native bottom (full headroom) or — on a fiber, whose bottom we can't see
-// — to the current SP with a small guard. Must be called with the isolate
-// ENTERED. `real_isolate` is the raw v8::Isolate* read out of iso_ptr.
+// pthread can't see. The limit MUST sit between the current SP and the real
+// bottom of whatever stack we're on:
+//   * Too high (above SP) and V8 declares a FALSE overflow on entry.
+//   * Too low (below the real bottom) and a deep recursion grows past the
+//     mapped stack and SEGVs the unmapped guard page below it.
+// So detect the stack by comparing the SP to the cached native bounds: on the
+// native stack, anchor to its pthread bottom; on a fiber, find the bottom of the
+// /proc/self/maps region holding the SP (the fiber's real bottom — anchoring to
+// SP minus a fixed guard punched through the bottom of Avo's small/deep Capybara
+// fibers and SEGV'd). Must be called with the isolate ENTERED. `real_isolate` is
+// the raw v8::Isolate* read out of iso_ptr.
+//
+// LIMITATION (worker-thread fibers): V8's central-stack view is anchored to
+// `base::Stack::GetStackStart()` — the pthread stack top, cached per native
+// thread, with no API to retarget it. A fiber whose mmap lands ABOVE that top
+// (the common case on a NON-main native thread, whose stack sits at a lower
+// address than later fiber mmaps) is outside the view, so V8 aborts
+// (`IsOnCentralStack()`) on the next GC or throw — the stack LIMIT can't fix it.
+// On the main thread the process stack is the highest address, so every fiber is
+// below it and safe; that's the case Capybara/Avo actually hits. See README.
 fn set_v8_stack_limit(real_isolate: *mut c_void) {
     let sp_marker = 0u8;
     let sp = &sp_marker as *const u8 as usize;
     let (nbottom, ntop) = native_stack_bounds_cached();
     let on_native = nbottom != 0 && sp > nbottom && sp <= ntop;
+    // Reserve below the limit for V8's own RangeError-throw frames.
+    const NATIVE_GUARD: usize = 128 * 1024;
+    // V8 throws when SP descends to the limit, then needs some real stack BELOW
+    // it to build the RangeError (and V8 itself allows growing a little past the
+    // limit — its overflow slack). On a fiber that reserve must NOT cross the
+    // fiber's real bottom (the mapping below it is an unmapped guard -> SEGV), so
+    // keep it comfortably above V8's slack.
+    const FIBER_RESERVE: usize = 64 * 1024;
+    let mut region = (0usize, 0usize);
     let limit = if on_native {
-        // Guard: headroom below the limit for V8's own RangeError-throw frames.
-        nbottom + 128 * 1024
+        nbottom + NATIVE_GUARD
     } else {
-        // On a fiber we don't know the bottom; anchor to the SP with a guard
-        // small enough to fit a modest fiber stack (so deep JS still throws
-        // RangeError cleanly rather than overflowing the real fiber stack).
-        sp.saturating_sub(64 * 1024)
+        // Anchor to the FIBER's real bottom (the /proc/self/maps region holding
+        // the SP), not the SP: SP - fixed_guard can punch through the bottom of a
+        // small/deep fiber stack and SEGV (Avo's deep Capybara filter chain).
+        // Reserve FIBER_RESERVE above the bottom for the throw, but keep the
+        // limit below the SP so we don't false-overflow; on a nearly-full fiber
+        // that clamps the headroom down (an early but CLEAN RangeError).
+        region = current_region_bounds_cached(sp);
+        if region.0 != 0 {
+            (region.0 + FIBER_RESERVE).min(sp.saturating_sub(8 * 1024))
+        } else {
+            sp.saturating_sub(64 * 1024) // region unknown (non-linux) — best effort
+        }
     };
     if limit == 0 {
         return; // couldn't determine a sane limit — leave V8's default
     }
     unsafe { v8__Isolate__SetStackLimit(real_isolate, limit) };
     // Opt-in diagnostics (RUSTY_RACER_STACK_DEBUG): the SP vs the native stack
-    // [nbottom, ntop], the per-op limit, whether a fiber was detected, and
-    // whether the SP is above the limit. A crash with sp_above_limit=false means
-    // the limit is wrong for the current stack.
+    // [nbottom, ntop], the fiber region (if any), the per-op limit, and whether
+    // the SP is above the limit. A crash with sp_above_limit=false means the
+    // limit is wrong for the current stack.
     if STACK_DEBUG.load(Ordering::Relaxed) {
         eprintln!(
             "[rusty stack] sp={sp:#x} nbottom={nbottom:#x} ntop={ntop:#x} \
-             limit={limit:#x} fiber={} sp_above_limit={}",
+             region=[{:#x},{:#x}) limit={limit:#x} fiber={} sp_above_limit={} \
+             fiber_above_native={}",
+            region.0,
+            region.1,
             !on_native,
             sp > limit,
+            !on_native && nbottom != 0 && sp > ntop,
         );
     }
 }
