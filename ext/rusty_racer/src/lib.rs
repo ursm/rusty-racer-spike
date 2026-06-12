@@ -38,15 +38,15 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::mpsc::{channel, Sender};
 use std::sync::{Arc, Condvar, Mutex, Once, Weak};
 use std::time::{Duration, Instant};
 
 use magnus::block::Proc;
 use magnus::value::{BoxValue, ReprValue};
 use magnus::{
-    function, method, prelude::*, Error, ExceptionClass, IntoValue, RArray, RHash, RString, Ruby,
-    TryConvert, Value,
+    function, method, prelude::*, Error, Exception, ExceptionClass, IntoValue, RArray, RHash,
+    RString, Ruby, TryConvert, Value,
 };
 
 // A Ruby Proc rooted for as long as the Core holds it. BoxValue registers a
@@ -70,6 +70,32 @@ impl RootedProc {
     fn get(&self) -> Proc {
         *self.0
     }
+}
+
+// The stable raw pointer to a Core's in-thread V8 isolate, stashed in Core so
+// the runner can open a scope (and the watchdog can be addressed) without
+// borrowing the OwnedIsolate out of the ISOLATES registry. Send + Sync for the
+// same reason as RootedProc: the pointer is only ever DEREFERENCED on the
+// owner thread (every op asserts owner == current), so moving the wrapping
+// Core across Ruby threads (GC) never touches V8 off-thread.
+struct IsoPtr(*mut v8::Isolate);
+unsafe impl Send for IsoPtr {}
+unsafe impl Sync for IsoPtr {}
+
+// Reach the IsolateState parked in a scope's (or isolate's) embedder slot — a
+// macro, not a fn, so it works on any scope type AND on a bare `&mut Isolate`,
+// all of which expose get_slot_mut (a generic fn can't express that over the
+// PinScope alias). Borrows the receiver mutably, so use it in SHORT bursts,
+// never held across a JS run (a re-entrant host callback must be able to borrow
+// it again). Panics if absent — every isolate the binding makes installs one.
+// (Defined up here because host_fn_callback, earlier in the file than the
+// IsolateState struct, uses it; macro_rules! is textually ordered.)
+macro_rules! istate {
+    ($scope:expr) => {
+        $scope
+            .get_slot_mut::<IsolateState>()
+            .expect("IsolateState missing from isolate slot")
+    };
 }
 
 // One attach()'d host fn: the realm it was attached into — so resetting or
@@ -269,7 +295,7 @@ enum Request {
         reply: Sender<VmReply>,
     },
     // instantiate: V8 walks imports, calling back to the Ruby resolve block
-    // (carried by pump) per edge via VmReply::ResolveModule.
+    // (parked in the slot for the op) per edge via resolve_imported.
     InstantiateModule {
         module_id: i32,
         reply: Sender<VmReply>,
@@ -328,7 +354,6 @@ enum Request {
         module_id: i32,
         reply: Sender<VmReply>,
     },
-    Dispose,
 }
 
 // compile_module result: the module's id plus any produced bytecode cache and
@@ -339,7 +364,9 @@ struct Compiled {
     cache_rejected: bool,
 }
 
-// V8 thread -> the Ruby thread that is waiting on this request
+// The terminal reply an op's `service_request` sends back into its channel; the
+// runner (Core::run) try_recv's it on the same thread. Host callbacks and module
+// resolvers no longer round-trip through here — they run inline (with_gvl).
 enum VmReply {
     Done(Result<JsVal, VmError>),
     // compile_module / compile's richer reply (id + produced cache + rejected).
@@ -348,46 +375,6 @@ enum VmReply {
     // Script#/Module#create_code_cache: the serialized bytes, or None when V8
     // can't produce a cache (or the handle's realm is gone).
     CodeCache(Result<Option<Vec<u8>>, VmError>),
-    // JS called host fn |id|; run the proc and send the answer back.
-    Callback {
-        host_fn_id: usize,
-        args: Vec<JsVal>,
-        answer: Sender<Answer>,
-    },
-    // instantiate's per-edge resolve: ask the Ruby resolve block for the module
-    // that |specifier| (imported by |referrer_url|) refers to. |initiating_context|
-    // is the realm being linked — passed to the dynamic_import_resolver (which
-    // auto-links a dynamic import's static deps) so it can resolve per-realm;
-    // the static instantiate block ignores it (its contract stays 2-arg).
-    ResolveModule {
-        specifier: String,
-        referrer_url: String,
-        initiating_context: i32,
-        answer: Sender<Answer>,
-    },
-    // JS did import(specifier): ask the Context's dynamic_import_resolver for an
-    // already-loaded module to fulfil the import() promise. |initiating_context|
-    // is the realm import() actually fired in (handed to the resolver as a
-    // Context so iframe imports resolve in the iframe's realm, not the main one).
-    DynamicImport {
-        specifier: String,
-        referrer_url: String,
-        initiating_context: i32,
-        answer: Sender<Answer>,
-    },
-}
-
-// Ruby thread -> the V8 thread suspended inside a callback / batch round-trip
-enum Answer {
-    Result(Result<JsVal, String>),
-    // the proc's/resolver's Ruby body issued another VM op (eval, call,
-    // compile, checkpoint, create_context, ... — ANY Request). The main queue
-    // is not being read while the V8 thread awaits this answer, so the
-    // suspended frame services it re-entrantly via the same dispatcher as the
-    // main loop (service_request).
-    Nested(Request),
-    // the resolve block's answer: the dependency module's id (None = unresolved).
-    ModuleId(Option<i32>),
 }
 
 // ---------------------------------------------------------------------------
@@ -418,13 +405,54 @@ where
     job.r.unwrap()
 }
 
-// ---------------------------------------------------------------------------
-// V8 thread
-// ---------------------------------------------------------------------------
-thread_local! {
-    // Reply sender of the request currently being served (stack: nested
-    // requests arriving through a suspended callback push their own sender).
-    static REPLY_STACK: RefCell<Vec<Sender<VmReply>>> = const { RefCell::new(Vec::new()) };
+// The inverse trampoline: REACQUIRE the GVL to run |f| (a Ruby callback), then
+// release it again. Called from inside a V8 host callback / module resolver,
+// which runs GVL-released under the in-thread runner's `without_gvl`; the proc
+// it invokes needs the GVL held. Nested without_gvl/with_gvl (an op issued by
+// the proc re-enters the runner, releasing the GVL again) is sound. |f| must
+// NOT let a Ruby exception escape as a longjmp — the callers convert proc
+// errors to a Result value and throw on the JS side instead.
+fn with_gvl<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R,
+{
+    struct Job<F, R> {
+        f: Option<F>,
+        r: Option<R>,
+    }
+    unsafe extern "C" fn run<F: FnOnce() -> R, R>(data: *mut c_void) -> *mut c_void {
+        let job = unsafe { &mut *(data as *mut Job<F, R>) };
+        job.r = Some((job.f.take().unwrap())());
+        null_mut()
+    }
+    let mut job = Job::<F, R> { f: Some(f), r: None };
+    unsafe {
+        rb_sys::rb_thread_call_with_gvl(Some(run::<F, R>), &mut job as *mut _ as *mut c_void);
+    }
+    job.r.unwrap()
+}
+
+// Identity of the calling RUBY thread (its Thread VALUE, stable for the thread's
+// life) — used to bind an isolate to its owner thread. Unlike a native ThreadId,
+// this survives Ruby's M:N scheduler moving the thread between native threads.
+// MUST be called with the GVL held.
+fn current_ruby_thread() -> usize {
+    unsafe { rb_sys::rb_thread_current() as usize }
+}
+
+// Reduce a magnus Error to a single Exception INSTANCE so it can be GC-rooted and
+// re-raised later WITH ITS ORIGINAL CLASS. A Ruby proc's raise is already an
+// instance; an Error::new(class, msg) from our own code becomes an instance of
+// that class carrying the message. Must be called with the GVL held.
+fn error_to_exception(e: &Error) -> Option<Exception> {
+    let v = e.value()?;
+    if let Ok(exc) = Exception::try_convert(v) {
+        return Some(exc);
+    }
+    if let Ok(class) = ExceptionClass::try_convert(v) {
+        return class.new_instance((e.to_string(),)).ok();
+    }
+    None
 }
 
 // Little-endian u64 limbs -> big-endian hex magnitude (no sign, no "0x"). The
@@ -780,8 +808,12 @@ fn jsval_to_js_d<'s>(
     }
 }
 
-// JS called a host function: round-trip to the Ruby thread that is waiting on
-// the current request, servicing nested requests until the answer arrives.
+// JS called a host function. We are on the owner thread with the GVL RELEASED
+// (the runner's without_gvl). Reacquire the GVL via with_gvl, run the Ruby proc
+// inline, and set the JS return — no channel, no other thread. A VM op the proc
+// issues just re-enters Core::run (at depth > 0), so re-entrancy is the plain
+// Rust call stack. A Ruby exception is returned as Err(String) (never a longjmp
+// through V8 frames) and re-thrown on the JS side.
 fn host_fn_callback(
     scope: &mut v8::PinScope<'_, '_>,
     args: v8::FunctionCallbackArguments<'_>,
@@ -795,54 +827,25 @@ fn host_fn_callback(
     for i in 0..args.length() {
         js_args.push(js_to_jsval(scope, args.get(i)));
     }
-
-    let reply = REPLY_STACK.with(|s| s.borrow().last().cloned());
-    let Some(reply) = reply else { return };
-    let (answer_tx, answer_rx) = channel::<Answer>();
-    if reply
-        .send(VmReply::Callback {
-            host_fn_id,
-            args: js_args,
-            answer: answer_tx,
-        })
-        .is_err()
-    {
-        // The requesting Ruby thread is gone; fail the JS call cleanly.
-        throw_js_error(scope, "host function caller went away");
+    // Reach the owning Core through the slot back-pointer (the callback holds
+    // only a scope). Null only before wiring, which is before any JS can run.
+    let core_ptr = istate!(scope).core_ptr;
+    if core_ptr.is_null() {
+        throw_js_error(scope, "host function has no owner");
         return;
     }
-
-    loop {
-        match answer_rx.recv() {
-            Ok(Answer::Result(Ok(val))) => {
-                let v = jsval_to_js(scope, val);
-                rv.set(v);
-                return;
-            }
-            Ok(Answer::Result(Err(message))) => {
-                // The proc raised: surface as a JS exception (audit #24's
-                // wedge becomes an ordinary throw).
-                throw_js_error(scope, &message);
-                return;
-            }
-            Ok(Answer::Nested(request)) => {
-                // ruby -> js -> ruby -> VM op: the proc issued another request
-                // while the main loop is parked in this very callback. Service
-                // it right here with the main loop's dispatcher — ANY op, not
-                // just eval/call, or the rendezvous deadlocks (the proc waits
-                // on the V8 thread, which waits on the proc's answer).
-                service_request(scope, request);
-            }
-            Ok(Answer::ModuleId(_)) => {
-                // A module-resolve answer can't arrive on a host-fn channel.
-                throw_js_error(scope, "unexpected module answer in host callback");
-                return;
-            }
-            Err(_) => {
-                throw_js_error(scope, "host function caller went away");
-                return;
-            }
+    let result: Result<JsVal, String> = with_gvl(|| {
+        let ruby = Ruby::get().unwrap();
+        let core = unsafe { &*core_ptr };
+        core.call_proc(&ruby, host_fn_id, &js_args)
+    });
+    match result {
+        Ok(val) => {
+            let v = jsval_to_js(scope, val);
+            rv.set(v);
         }
+        // The proc raised (or marshalling failed): surface as a JS exception.
+        Err(message) => throw_js_error(scope, &message),
     }
 }
 
@@ -1149,26 +1152,32 @@ struct IsolateState {
     realms: V8State,
     modules: ModuleReg,
     scripts: ScriptReg,
-    // The host-fn registry — no longer a Mutex: one isolate is driven by one
-    // (owning) thread, so there's no cross-thread contention to guard.
-    procs: ProcTable,
-    dynamic_import_resolver: Option<RootedProc>,
     active_realms: Vec<i32>,
     instantiating: bool,
     watchdog_fired: bool,
     auto_microtasks: bool,
     draining: bool,
-    default_timeout_ms: u64,
-    // Reentry-depth: 0 at a top-level op; >0 while a host callback is on the V8
-    // stack (a nested op then bootstraps its scope via callback_scope! instead of
-    // re-borrowing the OwnedIsolate, which is already borrowed by the outer run).
-    depth: u32,
+    // Back-pointer to the owning Core, so a V8 callback (host fn / module
+    // resolver) — which holds only a scope — can reach Core.procs and
+    // Core.dynamic_import_resolver. Set once, after the Arc<Core> is built;
+    // valid for the whole isolate life (Core outlives the slot — the slot is
+    // dropped during isolate disposal, which a live wrapper triggers). Null
+    // only in the brief window before it is wired up.
+    core_ptr: *const Core,
+    // Module#instantiate's resolve BLOCK, parked here for the duration of an
+    // InstantiateModule op so resolve_imported (a V8 callback) can find it
+    // (the old design passed it to pump). GC-rooted; cleared after the op.
+    // ..._err carries the resolver's own raised exception (GC-rooted) so the
+    // instantiate request can re-raise it WITH ITS ORIGINAL CLASS, instead of a
+    // generic "failed to link" (preserving the old pump behaviour).
+    instantiate_resolve: Option<RootedProc>,
+    instantiate_resolve_err: Option<BoxValue<Exception>>,
     watchdog: Arc<WatchdogShared>,
 }
 
 #[allow(dead_code)]
 impl IsolateState {
-    fn new(host_namespace: Option<String>, default_timeout_ms: u64, auto_microtasks: bool) -> Self {
+    fn new(host_namespace: Option<String>, auto_microtasks: bool) -> Self {
         IsolateState {
             realms: V8State {
                 host_namespace,
@@ -1177,15 +1186,14 @@ impl IsolateState {
             },
             modules: ModuleReg::default(),
             scripts: ScriptReg::default(),
-            procs: ProcTable::default(),
-            dynamic_import_resolver: None,
             active_realms: Vec::new(),
             instantiating: false,
             watchdog_fired: false,
             auto_microtasks,
             draining: false,
-            default_timeout_ms,
-            depth: 0,
+            core_ptr: std::ptr::null(),
+            instantiate_resolve: None,
+            instantiate_resolve_err: None,
             watchdog: Arc::new(WatchdogShared {
                 inner: Mutex::new(WatchdogInner {
                     frames: Vec::new(),
@@ -1199,29 +1207,29 @@ impl IsolateState {
     }
 }
 
-// The IsolateState parked in a scope's isolate slot (a macro, not a fn, so it
-// works on any scope type — HandleScope/ContextScope/TryCatch all reach
-// get_slot_mut via deref, which a generic fn can't express over the PinScope
-// alias). Borrows the scope mutably, so use it in SHORT bursts, never held
-// across a JS run (a re-entrant host callback must be able to borrow it again).
-// Panics if absent — every isolate the binding makes installs one, so a miss is
-// a bug.
-macro_rules! istate {
-    ($scope:expr) => {
-        $scope
-            .get_slot_mut::<IsolateState>()
-            .expect("IsolateState missing from isolate slot")
-    };
-}
+// The live OwnedIsolates, keyed by id. A GLOBAL (not a thread_local): Ruby's M:N
+// scheduler moves a Ruby thread across native threads, so a native-thread-local
+// registry would "lose" an isolate when its owner migrated. The registry is only
+// touched at create (insert) and dispose (remove) — never per op (the runner
+// uses Core.iso_ptr) — so the global Mutex is uncontended on the hot path.
+//
+// OwnedIsolate is !Send, so it rides in a SendIso newtype: sound because the V8
+// isolate is only ever ENTERED/used on its owner Ruby thread (asserted per op);
+// the registry merely owns the box for its lifetime and moves only the pointer.
+// BOXED so the OwnedIsolate has a STABLE address — Core stashes a raw *mut
+// Isolate pointing INTO it (at the cxx_isolate NonNull), which a move would
+// dangle. As a `static` the map is never dropped at process exit, so a leaked
+// (never-disposed) isolate just leaks instead of aborting V8's drop assert.
+// The box is held purely for ownership (its Drop disposes V8) and is reached at
+// runtime through Core.iso_ptr, never by reading this field — hence allow(dead).
+#[allow(dead_code)]
+struct SendIso(Box<v8::OwnedIsolate>);
+unsafe impl Send for SendIso {}
 
-// The owning thread's live OwnedIsolates, keyed by id. This is the ONLY piece
-// that must stay thread-local: OwnedIsolate is !Send and is needed by-&mut to
-// open a top-level scope, so it can't live in the (Send) magnus wrapper. The
-// wrapper holds just the id + owner ThreadId and asserts owner == current on
-// every op, so a cross-thread use raises instead of corrupting V8 (see i-c).
-thread_local! {
-    #[allow(clippy::type_complexity)]
-    static ISOLATES: RefCell<HashMap<u32, v8::OwnedIsolate>> = RefCell::new(HashMap::new());
+static ISOLATES: std::sync::OnceLock<Mutex<HashMap<u32, SendIso>>> = std::sync::OnceLock::new();
+
+fn isolates() -> &'static Mutex<HashMap<u32, SendIso>> {
+    ISOLATES.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 #[allow(dead_code)]
@@ -1254,11 +1262,10 @@ fn auto_drain(scope: &mut v8::PinScope<'_, '_>, outermost: bool) {
 }
 
 // The shared bracket every JS-running request (Eval/Call/Attach/RunScript/
-// EvaluateModule) needs: push this request's reply onto REPLY_STACK (so a host
-// fn it calls routes back here), arm the watchdog, run |body|, then on a
-// watchdog timeout flag the leftover terminate for the outermost sweep and —
-// only if |body| actually ran JS (the bool it returns) — override its outcome
-// to Terminated. |body| owns its ContextScope, JS call, and auto_drain, and
+// EvaluateModule) needs: arm the watchdog, run |body|, then on a watchdog
+// timeout flag the leftover terminate for the outermost sweep and — only if
+// |body| actually ran JS (the bool it returns) — override its outcome to
+// Terminated. |body| owns its ContextScope, JS call, and auto_drain, and
 // returns (ran_js, outcome); the realm-disposed/unknown paths return
 // (false, Err(..)) so a raced watchdog can't poison an error for work that ran
 // no JS. Collapsing the five arms onto this keeps the terminate discipline in
@@ -1267,10 +1274,8 @@ fn run_js_bracketed(
     scope: &mut v8::PinScope<'_, '_, ()>,
     outermost: bool,
     timeout_ms: u64,
-    reply: &Sender<VmReply>,
     body: impl FnOnce(&mut v8::PinScope<'_, '_, ()>, bool) -> (bool, Result<JsVal, VmError>),
 ) -> Result<JsVal, VmError> {
-    REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
     let watchdog = arm_watchdog(scope, timeout_ms);
     let (ran_js, mut outcome) = body(scope, outermost);
     if disarm_watchdog(scope, watchdog) {
@@ -1279,9 +1284,6 @@ fn run_js_bracketed(
             outcome = Err(VmError::Terminated);
         }
     }
-    REPLY_STACK.with(|s| {
-        s.borrow_mut().pop();
-    });
     outcome
 }
 
@@ -1322,26 +1324,6 @@ fn script_handle(state: &IsolateState, script_id: i32) -> Option<(v8::Global<v8:
         .map(|(g, cid)| (g.clone(), *cid))
 }
 
-// Park until the Ruby resolver answers with a module id, servicing any nested
-// requests that arrive meanwhile (the resolver may compile/evaluate lazily).
-// None = unresolved, a protocol violation, or the caller went away. Shared by
-// resolve_imported and dynamic_import_cb so the wait loops can't drift apart.
-fn recv_module_id(scope: &mut v8::PinScope<'_, '_, ()>, arx: &Receiver<Answer>) -> Option<i32> {
-    loop {
-        match arx.recv() {
-            Ok(Answer::ModuleId(id)) => return id,
-            Ok(Answer::Nested(request)) => {
-                service_request(scope, request);
-            }
-            _ => return None,
-        }
-    }
-}
-
-// V8 calls this per import edge during InstantiateModule. Maps the referrer to
-// its url, round-trips to the Ruby resolve block (carried on REPLY_STACK), and
-// returns the module the block named. Blocks the V8 thread on the answer, just
-// like host_fn_callback.
 // A registered module's url (the filename it was compiled with), by identity
 // against MODULES — the reverse of the id lookup. Used to give a referrer its
 // url for the resolve round-trip and to fill import.meta.url.
@@ -1379,6 +1361,11 @@ unsafe extern "C" fn import_meta_cb(
     }
 }
 
+// V8 calls this per import edge during InstantiateModule (and while
+// finish_dynamic_import links a dynamically-imported module). Maps the referrer
+// to its url and calls the Ruby resolver INLINE (reacquiring the GVL): the
+// static instantiate block parked in the slot for this op, or — when none is
+// parked (a dynamic import's auto-link) — the Context's dynamic_import_resolver.
 fn resolve_imported<'s>(
     context: v8::Local<'s, v8::Context>,
     specifier: v8::Local<'s, v8::String>,
@@ -1392,17 +1379,54 @@ fn resolve_imported<'s>(
     // it both rides along to the dynamic_import_resolver AND backs the
     // foreign-context check below; for a real module context it is always Some.
     let here = id_of_context(scope, context);
-    let reply = REPLY_STACK.with(|s| s.borrow().last().cloned())?;
-    let (atx, arx) = channel();
-    reply
-        .send(VmReply::ResolveModule {
-            specifier: spec,
-            referrer_url: ref_url,
-            initiating_context: here.unwrap_or(0),
-            answer: atx,
-        })
-        .ok()?;
-    let dep_id = recv_module_id(scope, &arx)?;
+    let core_ptr = istate!(scope).core_ptr;
+    if core_ptr.is_null() {
+        return None;
+    }
+    // The static instantiate block parked for THIS op (Some) vs a dynamic
+    // import's auto-link (None -> dynamic_import_resolver, with the initiating
+    // realm so it can resolve per-realm).
+    let instantiate = istate!(scope).instantiate_resolve.as_ref().map(|r| r.get());
+    let dep_id = match instantiate {
+        Some(resolve) => {
+            match with_gvl(|| {
+                resolve_module_via_ruby(unsafe { &*core_ptr }, resolve, &spec, &ref_url, None)
+            }) {
+                Ok(id) => id,
+                // Stash the resolver's own raised exception (GC-rooted) so the
+                // InstantiateModule op can re-raise it with its original class
+                // instead of a generic "failed to link".
+                Err(e) => {
+                    if let Some(exc) = error_to_exception(&e) {
+                        istate!(scope).instantiate_resolve_err = Some(BoxValue::new(exc));
+                    }
+                    None
+                }
+            }
+        }
+        None => {
+            let resolver = unsafe { &*core_ptr }
+                .dynamic_import_resolver
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|r| r.get());
+            match resolver {
+                Some(p) => with_gvl(|| {
+                    resolve_module_via_ruby(
+                        unsafe { &*core_ptr },
+                        p,
+                        &spec,
+                        &ref_url,
+                        Some(here.unwrap_or(0)),
+                    )
+                })
+                .unwrap_or(None),
+                None => None,
+            }
+        }
+    };
+    let dep_id = dep_id?;
     // The dep must live in the context actually being linked — the auto-link of
     // a dynamic import runs in whatever realm import() fired in, which kAuto can
     // detach from the request that started it. A foreign-context module would
@@ -1418,10 +1442,9 @@ fn resolve_imported<'s>(
 }
 
 // V8 calls this for a JS `import(specifier)`. Returns a Promise fulfilled with
-// the resolved module's namespace (or rejected). Round-trips to the Context's
-// dynamic_import_resolver over the current request's reply channel (REPLY_STACK)
-// — so import() only works inside an eval/call. The resolver may return a
-// merely COMPILED module: per V8's host contract, link + evaluate happen here
+// the resolved module's namespace (or rejected). Calls the Context's
+// dynamic_import_resolver INLINE (reacquiring the GVL). The resolver may return
+// a merely COMPILED module: per V8's host contract, link + evaluate happen here
 // (finish_dynamic_import).
 fn dynamic_import_cb<'s>(
     scope: &mut v8::PinScope<'s, '_>,
@@ -1441,27 +1464,27 @@ fn dynamic_import_cb<'s>(
     // resolve/compile the module in the right realm (e.g. an iframe's), not the
     // main one.
     let initiating = id_of_context(scope, scope.get_current_context()).unwrap_or(0);
-    let reply = match REPLY_STACK.with(|s| s.borrow().last().cloned()) {
-        Some(r) => r,
-        None => {
-            reject(scope, "import() is only available during eval/call");
-            return Some(promise);
-        }
-    };
-    let (atx, arx) = channel();
-    if reply
-        .send(VmReply::DynamicImport {
-            specifier: spec,
-            referrer_url: referrer,
-            initiating_context: initiating,
-            answer: atx,
-        })
-        .is_err()
-    {
-        reject(scope, "dynamic import caller went away");
+    let core_ptr = istate!(scope).core_ptr;
+    if core_ptr.is_null() {
+        reject(scope, "dynamic import has no owner");
         return Some(promise);
     }
-    match recv_module_id(scope, &arx) {
+    let resolver_proc = unsafe { &*core_ptr }
+        .dynamic_import_resolver
+        .lock()
+        .unwrap()
+        .as_ref()
+        .map(|r| r.get());
+    let id = match resolver_proc {
+        // A raising resolver only fails the import() (it rejects generically);
+        // it must NOT abort the surrounding eval, so swallow the Err here.
+        Some(p) => with_gvl(|| {
+            resolve_module_via_ruby(unsafe { &*core_ptr }, p, &spec, &referrer, Some(initiating))
+        })
+        .unwrap_or(None),
+        None => None,
+    };
+    match id {
         Some(id) => {
             // The resolved module must live in the context import() ACTUALLY
             // ran in — a foreign-context module would V8-CHECK-abort. Use the
@@ -1708,106 +1731,21 @@ fn disarm_watchdog(scope: &mut v8::PinScope<'_, '_, ()>, generation: Option<u64>
     fired
 }
 
-fn v8_thread_main(
-    rx: Receiver<Request>,
-    handle_tx: Sender<v8::IsolateHandle>,
-    host_namespace: Option<String>,
-    snapshot: Option<Vec<u8>>,
-    explicit_microtasks: bool,
-) {
-    init_v8();
-    // A snapshot blob bakes globalThis state into the isolate: the first
-    // Context::new below then deserializes that default context for free.
-    let create_params = match snapshot {
-        Some(bytes) => v8::CreateParams::default().snapshot_blob(v8::StartupData::from(bytes)),
-        None => Default::default(),
-    };
-    let mut isolate = v8::Isolate::new(create_params);
-    // Always Explicit at the V8 level; the binding performs the kAuto
-    // end-of-script drain itself (auto_drain), so the drain stays inside the
-    // request's watchdog bracket and honours TerminateExecution. Relying on
-    // V8's own kAuto would put the drain outside our bracket — and worse,
-    // V8's auto-drain inside Function::Call does not stop on termination, so
-    // a timed-out call that re-queues a microtask would spin forever. The
-    // :auto/:explicit distinction lives in AUTO_MICROTASKS (read by
-    // auto_drain): :auto drains at the outermost request, :explicit only on
-    // perform_microtask_checkpoint / the host-namespace drainMicrotasks.
-    isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
-    // JS import() routes here; rejects unless a dynamic_import_resolver is set.
-    isolate.set_host_import_module_dynamically_callback(dynamic_import_cb);
-    // Fills import.meta.url (the module's compile-time filename) on first access.
-    isolate.set_host_initialize_import_meta_object_callback(import_meta_cb);
-    // Unhandled-rejection notifications route to the JS recorder, if one was
-    // registered via NS.setPromiseRejectHandler (no-op otherwise).
-    isolate.set_promise_reject_callback(promise_reject_cb);
-    let _ = handle_tx.send(isolate.thread_safe_handle());
-    // All per-isolate state now lives in the isolate's slot (reached anywhere via
-    // istate!(scope)). IsolateState::new seeds the host namespace + next realm id
-    // and creates the watchdog; install it, then spawn the one persistent
-    // watchdog thread (requests arm/disarm it — see WatchdogShared). The timeout
-    // here is unused in the channel model (Core still holds default_timeout_ms).
-    let state = IsolateState::new(host_namespace, 0, !explicit_microtasks);
-    let watchdog_shared = Arc::clone(&state.watchdog);
-    isolate.set_slot(state);
-    let watchdog_thread = {
-        let shared = Arc::clone(&watchdog_shared);
-        let handle = isolate.thread_safe_handle();
-        std::thread::spawn(move || watchdog_loop(shared, handle))
-    };
-    // Boot the main realm (id 0) into the slot, where service_request — callable
-    // with only a scope in hand — reaches it. new_realm reads the host namespace
-    // from the slot (seeded above).
-    {
-        v8::scope!(let scope, &mut isolate);
-        let main_context = new_realm(scope, 0);
-        istate!(scope).realms.main_context = Some(main_context);
-    }
-
-    while let Ok(request) = rx.recv() {
-        v8::scope!(let scope, &mut isolate);
-        if service_request(scope, request) {
-            break;
-        }
-    }
-    // Every v8::Global parked in the slot's registries must die before the
-    // isolate it points into. Clear them here explicitly (the slot's IsolateState
-    // is otherwise dropped by V8 during isolate disposal, too late for Globals).
-    {
-        v8::scope!(let scope, &mut isolate);
-        let st = istate!(scope);
-        st.realms = V8State::default();
-        st.modules = ModuleReg::default();
-        st.scripts = ScriptReg::default();
-    }
-    // Stop the watchdog and join it before the isolate (whose handle it holds)
-    // drops, so no terminate can land after teardown.
-    {
-        let mut inner = watchdog_shared.inner.lock().unwrap();
-        inner.shutdown = true;
-        watchdog_shared.cv.notify_one();
-    }
-    let _ = watchdog_thread.join();
-    drop(isolate);
-}
-
-// Service ONE request on the V8 thread; returns true when the isolate should
-// shut down (Request::Dispose). This is the single dispatcher for BOTH the
-// main request loop and the nested wait loops (host_fn_callback /
-// resolve_imported / dynamic_import_cb), so EVERY op — not just eval/call —
-// works re-entrantly from inside a host proc or module resolver. Anything
-// less deadlocks the rendezvous: the Ruby thread waits on the V8 thread,
-// which waits on that same Ruby thread's answer.
-fn service_request(scope: &mut v8::PinScope<'_, '_, ()>, request: Request) -> bool {
-    // True when no other request is suspended beneath this one — the frame
-    // that owns terminate-flag cleanup (see WATCHDOG_FIRED).
-    let outermost = REPLY_STACK.with(|s| s.borrow().is_empty());
+// Service ONE request inline on the owner thread; returns true when the isolate
+// should shut down (Request::Dispose — though dispose has its own path and never
+// reaches here). This is the single dispatcher for BOTH a top-level op and a
+// re-entrant one (a host proc / module resolver that issues another op), so
+// EVERY op — not just eval/call — works re-entrantly. `outermost` (depth == 0,
+// computed by Core::run before it bumped the depth) owns the terminate-flag
+// cleanup; a nested op passes false.
+fn service_request(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermost: bool) {
     // Clear any terminate left over from BEFORE this request. An
-    // Isolate#terminate fired while the V8 thread was idle (no JS running)
-    // arms the isolate-global flag but no WATCHDOG_FIRED, so the end-of-request
-    // sweep would miss it and the next eval would abort spuriously — and an
-    // idle terminate isn't even observable via is_execution_terminating() yet,
-    // so cancel unconditionally. Only at the outermost frame: a terminate aimed
-    // at a SUSPENDED outer frame must survive a nested request.
+    // Isolate#terminate fired while no JS was running arms the isolate-global
+    // flag but no watchdog_fired, so the end-of-request sweep would miss it and
+    // the next eval would abort spuriously — and an idle terminate isn't even
+    // observable via is_execution_terminating() yet, so cancel unconditionally.
+    // Only at the outermost frame: a terminate aimed at a SUSPENDED outer frame
+    // must survive a nested request.
     if outermost {
         scope.cancel_terminate_execution();
     }
@@ -1818,7 +1756,7 @@ fn service_request(scope: &mut v8::PinScope<'_, '_, ()>, request: Request) -> bo
     if let Some(id) = realm {
         istate!(scope).active_realms.push(id);
     }
-    let dispose = dispatch_one(scope, request, outermost);
+    dispatch_one(scope, request, outermost);
     if realm.is_some() {
         istate!(scope).active_realms.pop();
     }
@@ -1828,7 +1766,6 @@ fn service_request(scope: &mut v8::PinScope<'_, '_, ()>, request: Request) -> bo
         istate!(scope).watchdog_fired = false;
         scope.cancel_terminate_execution();
     }
-    dispose
 }
 
 // The realm a request will run in (None for realm-independent ops); feeds
@@ -1855,12 +1792,11 @@ fn request_realm(state: &IsolateState, request: &Request) -> Option<i32> {
         | Request::DisposeModule { .. }
         | Request::DisposeScript { .. }
         | Request::ScriptCodeCache { .. }
-        | Request::ModuleCodeCache { .. }
-        | Request::Dispose => None,
+        | Request::ModuleCodeCache { .. } => None,
     }
 }
 
-fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermost: bool) -> bool {
+fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermost: bool) {
     // A request-scoped handle scope, so handles created while servicing a
     // nested request don't pile up in the suspended callback's scope.
     v8::scope!(let scope, &mut *scope);
@@ -1873,7 +1809,7 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 timeout_ms,
                 reply,
             } => {
-                let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, |scope, outermost| {
                     let realm = context_for(istate!(scope), context_id);
                     match realm {
                         Some(ctx) => {
@@ -1896,9 +1832,9 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 timeout_ms,
                 reply,
             } => {
-                // The bracket pushes REPLY_STACK so a host fn invoked by the
-                // called function routes back to this request's waiter.
-                let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
+                // A host fn invoked by the called function runs inline
+                // (host_fn_callback, with_gvl) — no routing setup needed.
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, |scope, outermost| {
                     let realm = context_for(istate!(scope), context_id);
                     match realm {
                         Some(ctx) => {
@@ -1915,9 +1851,8 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
             }
             Request::DrainMicrotasks { timeout_ms, reply } => {
                 // A microtask may call an attached host fn (a Promise .then ->
-                // ruby), so push the reply onto REPLY_STACK exactly like Eval,
-                // or that callback would find no waiter and silently no-op.
-                REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
+                // ruby), which runs inline via host_fn_callback — no routing
+                // setup needed any more.
                 let watchdog = arm_watchdog(scope, timeout_ms);
                 let main = context_for(istate!(scope), 0);
                 if let Some(ctx) = main {
@@ -1929,9 +1864,6 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 if fired {
                     istate!(scope).watchdog_fired = true;
                 }
-                REPLY_STACK.with(|s| {
-                    s.borrow_mut().pop();
-                });
                 let outcome = if fired {
                     Err(VmError::Terminated)
                 } else {
@@ -1951,7 +1883,7 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 // arbitrary JS. So it goes through the same bracket as Eval: a
                 // host fn the trap calls routes back, and a looping trap is
                 // time-capped.
-                let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, |scope, outermost| {
                     let realm = context_for(istate!(scope), context_id);
                     match realm {
                         Some(ctx) => {
@@ -1989,7 +1921,7 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 // NOT transactional: entries before the failure stay attached —
                 // the realm is not rolled back (matches single Attach, which also
                 // commits its one write or fails it).
-                let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, |scope, outermost| {
                     let realm = context_for(istate!(scope), context_id);
                     match realm {
                         Some(ctx) => {
@@ -2194,8 +2126,6 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                     ))));
                 } else {
                     istate!(scope).instantiating = true;
-                    // REPLY_STACK so resolve_imported can round-trip per import edge.
-                    REPLY_STACK.with(|s| s.borrow_mut().push(reply.clone()));
                     let handle = module_handle(istate!(scope), module_id);
                     let outcome = match handle {
                         None => Err(VmError::Runtime("unknown module".into())),
@@ -2224,6 +2154,11 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                                         match module.instantiate_module(tc, resolve_imported) {
                                             Some(true) => Ok(JsVal::Undefined),
                                             _ if tc.has_terminated() => Err(VmError::Terminated),
+                                            // A resolver that RAISED is re-raised with its
+                                            // real class by instantiate_module (via the
+                                            // stashed exception); this generic link error
+                                            // is only used when no resolver exception was
+                                            // stashed.
                                             _ => {
                                                 let exc = tc.exception();
                                                 let stack = tc.stack_trace();
@@ -2235,9 +2170,6 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                             }
                         }
                     };
-                    REPLY_STACK.with(|s| {
-                        s.borrow_mut().pop();
-                    });
                     istate!(scope).instantiating = false;
                     let _ = reply.send(VmReply::Done(outcome));
                 }
@@ -2245,8 +2177,8 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
             Request::EvaluateModule { module_id, timeout_ms, reply } => {
                 // Top-level module code (and, under :auto, the microtasks its
                 // TLA continuation drains) can loop, so it runs in the same
-                // watchdog/REPLY_STACK bracket as Eval/Call/RunScript.
-                let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
+                // watchdog bracket as Eval/Call/RunScript.
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, |scope, outermost| {
                 let handle = module_handle(istate!(scope), module_id);
                 match handle {
                     None => (false, Err(VmError::Runtime("unknown module".into()))),
@@ -2471,7 +2403,7 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 timeout_ms,
                 reply,
             } => {
-                let outcome = run_js_bracketed(scope, outermost, timeout_ms, &reply, |scope, outermost| {
+                let outcome = run_js_bracketed(scope, outermost, timeout_ms, |scope, outermost| {
                     let handle = script_handle(istate!(scope), script_id);
                     match handle {
                         None => (false, Err(VmError::Runtime("unknown script".into()))),
@@ -2542,12 +2474,8 @@ fn dispatch_one(scope: &mut v8::PinScope<'_, '_, ()>, request: Request, outermos
                 };
                 let _ = reply.send(VmReply::CodeCache(outcome));
             }
-            // Shuts the main loop down. Never arrives at a nested servicing
-            // site: Core::dispose bypasses dispatch and queues directly.
-            Request::Dispose => return true,
         }
     }
-    false
 }
 
 // The id of |context|, read O(1) from the realm-id stamped in by new_realm.
@@ -2587,51 +2515,45 @@ fn module_handle(state: &IsolateState, module_id: i32) -> Option<(v8::Global<v8:
 // ---------------------------------------------------------------------------
 // Ruby side
 // ---------------------------------------------------------------------------
-thread_local! {
-    // Suspended frames this Ruby thread is currently serving (a host proc or
-    // module resolver), innermost last. Each frame is tagged with its Core's
-    // address so Core::dispatch only routes ops for THAT isolate through it —
-    // an op aimed at a different isolate must use that isolate's own queue
-    // (its V8 thread is not the suspended one).
-    static NESTED: RefCell<Vec<(usize, Sender<Answer>)>> = const { RefCell::new(Vec::new()) };
-}
-
-// Run |f| with |answer| pushed as this thread's innermost suspended frame,
-// popping it afterwards — any VM op |f| issues routes through the frame via
-// Core::dispatch. Centralised so push/pop can't fall out of balance.
-fn with_nested<R>(core: &Core, answer: &Sender<Answer>, f: impl FnOnce() -> R) -> R {
-    let tag = core as *const Core as usize;
-    NESTED.with(|n| n.borrow_mut().push((tag, answer.clone())));
-    let r = f();
-    NESTED.with(|n| {
-        n.borrow_mut().pop();
-    });
-    r
-}
-
 struct Shared {
-    tx: Sender<Request>,
     handle: v8::IsolateHandle,
     disposed: bool,
 }
 
-// The channel + isolate handle + shared host-fn registry that drive the one V8
-// thread. A Context and all the Realms it spawns share ONE Core via Arc, so
-// any of them can issue requests and they all see the same attached procs and
-// the same dispose state. Rust's refcount keeps the V8 thread alive until the
-// last wrapper is gone — no GC-mark bookkeeping (mini_racer's Realm has to mark
-// its parent Context by hand; here the type system does it).
+// The in-thread V8 isolate's control block. The isolate runs ON the Ruby thread
+// that created it (its `owner`): there is no dedicated V8 thread and no request
+// channel — `Core::run` opens a scope on the isolate (via `iso_ptr`) and runs
+// the op inline, releasing the GVL around the JS. A Context and all the Realms
+// it spawns share ONE Core via Arc, so any of them can issue ops and they all
+// see the same attached procs and dispose state. The isolate is THREAD-BOUND:
+// every op asserts owner == current thread and raises otherwise (a foreign-thread
+// use would SEGV deep in V8 — rusty_v8 exposes no v8::Locker).
 struct Core {
     // Weak self-handle so a &Core method can mint an Arc<Core> again (built via
     // Arc::new_cyclic). Needed to hand a fresh Context wrapper to the dynamic
     // import resolver — Context owns an Arc<Core> and &self can't recover it.
     me: Weak<Core>,
     shared: Mutex<Shared>,
-    // Shared across contexts (host_fn_id indexes ProcTable.slots). Mutex (not
-    // RefCell) because contexts of one Context may be pumped on different
-    // threads. Each proc is GC-rooted (marked + pinned) while live — see
-    // RootedProc/ProcSlot; reset/dispose of a realm releases its roots and
-    // recycles their slots (ProcTable.free).
+    // The id this isolate is keyed under in the owner thread's ISOLATES registry,
+    // and the owning RUBY thread (its Thread VALUE — see current_ruby_thread).
+    // Every op checks `owner == current_ruby_thread()`.
+    iso_id: u32,
+    owner: usize,
+    // Stable raw ptr to the OwnedIsolate's V8 isolate (it lives in ISOLATES). The
+    // runner opens its scope from this without borrowing ISOLATES across the run,
+    // so a re-entrant op can't double-borrow the registry. Dereferenced only on
+    // the owner thread.
+    iso_ptr: IsoPtr,
+    // Re-entry depth for THIS isolate, readable without a scope (the runner needs
+    // it to choose the scope kind before any scope exists): 0 = top-level op
+    // (open a fresh HandleScope from iso_ptr); >0 = a host callback is on the V8
+    // stack (bootstrap via callback_scope! onto the ambient scope). Bumped around
+    // each `run`.
+    depth: std::sync::atomic::AtomicU32,
+    // host_fn_id indexes ProcTable.slots. Mutex (uncontended — single owner
+    // thread) so host_fn_callback can reach it through Core (via the slot's
+    // core_ptr) while a &Core method also holds it. Each proc is GC-rooted while
+    // live — see RootedProc/ProcSlot; reset/dispose releases roots, recycles slots.
     procs: Mutex<ProcTable>,
     // Default per-eval/call timeout (ms); 0 = none. eval(timeout_ms:)'s explicit
     // value overrides it. Guards against an in-V8 infinite loop without a watchdog.
@@ -2639,6 +2561,11 @@ struct Core {
     // Set by Context#dynamic_import_resolver=; called for a JS import() to map
     // (specifier, referrer) to an already-loaded Module. GC-rooted like procs.
     dynamic_import_resolver: Mutex<Option<RootedProc>>,
+    // The watchdog (armed per timed op, fires TerminateExecution via the handle)
+    // and its thread's join handle, held here so dispose/Drop — which run on the
+    // owner thread with no scope — can stop and join it before the isolate drops.
+    watchdog: Arc<WatchdogShared>,
+    watchdog_join: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 // The V8 isolate (one per Isolate): lifecycle + the isolate-level ops
@@ -3073,229 +3000,161 @@ fn build_snapshot(code: &str, base: Option<Vec<u8>>, warmup: bool) -> Result<Vec
 }
 
 impl Isolate {
+    // Build the isolate ON THIS (the calling Ruby) thread — no dedicated V8
+    // thread. The OwnedIsolate moves into the owner thread's ISOLATES registry;
+    // Core keeps its id + a stable raw ptr so `run` can open scopes on it. The
+    // isolate is thread-bound from here on (every op asserts the owner thread).
     fn new(
-        ruby: &Ruby,
+        _ruby: &Ruby,
         host_namespace: Option<String>,
         snapshot: Option<magnus::typed_data::Obj<Snapshot>>,
         timeout_ms: u64,
         explicit_microtasks: bool,
     ) -> Result<Self, Error> {
+        init_v8();
+        // A snapshot blob bakes globalThis state in: the first Context::new (in
+        // new_realm below) deserializes that default context for free.
         let snapshot_bytes = snapshot.map(|s| s.blob.borrow().clone());
-        let (tx, rx) = channel::<Request>();
-        let (handle_tx, handle_rx) = channel::<v8::IsolateHandle>();
-        std::thread::spawn(move || {
-            v8_thread_main(rx, handle_tx, host_namespace, snapshot_bytes, explicit_microtasks)
+        let create_params = match snapshot_bytes {
+            Some(bytes) => v8::CreateParams::default().snapshot_blob(v8::StartupData::from(bytes)),
+            None => Default::default(),
+        };
+        let mut isolate = v8::Isolate::new(create_params);
+        // Always Explicit at the V8 level; the binding performs the kAuto
+        // end-of-script drain itself (auto_drain) so it stays inside the
+        // request's watchdog bracket and honours TerminateExecution. The
+        // :auto/:explicit distinction lives in auto_microtasks (read by
+        // auto_drain).
+        isolate.set_microtasks_policy(v8::MicrotasksPolicy::Explicit);
+        // JS import() routes here; rejects unless a dynamic_import_resolver is set.
+        isolate.set_host_import_module_dynamically_callback(dynamic_import_cb);
+        // Fills import.meta.url (the module's compile-time filename) on first access.
+        isolate.set_host_initialize_import_meta_object_callback(import_meta_cb);
+        // Unhandled-rejection notifications route to the JS recorder, if one was
+        // registered via NS.setPromiseRejectHandler (no-op otherwise).
+        isolate.set_promise_reject_callback(promise_reject_cb);
+        let handle = isolate.thread_safe_handle();
+        // Per-isolate state lives in the isolate's embedder slot (reached anywhere
+        // via istate!(scope)). Seed it; keep a clone of the watchdog Arc so
+        // dispose/Drop (which have no scope) can stop + join the thread.
+        let state = IsolateState::new(host_namespace, !explicit_microtasks);
+        let watchdog = Arc::clone(&state.watchdog);
+        isolate.set_slot(state);
+        let watchdog_join = {
+            let shared = Arc::clone(&watchdog);
+            let handle = isolate.thread_safe_handle();
+            std::thread::spawn(move || watchdog_loop(shared, handle))
+        };
+        // Boot the main realm (id 0) into the slot. new_realm reads the host
+        // namespace from the slot (seeded above).
+        {
+            v8::scope!(let scope, &mut isolate);
+            let main_context = new_realm(scope, 0);
+            istate!(scope).realms.main_context = Some(main_context);
+        }
+        // Box the OwnedIsolate so it has a STABLE address, then capture a raw ptr
+        // INTO the box (a `&mut Isolate` is `&mut NonNull<RealIsolate>`, pointing
+        // at the cxx_isolate field — so it must not move). Moving the Box into the
+        // registry moves only the 8-byte pointer; the boxed OwnedIsolate stays put.
+        let mut boxed = Box::new(isolate);
+        let iso_ptr = IsoPtr(&mut **boxed as *mut v8::Isolate);
+        let iso_id = NEXT_ISOLATE_ID.fetch_add(1, Ordering::SeqCst);
+        isolates().lock().unwrap().insert(iso_id, SendIso(boxed));
+        let core = Arc::new_cyclic(|me| Core {
+            me: me.clone(),
+            shared: Mutex::new(Shared { handle, disposed: false }),
+            iso_id,
+            owner: current_ruby_thread(),
+            iso_ptr,
+            depth: std::sync::atomic::AtomicU32::new(0),
+            procs: Mutex::new(ProcTable::default()),
+            default_timeout_ms: timeout_ms,
+            dynamic_import_resolver: Mutex::new(None),
+            watchdog,
+            watchdog_join: Mutex::new(Some(watchdog_join)),
         });
-        let handle = handle_rx
-            .recv()
-            .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread failed to boot"))?;
-        Ok(Isolate {
-            core: Arc::new_cyclic(|me| Core {
-                me: me.clone(),
-                shared: Mutex::new(Shared {
-                    tx,
-                    handle,
-                    disposed: false,
-                }),
-                procs: Mutex::new(ProcTable::default()),
-                default_timeout_ms: timeout_ms,
-                dynamic_import_resolver: Mutex::new(None),
-            }),
-        })
+        // Wire the slot's back-pointer now that the Arc exists, so a V8 callback
+        // (host fn / module resolver), which holds only a scope, can reach Core.
+        // Pure slot access — no V8 handles — so reach it through the raw ptr.
+        istate!(unsafe { &mut *core.iso_ptr.0 }).core_ptr = Arc::as_ptr(&core);
+        // v8::Isolate::new ENTERED the isolate (and the boot above needed it).
+        // EXIT it now: with several isolates created/disposed on one thread in
+        // any order, keeping each entered for life would break V8's LIFO
+        // enter/exit stack (an out-of-order drop aborts). Instead each op enters
+        // around its run (Core::run) and teardown re-enters just before drop.
+        unsafe { (*core.iso_ptr.0).exit() };
+        Ok(Isolate { core })
     }
 }
 
 impl Core {
-    fn send(&self, ruby: &Ruby, request: Request) -> Result<(), Error> {
-        let shared = self.shared.lock().unwrap();
-        if shared.disposed {
-            return Err(Error::new(ruby.exception_runtime_error(), "disposed context"));
-        }
-        shared
-            .tx
-            .send(request)
-            .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread is gone"))
-    }
-
-    // Deliver a request to the V8 thread. Normally via the main queue; but
-    // when this Ruby thread is inside a host proc / module resolver for THIS
-    // isolate (a NESTED frame tagged with this Core), the V8 thread is parked
-    // in that callback's answer loop and is NOT reading the queue — route
-    // through the innermost such frame instead, whose loop services any op
-    // re-entrantly (service_request). Queueing there would deadlock: the V8
-    // thread waits for the proc's answer while the proc waits for the queued
-    // request. A frame belonging to a DIFFERENT isolate is skipped: that
-    // isolate's V8 thread is the suspended one, not ours, so our queue is
-    // being read normally.
-    //
-    // NB: the frame lookup is per-Ruby-thread. An op issued from a Ruby
-    // thread *spawned inside* a proc still goes to the main queue and blocks
-    // until the outer request completes — if the proc waits on that thread,
-    // they deadlock. Re-entry is same-thread only.
-    fn dispatch(&self, ruby: &Ruby, request: Request) -> Result<(), Error> {
-        let me = self as *const Core as usize;
-        let nested = NESTED.with(|n| {
-            n.borrow()
-                .iter()
-                .rev()
-                .find(|(core, _)| *core == me)
-                .map(|(_, answer)| answer.clone())
-        });
-        match nested {
-            Some(answer) => answer
-                .send(Answer::Nested(request))
-                .map_err(|_| Error::new(ruby.exception_runtime_error(), "V8 thread is gone")),
-            None => self.send(ruby, request),
-        }
-    }
-
-    // Wait for this request's reply, serving host-fn callbacks and the
-    // instantiate resolve round-trip as they arrive. The recv waits release the
-    // GVL; the Ruby procs run with it held. |module_resolve| carries
-    // Module#instantiate's resolve block; other ops pass None.
-    fn pump(
+    // Run ONE op in-thread on the owner isolate and return its terminal reply.
+    // Opens a scope on the isolate — a fresh HandleScope at the top level, or,
+    // when re-entered from inside a host callback (depth > 0), a CallbackScope
+    // onto the ambient one — and runs `service_request` with the GVL RELEASED,
+    // so other Ruby threads proceed and a host callback can reacquire the GVL
+    // (with_gvl) to run its proc. `service_request` delivers the terminal reply
+    // synchronously into the channel before returning, so the try_recv always
+    // succeeds. Asserts the owner thread (a foreign-thread use would SEGV in V8).
+    fn run(
         &self,
         ruby: &Ruby,
-        reply_rx: Receiver<VmReply>,
-        module_resolve: Option<Proc>,
-    ) -> Result<Value, Error> {
-        loop {
-            let message = without_gvl(|| reply_rx.recv());
-            match message {
-                Ok(VmReply::Done(Ok(val))) => return jsval_to_ruby(ruby, &val),
-                Ok(VmReply::Done(Err(e))) => return Err(vm_err(ruby, e)),
-                // compile_module / compile / create_code_cache receive these
-                // directly, never via pump.
-                Ok(VmReply::ModuleCompiled(_))
-                | Ok(VmReply::ScriptCompiled(_))
-                | Ok(VmReply::CodeCache(_)) => {
-                    return Err(Error::new(
-                        ruby.exception_runtime_error(),
-                        "unexpected compile reply",
-                    ));
+        build: impl FnOnce(Sender<VmReply>) -> Request,
+    ) -> Result<VmReply, Error> {
+        // Bind by the RUBY thread, not the native one: Ruby's M:N scheduler can
+        // run one Ruby thread on different native threads over time, so a native
+        // ThreadId is unstable. A different Ruby thread, though, means concurrent
+        // use of a !Locker isolate — refuse it.
+        if current_ruby_thread() != self.owner {
+            return Err(Error::new(
+                ruby.exception_runtime_error(),
+                "RustyRacer: isolate used from a thread other than the one that created it",
+            ));
+        }
+        if self.shared.lock().unwrap().disposed {
+            return Err(Error::new(ruby.exception_runtime_error(), "disposed context"));
+        }
+        let (tx, rx) = channel::<VmReply>();
+        let request = build(tx);
+        let iso = self.iso_ptr.0;
+        let depth = self.depth.fetch_add(1, Ordering::SeqCst);
+        // EVERYTHING that touches V8 — enter, the scope, the JS run, the scope
+        // drop, exit — happens inside ONE without_gvl, hence on ONE native thread
+        // with no GVL boundary in between: M:N could otherwise migrate us to a
+        // different native thread on GVL re-acquire, and V8's enter/exit and
+        // HandleScope are native-thread-bound. Between ops the isolate is exited,
+        // so the next op (possibly on another native thread) just re-enters.
+        without_gvl(|| {
+            if depth == 0 {
+                unsafe { (*iso).enter() };
+                {
+                    v8::scope!(let scope, unsafe { &mut *iso });
+                    service_request(scope, request, true);
                 }
-                Ok(VmReply::Callback {
-                    host_fn_id,
-                    args,
-                    answer,
-                }) => {
-                    let result = self.call_proc(ruby, host_fn_id, &args, &answer);
-                    let _ = answer.send(Answer::Result(result));
-                }
-                Ok(VmReply::ResolveModule {
-                    specifier,
-                    referrer_url,
-                    initiating_context,
-                    answer,
-                }) => {
-                    match &module_resolve {
-                        Some(resolve) => {
-                            // The resolve block may itself call back into the VM
-                            // (e.g. compile_module for a lazily-loaded dep), so
-                            // run it under a NESTED frame like a host proc's:
-                            // those ops then route nested instead of into the
-                            // (busy) main queue. The static instantiate block
-                            // keeps its 2-arg contract (None).
-                            let resolved = with_nested(self, &answer, || {
-                                resolve_module_via_ruby(self, *resolve, &specifier, &referrer_url, None)
-                            });
-                            match resolved {
-                                Ok(id) => {
-                                    let _ = answer.send(Answer::ModuleId(id));
-                                }
-                                // Unblock the V8 thread (import fails to resolve),
-                                // then propagate the resolver's real error instead
-                                // of masking it as "module not found".
-                                Err(e) => {
-                                    let _ = answer.send(Answer::ModuleId(None));
-                                    return Err(e);
-                                }
-                            }
-                        }
-                        None => {
-                            // No instantiate block on this request: the V8
-                            // thread is auto-linking a DYNAMIC import, whose
-                            // static imports resolve through the
-                            // dynamic_import_resolver. A raising resolver only
-                            // fails the import() (the surrounding request is
-                            // still owed its Done reply), like the
-                            // DynamicImport arm below.
-                            let resolver = {
-                                let guard = self.dynamic_import_resolver.lock().unwrap();
-                                guard.as_ref().map(|r| r.get())
-                            };
-                            let id = match resolver {
-                                Some(proc) => with_nested(self, &answer, || {
-                                    resolve_module_via_ruby(
-                                        self,
-                                        proc,
-                                        &specifier,
-                                        &referrer_url,
-                                        Some(initiating_context),
-                                    )
-                                })
-                                .unwrap_or(None),
-                                None => None,
-                            };
-                            let _ = answer.send(Answer::ModuleId(id));
-                        }
-                    }
-                }
-                Ok(VmReply::DynamicImport {
-                    specifier,
-                    referrer_url,
-                    initiating_context,
-                    answer,
-                }) => {
-                    // Read the Context's dynamic_import_resolver (set via the
-                    // setter); reuse the same Module-id resolution as instantiate.
-                    let resolver = {
-                        let guard = self.dynamic_import_resolver.lock().unwrap();
-                        guard.as_ref().map(|r| r.get())
-                    };
-                    match resolver {
-                        Some(proc) => {
-                            // Like ResolveModule: ops issued by the resolver
-                            // (compile/instantiate/evaluate a lazy module)
-                            // route nested through this answer sender. The
-                            // resolver gets the initiating realm as a 3rd Context
-                            // arg so iframe imports resolve in the iframe's realm.
-                            let resolved = with_nested(self, &answer, || {
-                                resolve_module_via_ruby(
-                                    self,
-                                    proc,
-                                    &specifier,
-                                    &referrer_url,
-                                    Some(initiating_context),
-                                )
-                            });
-                            match resolved {
-                                Ok(id) => {
-                                    let _ = answer.send(Answer::ModuleId(id));
-                                }
-                                // import() happens mid-eval; a raising resolver
-                                // must only reject the import() promise, NOT abort
-                                // the surrounding eval (whose Done reply is still
-                                // coming). Unblock V8 and keep pumping — the
-                                // import() rejects generically (unlike instantiate,
-                                // which is its own request and may propagate Err).
-                                Err(_) => {
-                                    let _ = answer.send(Answer::ModuleId(None));
-                                }
-                            }
-                        }
-                        None => {
-                            let _ = answer.send(Answer::ModuleId(None));
-                        }
-                    }
-                }
-                Err(_) => {
-                    return Err(Error::new(
-                        ruby.exception_runtime_error(),
-                        "V8 thread went away mid-request",
-                    ));
-                }
+                unsafe { (*iso).exit() };
+            } else {
+                // Re-entrant (a host callback, having reacquired the GVL to run a
+                // proc that issued this op, is on the V8 stack): the isolate is
+                // already entered by the depth-0 op on THIS native thread, so
+                // bootstrap onto the ambient HandleScope rather than re-enter.
+                v8::callback_scope!(unsafe scope, unsafe { &mut *iso });
+                service_request(scope, request, false);
             }
+        });
+        self.depth.fetch_sub(1, Ordering::SeqCst);
+        rx.try_recv()
+            .map_err(|_| Error::new(ruby.exception_runtime_error(), "internal: op produced no reply"))
+    }
+
+    // Map a terminal reply to a Ruby value (the common eval/call/run shape).
+    fn reply_value(ruby: &Ruby, reply: VmReply) -> Result<Value, Error> {
+        match reply {
+            VmReply::Done(Ok(val)) => jsval_to_ruby(ruby, &val),
+            VmReply::Done(Err(e)) => Err(vm_err(ruby, e)),
+            _ => Err(Error::new(
+                ruby.exception_runtime_error(),
+                "internal: unexpected reply kind",
+            )),
         }
     }
 
@@ -3304,7 +3163,6 @@ impl Core {
         ruby: &Ruby,
         host_fn_id: usize,
         args: &[JsVal],
-        answer: &Sender<Answer>,
     ) -> Result<JsVal, String> {
         let proc = {
             let procs = self.procs.lock().unwrap();
@@ -3330,9 +3188,10 @@ impl Core {
                 .map_err(|e| e.to_string())?;
         }
         // SAFETY: ruby_args is a live local (so GC keeps it and its elements) and
-        // is not mutated while the slice is borrowed — as_slice's contract.
-        let result: Result<Value, Error> =
-            with_nested(self, answer, || proc.call(unsafe { ruby_args.as_slice() }));
+        // is not mutated while the slice is borrowed — as_slice's contract. A VM
+        // op the proc issues re-enters Core::run (depth > 0) directly — no nested
+        // frame bookkeeping is needed any more (the call stack IS the nesting).
+        let result: Result<Value, Error> = proc.call(unsafe { ruby_args.as_slice() });
         let value = result.map_err(|e| e.to_string())?;
         ruby_to_jsval(value).map_err(|e| e.to_string())
     }
@@ -3353,31 +3212,23 @@ impl Core {
             .map(|v| ruby_to_jsval(*v))
             .collect::<Result<_, _>>()?;
 
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(
-            ruby,
-            Request::Call {
-                context_id,
-                name,
-                args: jsargs,
-                void,
-                timeout_ms: self.default_timeout_ms,
-                reply: reply_tx,
-            },
-        )?;
-        self.pump(ruby, reply_rx, None)
+        let reply = self.run(ruby, |reply| Request::Call {
+            context_id,
+            name,
+            args: jsargs,
+            void,
+            timeout_ms: self.default_timeout_ms,
+            reply,
+        })?;
+        Self::reply_value(ruby, reply)
     }
 
     fn drain_microtasks(&self, ruby: &Ruby) -> Result<Value, Error> {
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(
-            ruby,
-            Request::DrainMicrotasks {
-                timeout_ms: self.default_timeout_ms,
-                reply: reply_tx,
-            },
-        )?;
-        self.pump(ruby, reply_rx, None)
+        let reply = self.run(ruby, |reply| Request::DrainMicrotasks {
+            timeout_ms: self.default_timeout_ms,
+            reply,
+        })?;
+        Self::reply_value(ruby, reply)
     }
 
     fn eval_t(
@@ -3388,18 +3239,14 @@ impl Core {
         filename: String,
         timeout_ms: u64,
     ) -> Result<Value, Error> {
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(
-            ruby,
-            Request::Eval {
-                context_id,
-                source,
-                filename,
-                timeout_ms,
-                reply: reply_tx,
-            },
-        )?;
-        self.pump(ruby, reply_rx, None)
+        let reply = self.run(ruby, |reply| Request::Eval {
+            context_id,
+            source,
+            filename,
+            timeout_ms,
+            reply,
+        })?;
+        Self::reply_value(ruby, reply)
     }
 
     fn attach(&self, ruby: &Ruby, context_id: i32, name: String, proc: Proc) -> Result<Value, Error> {
@@ -3407,18 +3254,14 @@ impl Core {
             context_id,
             proc: Some(RootedProc(BoxValue::new(proc))),
         });
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(
-            ruby,
-            Request::Attach {
-                context_id,
-                name,
-                host_fn_id,
-                timeout_ms: self.default_timeout_ms,
-                reply: reply_tx,
-            },
-        )?;
-        self.pump(ruby, reply_rx, None)
+        let reply = self.run(ruby, |reply| Request::Attach {
+            context_id,
+            name,
+            host_fn_id,
+            timeout_ms: self.default_timeout_ms,
+            reply,
+        })?;
+        Self::reply_value(ruby, reply)
     }
 
     // attach_many: install several host fns in ONE round-trip to the V8 thread
@@ -3445,17 +3288,13 @@ impl Core {
                 })
                 .collect()
         };
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(
-            ruby,
-            Request::AttachMany {
-                context_id,
-                entries: named_ids,
-                timeout_ms: self.default_timeout_ms,
-                reply: reply_tx,
-            },
-        )?;
-        self.pump(ruby, reply_rx, None)
+        let reply = self.run(ruby, |reply| Request::AttachMany {
+            context_id,
+            entries: named_ids,
+            timeout_ms: self.default_timeout_ms,
+            reply,
+        })?;
+        Self::reply_value(ruby, reply)
     }
 
     // Release the GC roots of the procs attached into |context_id| — its
@@ -3468,27 +3307,24 @@ impl Core {
     }
 
     fn reset(&self, ruby: &Ruby, context_id: i32) -> Result<Value, Error> {
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(ruby, Request::Reset { context_id, reply: reply_tx })?;
-        let out = self.pump(ruby, reply_rx, None)?;
+        let reply = self.run(ruby, |reply| Request::Reset { context_id, reply })?;
+        let out = Self::reply_value(ruby, reply)?;
         // Only on success — a refused reset (unknown/suspended realm) keeps
         // its attached fns callable.
         self.release_context_procs(context_id);
         Ok(out)
     }
 
-    // Build a new context; returns its id (the V8 thread replies with an Int).
+    // Build a new context; returns its id (replied as an Int).
     fn create_context(&self, ruby: &Ruby) -> Result<i32, Error> {
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(ruby, Request::CreateContext { reply: reply_tx })?;
-        let id = self.pump(ruby, reply_rx, None)?;
+        let reply = self.run(ruby, |reply| Request::CreateContext { reply })?;
+        let id = Self::reply_value(ruby, reply)?;
         i32::try_convert(id)
     }
 
     fn dispose_context(&self, ruby: &Ruby, context_id: i32) -> Result<(), Error> {
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(ruby, Request::DisposeContext { context_id, reply: reply_tx })?;
-        self.pump(ruby, reply_rx, None)?;
+        let reply = self.run(ruby, |reply| Request::DisposeContext { context_id, reply })?;
+        Self::reply_value(ruby, reply)?;
         self.release_context_procs(context_id);
         Ok(())
     }
@@ -3504,71 +3340,83 @@ impl Core {
         produce_cache: bool,
         eager: bool,
     ) -> Result<Compiled, Error> {
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(
-            ruby,
-            Request::CompileModule {
-                context_id,
-                source,
-                filename,
-                cached_data,
-                produce_cache,
-                eager,
-                reply: reply_tx,
-            },
-        )?;
-        // compile_module can't trigger host callbacks, so receive directly
-        // (release the GVL) rather than via pump.
-        match without_gvl(|| reply_rx.recv()) {
-            Ok(VmReply::ModuleCompiled(Ok(cm))) => Ok(cm),
-            Ok(VmReply::ModuleCompiled(Err(e))) => Err(vm_err(ruby, e)),
+        let reply = self.run(ruby, |reply| Request::CompileModule {
+            context_id,
+            source,
+            filename,
+            cached_data,
+            produce_cache,
+            eager,
+            reply,
+        })?;
+        match reply {
+            VmReply::ModuleCompiled(Ok(cm)) => Ok(cm),
+            VmReply::ModuleCompiled(Err(e)) => Err(vm_err(ruby, e)),
             _ => Err(Error::new(
                 ruby.exception_runtime_error(),
-                "V8 thread went away mid-compile",
+                "internal: unexpected compile reply",
             )),
         }
     }
 
-    // instantiate carries the resolve block to pump so resolve_imported can ask
-    // it per import edge. The block may compile a dependency lazily — while the
-    // V8 thread is parked inside InstantiateModule, its wait loop services
-    // nested ops (service_request) — and returns the dep Module (or nil for
-    // unresolved).
+    // Park (or clear) Module#instantiate's resolve block in the slot so
+    // resolve_imported — a V8 callback with only a scope — can find it during
+    // linking. Setting also clears any stale resolver error. Pure slot access,
+    // no V8 handles, so reach it through the raw isolate ptr directly.
+    fn set_instantiate_resolve(&self, resolve: Option<Proc>) {
+        let st = unsafe { &mut *self.iso_ptr.0 }
+            .get_slot_mut::<IsolateState>()
+            .expect("IsolateState missing from isolate slot");
+        st.instantiate_resolve = resolve.map(|p| RootedProc(BoxValue::new(p)));
+        st.instantiate_resolve_err = None;
+    }
+
+    fn take_instantiate_resolve_err(&self) -> Option<Exception> {
+        unsafe { &mut *self.iso_ptr.0 }
+            .get_slot_mut::<IsolateState>()
+            .expect("IsolateState missing from isolate slot")
+            .instantiate_resolve_err
+            .take()
+            .map(|b| *b)
+    }
+
+    // instantiate parks the resolve block in the slot so resolve_imported can ask
+    // it per import edge (it may compile a dependency lazily — a re-entrant op
+    // that just recurses into run). Cleared afterwards, success or failure. A
+    // resolver that RAISED is re-raised here with its original class.
     fn instantiate_module(&self, ruby: &Ruby, module_id: i32, resolve: Proc) -> Result<Value, Error> {
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(ruby, Request::InstantiateModule { module_id, reply: reply_tx })?;
-        self.pump(ruby, reply_rx, Some(resolve))
+        self.set_instantiate_resolve(Some(resolve));
+        let reply = self.run(ruby, |reply| Request::InstantiateModule { module_id, reply });
+        let resolver_err = self.take_instantiate_resolve_err();
+        self.set_instantiate_resolve(None);
+        if let Some(exc) = resolver_err {
+            return Err(Error::from(exc));
+        }
+        Self::reply_value(ruby, reply?)
     }
 
     fn evaluate_module(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(
-            ruby,
-            Request::EvaluateModule {
-                module_id,
-                timeout_ms: self.default_timeout_ms,
-                reply: reply_tx,
-            },
-        )?;
-        self.pump(ruby, reply_rx, None)
+        let reply = self.run(ruby, |reply| Request::EvaluateModule {
+            module_id,
+            timeout_ms: self.default_timeout_ms,
+            reply,
+        })?;
+        Self::reply_value(ruby, reply)
     }
 
     fn module_namespace(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(ruby, Request::ModuleNamespace { module_id, reply: reply_tx })?;
-        self.pump(ruby, reply_rx, None)
+        let reply = self.run(ruby, |reply| Request::ModuleNamespace { module_id, reply })?;
+        Self::reply_value(ruby, reply)
     }
 
     fn module_status(&self, ruby: &Ruby, module_id: i32) -> Result<Value, Error> {
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(ruby, Request::ModuleStatus { module_id, reply: reply_tx })?;
-        self.pump(ruby, reply_rx, None)
+        let reply = self.run(ruby, |reply| Request::ModuleStatus { module_id, reply })?;
+        Self::reply_value(ruby, reply)
     }
 
     fn dispose_module(&self, ruby: &Ruby, module_id: i32) -> Result<(), Error> {
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(ruby, Request::DisposeModule { module_id, reply: reply_tx })?;
-        self.pump(ruby, reply_rx, None).map(|_| ())
+        let reply = self.run(ruby, |reply| Request::DisposeModule { module_id, reply })?;
+        Self::reply_value(ruby, reply).map(|_| ())
     }
 
     // Classic script: compile (no host callbacks -> direct recv), run, dispose.
@@ -3582,46 +3430,37 @@ impl Core {
         produce_cache: bool,
         eager: bool,
     ) -> Result<Compiled, Error> {
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(
-            ruby,
-            Request::CompileScript {
-                context_id,
-                source,
-                filename,
-                cached_data,
-                produce_cache,
-                eager,
-                reply: reply_tx,
-            },
-        )?;
-        match without_gvl(|| reply_rx.recv()) {
-            Ok(VmReply::ScriptCompiled(Ok(cs))) => Ok(cs),
-            Ok(VmReply::ScriptCompiled(Err(e))) => Err(vm_err(ruby, e)),
+        let reply = self.run(ruby, |reply| Request::CompileScript {
+            context_id,
+            source,
+            filename,
+            cached_data,
+            produce_cache,
+            eager,
+            reply,
+        })?;
+        match reply {
+            VmReply::ScriptCompiled(Ok(cs)) => Ok(cs),
+            VmReply::ScriptCompiled(Err(e)) => Err(vm_err(ruby, e)),
             _ => Err(Error::new(
                 ruby.exception_runtime_error(),
-                "V8 thread went away mid-compile",
+                "internal: unexpected compile reply",
             )),
         }
     }
 
     fn run_script(&self, ruby: &Ruby, script_id: i32) -> Result<Value, Error> {
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(
-            ruby,
-            Request::RunScript {
-                script_id,
-                timeout_ms: self.default_timeout_ms,
-                reply: reply_tx,
-            },
-        )?;
-        self.pump(ruby, reply_rx, None)
+        let reply = self.run(ruby, |reply| Request::RunScript {
+            script_id,
+            timeout_ms: self.default_timeout_ms,
+            reply,
+        })?;
+        Self::reply_value(ruby, reply)
     }
 
     fn dispose_script(&self, ruby: &Ruby, script_id: i32) -> Result<(), Error> {
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(ruby, Request::DisposeScript { script_id, reply: reply_tx })?;
-        self.pump(ruby, reply_rx, None).map(|_| ())
+        let reply = self.run(ruby, |reply| Request::DisposeScript { script_id, reply })?;
+        Self::reply_value(ruby, reply).map(|_| ())
     }
 
     // Serialize a fresh bytecode cache from a compiled handle's current state
@@ -3629,15 +3468,13 @@ impl Core {
     // — so receive directly off the GVL like compile_script. None = V8 couldn't
     // produce one (or the realm is gone).
     fn script_code_cache(&self, ruby: &Ruby, script_id: i32) -> Result<Option<Vec<u8>>, Error> {
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(ruby, Request::ScriptCodeCache { script_id, reply: reply_tx })?;
-        recv_code_cache(ruby, reply_rx)
+        let reply = self.run(ruby, |reply| Request::ScriptCodeCache { script_id, reply })?;
+        code_cache_from_reply(ruby, reply)
     }
 
     fn module_code_cache(&self, ruby: &Ruby, module_id: i32) -> Result<Option<Vec<u8>>, Error> {
-        let (reply_tx, reply_rx) = channel::<VmReply>();
-        self.dispatch(ruby, Request::ModuleCodeCache { module_id, reply: reply_tx })?;
-        recv_code_cache(ruby, reply_rx)
+        let reply = self.run(ruby, |reply| Request::ModuleCodeCache { module_id, reply })?;
+        code_cache_from_reply(ruby, reply)
     }
 
     fn set_dynamic_import_resolver(&self, proc: Proc) {
@@ -3657,29 +3494,100 @@ impl Core {
         self.shared.lock().unwrap().disposed
     }
 
-    fn dispose(&self, ruby: &Ruby) -> Result<(), Error> {
-        let mut shared = self.shared.lock().unwrap();
-        if shared.disposed {
-            return Ok(());
-        }
-        shared.disposed = true;
-        // Queued behind any in-flight request; its requester still gets its
-        // reply (it owns its own channel). Send can only fail if the V8
-        // thread already exited, which is fine.
-        let _ = shared.tx.send(Request::Dispose);
-        drop(shared);
-        // Release every GC root now (we are on a Ruby thread): a disposed
-        // isolate must not keep the attached procs — and whatever their
-        // closures capture — alive and pinned until the last wrapper object
-        // is itself collected.
+    // Owner-thread isolate teardown: release GC roots, clear the slot's Globals,
+    // stop + join the watchdog, then drop the OwnedIsolate (which disposes V8).
+    // Order matters — every v8::Global must die before the isolate, and the
+    // watchdog (which holds the isolate handle) must be joined before the isolate
+    // drops so no late TerminateExecution lands. Caller has set `disposed`.
+    fn teardown(&self) {
+        // ENTER the isolate so it is the current one: dropping v8::Globals needs
+        // it entered, and OwnedIsolate's Drop asserts `self == GetCurrent()`
+        // (then exits). Between ops the isolate is exited, so we must enter here.
+        unsafe { (*self.iso_ptr.0).enter() };
         {
             let mut procs = self.procs.lock().unwrap();
             procs.slots.clear();
             procs.free.clear();
         }
         *self.dynamic_import_resolver.lock().unwrap() = None;
-        let _ = ruby;
+        {
+            let st = unsafe { &mut *self.iso_ptr.0 }
+                .get_slot_mut::<IsolateState>()
+                .expect("IsolateState missing from isolate slot");
+            st.realms = V8State::default();
+            st.modules = ModuleReg::default();
+            st.scripts = ScriptReg::default();
+            st.instantiate_resolve = None;
+        }
+        {
+            let mut inner = self.watchdog.inner.lock().unwrap();
+            inner.shutdown = true;
+        }
+        self.watchdog.cv.notify_one();
+        if let Some(join) = self.watchdog_join.lock().unwrap().take() {
+            let _ = join.join();
+        }
+        // Remove (and drop) the OwnedIsolate — V8 disposal runs here — AFTER the
+        // watchdog joined and the Globals were cleared, while the isolate is
+        // entered (above). Drop outside the lock so V8 teardown can't deadlock on
+        // the registry.
+        let removed = isolates().lock().unwrap().remove(&self.iso_id);
+        drop(removed);
+    }
+
+    fn dispose(&self, ruby: &Ruby) -> Result<(), Error> {
+        if current_ruby_thread() != self.owner {
+            return Err(Error::new(
+                ruby.exception_runtime_error(),
+                "RustyRacer: dispose must run on the isolate's owner thread",
+            ));
+        }
+        {
+            let mut shared = self.shared.lock().unwrap();
+            if shared.disposed {
+                return Ok(());
+            }
+            // A dispose racing a live op on this isolate (depth > 0 = a host
+            // callback is on the V8 stack) would tear the isolate down mid-run
+            // and SEGV — refuse it, leaving the isolate usable.
+            if self.depth.load(Ordering::SeqCst) != 0 {
+                return Err(Error::new(
+                    ruby.exception_runtime_error(),
+                    "RustyRacer: cannot dispose an isolate from within a running op or host callback",
+                ));
+            }
+            shared.disposed = true;
+        }
+        self.teardown();
         Ok(())
+    }
+}
+
+impl Drop for Core {
+    fn drop(&mut self) {
+        // Explicit dispose already tore the isolate down — nothing to do.
+        if self.shared.lock().unwrap().disposed {
+            return;
+        }
+        if current_ruby_thread() == self.owner {
+            // Last wrapper dropped on the owner thread: full teardown. depth is 0
+            // (a running op holds a wrapper alive, so the last drop can't race
+            // one), and Drop can't raise — so just tear down.
+            self.shared.lock().unwrap().disposed = true;
+            self.teardown();
+        } else {
+            // Foreign-thread GC drop: a thread-bound isolate CANNOT be disposed
+            // off its owner thread (that would SEGV) and Drop CANNOT raise — so
+            // LEAK the OwnedIsolate (it stays in the owner thread's ISOLATES until
+            // the process exits) and only signal the watchdog to stop. Disposing
+            // explicitly on the owner thread before the last wrapper drops avoids
+            // this leak.
+            {
+                let mut inner = self.watchdog.inner.lock().unwrap();
+                inner.shutdown = true;
+            }
+            self.watchdog.cv.notify_one();
+        }
     }
 }
 
@@ -4015,13 +3923,13 @@ fn code_cache_value(ruby: &Ruby, bytes: Option<&Vec<u8>>) -> Value {
 
 // Await a ScriptCodeCache/ModuleCodeCache reply off the GVL (it runs no JS, so
 // no host callbacks to service — a direct recv, not pump).
-fn recv_code_cache(ruby: &Ruby, reply_rx: Receiver<VmReply>) -> Result<Option<Vec<u8>>, Error> {
-    match without_gvl(|| reply_rx.recv()) {
-        Ok(VmReply::CodeCache(Ok(bytes))) => Ok(bytes),
-        Ok(VmReply::CodeCache(Err(e))) => Err(vm_err(ruby, e)),
+fn code_cache_from_reply(ruby: &Ruby, reply: VmReply) -> Result<Option<Vec<u8>>, Error> {
+    match reply {
+        VmReply::CodeCache(Ok(bytes)) => Ok(bytes),
+        VmReply::CodeCache(Err(e)) => Err(vm_err(ruby, e)),
         _ => Err(Error::new(
             ruby.exception_runtime_error(),
-            "V8 thread went away mid-cache",
+            "internal: unexpected code-cache reply",
         )),
     }
 }
