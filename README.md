@@ -36,7 +36,7 @@ begin
   ctx.eval("throw new Error('boom')", filename: "app.js")
 rescue RustyRacer::RuntimeError => e
   e.message     # => "Error: boom"
-  e.backtrace   # => ["app.js:1:7:in '<anonymous>'", ...]
+  e.backtrace   # => ["app.js:1:7"]  (named frames read "app.js:1:25:in 'fn'")
 end
 ```
 
@@ -49,32 +49,60 @@ app = ctx.compile_module('import {x} from "./dep.js"; export const r = x * 2;',
 app.instantiate { |specifier, referrer| dep if specifier == "./dep.js" }
 app.evaluate
 app.namespace["r"]                       # => 42
-
-# Bytecode cache for cross-process boot:
-blob = ctx.compile_module(src, produce_cache: true).cached_data
-iso2.context.compile_module(src, cached_data: blob)   # skips reparse
-
-# Warm cache: run/evaluate first, then create_code_cache picks up the inner
-# functions V8 compiled while running (produce_cache only sees the top level).
-s = ctx.compile(src, filename: "/app.js")
-s.run
-warm = s.create_code_cache                            # includes hot inner fns
 ```
 
-Also: `Snapshot` (startup blobs), `Isolate#create_context` (an extra realm —
-its own globals sharing the isolate's heap; all realms are mutually
-same-origin, so with a host namespace `NS.contextGlobal(id)` reaches another
-realm's `globalThis` like a same-origin `iframe.contentWindow`, and is not an
-isolation boundary), `Isolate#perform_microtask_checkpoint` (manual drain; the
-default `microtasks: :auto` also drains at the end of each outermost
-eval/call/evaluate, while `microtasks: :explicit` leaves draining fully manual
-— there is no event loop or timers either way), `Isolate#terminate`,
-`Isolate#dynamic_import_resolver=`, `Context#reset`, `Platform.set_flags!`.
+Classic `<script>`s work the same way: `ctx.compile("1 + 1").run` # => 2.
+
+### Bytecode caching
+
+V8 compiles lazily: the top level up front, each function body on first call.
+Caches can be produced two ways, matching that.
+
+```ruby
+src = "function double(x) { return x * 2 }; double(21)"
+
+# produce_cache: — a cold cache taken at compile time (top level only). Persist
+# it, then pass it back via cached_data: to skip the reparse on the next boot,
+# even in another process or isolate.
+blob  = ctx.compile(src, produce_cache: true).cached_data
+other = RustyRacer::Isolate.new.context.compile(src, cached_data: blob)
+other.cache_rejected?            # => false (true if the blob was stale)
+
+# create_code_cache — a warm cache from the current compile state. Run a script
+# (or evaluate a module) first, and it also captures the inner functions that
+# actually ran — the warm cache a browser keeps; produce_cache can't see them.
+s = ctx.compile(src)
+s.run
+warm = s.create_code_cache       # binary String, or nil if V8 can't serialize
+
+# eager: compiles every function up front instead of lazily (~2× compile time,
+# more memory) — worth it only when producing a cache. Ignored with cached_data:.
+ctx.compile(src, produce_cache: true, eager: true)
+```
+
+Both `compile` (classic scripts → `Script#run`) and `compile_module` (ES modules
+→ `#instantiate`/`#evaluate`) take `cached_data:`, `produce_cache:`, and `eager:`,
+and expose `#cached_data` / `#cache_rejected?` / `#create_code_cache`.
+
+Also available:
+
+- **`Snapshot`** — startup blobs: boot an isolate from a baked-in heap and code
+  cache.
+- **`Isolate#create_context`** — an extra realm with its own globals, sharing the
+  isolate's heap. All realms are mutually same-origin (with a host namespace,
+  `NS.contextGlobal(id)` reaches another realm's `globalThis`, like a same-origin
+  `iframe.contentWindow`), so this is **not** an isolation boundary.
+- **`Isolate#perform_microtask_checkpoint`** — manual microtask drain. The default
+  `microtasks: :auto` also drains at the end of each outermost eval/call/evaluate;
+  `microtasks: :explicit` leaves it fully manual. There is no event loop or timers
+  either way.
+- **`Isolate#terminate`**, **`Isolate#dynamic_import_resolver=`**,
+  **`Context#reset`** (below), and **`Platform.set_flags!`**.
 
 ### `Context#reset`
 
 `reset` swaps the realm's `globalThis` for a fresh `v8::Context`, reusing the
-warm isolate (csim's per-visit reset). Its contract:
+warm isolate — a per-visit reset that avoids rebuilding the VM. Its contract:
 
 - **The snapshot is replayed.** On a snapshotted isolate the fresh context is
   re-deserialized from the snapshot, so the snapshot's baked-in globals — and
@@ -92,20 +120,30 @@ warm isolate (csim's per-visit reset). Its contract:
   suspended on the V8 stack (e.g. resetting a realm from inside one of its own
   host fns).
 
-## Building
+## Installation
+
+Precompiled gems bundle V8 — no V8 build, no Rust toolchain — for Ruby 3.3, 3.4,
+and 4.0 on:
+
+- **Linux:** x86_64 and arm64 (aarch64)
+- **macOS:** arm64 (Apple silicon) and x86_64 (Intel)
+
+```ruby
+gem "rusty_racer"
+```
+
+or `gem install rusty_racer`. On any other platform or Ruby, the source gem
+builds the extension at install time — see below.
+
+## Building from source
 
 The stock `v8` crate prebuilt links as a binary (initial-exec TLS), which a Ruby
-extension's shared object can't use. The extension therefore needs a
+extension's shared object can't use. A source build therefore needs a
 **library-TLS** `librusty_v8.a`. Either:
 
 - point `RUSTY_V8_ARCHIVE` at a prebuilt library-TLS archive, or
 - set `V8_FROM_SOURCE=1` to build V8 from the `denoland/rusty_v8` git tree
-  (large: lots of disk/RAM/time).
-
-```ruby
-# In a consuming Gemfile, while developing:
-gem "rusty_racer", path: "../rusty_racer"
-```
+  (large: lots of disk, RAM, and time).
 
 ## License
 
