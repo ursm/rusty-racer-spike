@@ -1456,6 +1456,29 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2, @ctx.eval('1 + 1')
   end
 
+  def test_eval_inside_a_fiber_does_not_crash
+    # A Ruby Fiber runs on the same native thread but a SEPARATE (mmap'd) stack,
+    # which pthread can't see. If the V8 limit were anchored to the native stack
+    # bottom (above the fiber stack), V8 would false-overflow and the throw would
+    # trip a FATAL IsOnCentralStack CHECK. Capybara::Result is an Enumerator (=
+    # Fiber), so `find` always evals inside one. A trivial eval and a deep JS
+    # overflow must both behave cleanly on a fiber.
+    @ctx.eval('globalThis.rec = function (n) { return n <= 0 ? 0 : 1 + rec(n - 1) }')
+    assert_equal 2, Fiber.new { @ctx.eval('1 + 1') }.resume
+    assert_equal 6, Fiber.new { @ctx.eval('[1,2,3].reduce((a, b) => a + b, 0)') }.resume
+    err = Fiber.new do
+      @ctx.eval('rec(10_000_000)')
+      nil
+    rescue RustyRacer::RuntimeError => e
+      e
+    end.resume
+    assert_includes err.message, 'call stack'
+    # an Enumerator (the Capybara::Result shape) also evaluates lazily in a fiber
+    enum = Enumerator.new { |y| y << @ctx.eval('40 + 2') }
+    assert_equal 42, enum.next
+    assert_equal 2, @ctx.eval('1 + 1') # isolate still works on the main stack
+  end
+
   def test_isolate_is_thread_confined
     # Every op must run on the isolate's owner thread; a foreign-thread op raises
     # WrongThreadError rather than corrupting V8.

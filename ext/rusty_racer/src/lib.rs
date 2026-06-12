@@ -460,64 +460,32 @@ unsafe extern "C" {
     fn v8__Isolate__SetStackLimit(isolate: *mut c_void, stack_limit: usize);
 }
 
-// The stack bottom is stable per NATIVE thread, but querying it (pthread, which
-// reads /proc/self/maps for the main thread on Linux) is far too slow to do per
-// op. Cache it in a native-thread-local — correct under M:N (each native thread
-// caches its own stack) and ~free after the first op on a thread.
+// The native thread's stack bounds are stable per NATIVE thread, but querying
+// them (pthread, which reads /proc/self/maps for the main thread on Linux) is
+// far too slow per op. Cache (bottom, top) in a native-thread-local — correct
+// under M:N (each native thread caches its own stack) and ~free after the first
+// op on a thread. (0, 0) if it can't be queried.
 thread_local! {
-    static STACK_BOTTOM: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static STACK_BOUNDS: std::cell::Cell<(usize, usize)> =
+        const { std::cell::Cell::new((0, 0)) };
 }
 
-fn native_stack_bottom() -> usize {
-    STACK_BOTTOM.with(|c| {
+fn native_stack_bounds_cached() -> (usize, usize) {
+    STACK_BOUNDS.with(|c| {
         let cached = c.get();
-        if cached != 0 {
+        if cached.0 != 0 {
             return cached;
         }
-        let bottom = query_native_stack_bottom();
-        c.set(bottom);
-        bottom
+        let bounds = native_stack_bounds();
+        c.set(bounds);
+        bounds
     })
 }
 
-// Lowest valid address of the CURRENT native thread's stack (it grows DOWN
-// toward this). 0 if it can't be queried.
-#[cfg(target_os = "linux")]
-fn query_native_stack_bottom() -> usize {
-    unsafe {
-        let mut attr: libc::pthread_attr_t = std::mem::zeroed();
-        if libc::pthread_getattr_np(libc::pthread_self(), &mut attr) != 0 {
-            return 0;
-        }
-        let mut addr: *mut c_void = null_mut();
-        let mut size: libc::size_t = 0;
-        let rc = libc::pthread_attr_getstack(&attr, &mut addr, &mut size);
-        libc::pthread_attr_destroy(&mut attr);
-        if rc != 0 {
-            return 0;
-        }
-        addr as usize
-    }
-}
-
-#[cfg(target_os = "macos")]
-fn query_native_stack_bottom() -> usize {
-    unsafe {
-        // On macOS pthread_get_stackaddr_np returns the stack BASE (highest
-        // address); the usable bottom is base - size.
-        let top = libc::pthread_get_stackaddr_np(libc::pthread_self()) as usize;
-        let size = libc::pthread_get_stacksize_np(libc::pthread_self());
-        top.saturating_sub(size)
-    }
-}
-
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn query_native_stack_bottom() -> usize {
-    0
-}
-
-// (bottom, top) of the current native thread's stack — uncached, used only by
-// the RUSTY_RACER_STACK_DEBUG diagnostics.
+// (bottom, top) of the CURRENT native thread's stack via pthread (uncached —
+// callers go through native_stack_bounds_cached). The stack grows DOWN from top
+// toward bottom. (0, 0) if it can't be queried. NB: this is the NATIVE thread's
+// pthread stack; a Ruby Fiber runs on a separate mmap'd stack invisible here.
 #[cfg(target_os = "linux")]
 fn native_stack_bounds() -> (usize, usize) {
     unsafe {
@@ -553,38 +521,45 @@ fn native_stack_bounds() -> (usize, usize) {
 // Set from RUSTY_RACER_STACK_DEBUG at init; gates the per-op stack diagnostics.
 static STACK_DEBUG: AtomicBool = AtomicBool::new(false);
 
-// Point V8's stack limit just above the current native thread's real stack
-// bottom, so a deep JS recursion throws RangeError ON the central stack
-// (cleanly) instead of overflowing the native stack — or, if the limit were
-// stale from a shallower entry, false-overflowing and tripping V8's
-// IsOnCentralStack CHECK (a fatal abort). Must be called with the isolate
+// Re-point V8's stack limit at the CURRENT stack each op. In-thread V8 runs
+// wherever the Ruby code is: usually the native thread's pthread stack, but also
+// a Ruby Fiber's separate mmap'd stack (Capybara::Result is an Enumerator) that
+// pthread can't see. The limit MUST be below the current SP — if it's set to the
+// native bottom while we're on a fiber (a DIFFERENT, lower address region), V8
+// sees SP below the limit, declares a (false) stack overflow, and throwing it
+// trips a fatal `Check failed: IsOnCentralStack()`. So detect which stack we're
+// on by comparing the SP to the cached native bounds, and anchor the limit to
+// the native bottom (full headroom) or — on a fiber, whose bottom we can't see
+// — to the current SP with a small guard. Must be called with the isolate
 // ENTERED. `real_isolate` is the raw v8::Isolate* read out of iso_ptr.
 fn set_v8_stack_limit(real_isolate: *mut c_void) {
-    let bottom = native_stack_bottom();
-    if bottom == 0 {
-        return; // couldn't query — leave V8's creation-time default
+    let sp_marker = 0u8;
+    let sp = &sp_marker as *const u8 as usize;
+    let (nbottom, ntop) = native_stack_bounds_cached();
+    let on_native = nbottom != 0 && sp > nbottom && sp <= ntop;
+    let limit = if on_native {
+        // Guard: headroom below the limit for V8's own RangeError-throw frames.
+        nbottom + 128 * 1024
+    } else {
+        // On a fiber we don't know the bottom; anchor to the SP with a guard
+        // small enough to fit a modest fiber stack (so deep JS still throws
+        // RangeError cleanly rather than overflowing the real fiber stack).
+        sp.saturating_sub(64 * 1024)
+    };
+    if limit == 0 {
+        return; // couldn't determine a sane limit — leave V8's default
     }
-    // Reserve headroom below the limit for V8's own RangeError throw + the C++
-    // frames under the limit check.
-    const GUARD_BYTES: usize = 128 * 1024;
-    let limit = bottom + GUARD_BYTES;
     unsafe { v8__Isolate__SetStackLimit(real_isolate, limit) };
-    // Opt-in diagnostics (RUSTY_RACER_STACK_DEBUG): print the current native SP
-    // against the real stack [bottom, top], the per-op limit, and V8's central
-    // stack view [top - stack_size_kb, top]. If the entry SP is below the view's
-    // lower bound, any throw from here fatals on IsOnCentralStack — that's the
-    // signal the --stack-size view is still too small for this entry.
+    // Opt-in diagnostics (RUSTY_RACER_STACK_DEBUG): the SP vs the native stack
+    // [nbottom, ntop], the per-op limit, whether a fiber was detected, and
+    // whether the SP is above the limit. A crash with sp_above_limit=false means
+    // the limit is wrong for the current stack.
     if STACK_DEBUG.load(Ordering::Relaxed) {
-        let sp_marker = 0u8;
-        let sp = &sp_marker as *const u8 as usize;
-        let (b, top) = native_stack_bounds();
-        let view_lo = top.saturating_sub((v8_central_stack_kb() as usize) * 1024);
         eprintln!(
-            "[rusty stack] sp={sp:#x} bottom={b:#x} top={top:#x} limit={limit:#x} \
-             view_lo={view_lo:#x} sp_in_view={} sp_above_limit={} headroom_kb={}",
-            sp > view_lo && sp <= top,
+            "[rusty stack] sp={sp:#x} nbottom={nbottom:#x} ntop={ntop:#x} \
+             limit={limit:#x} fiber={} sp_above_limit={}",
+            !on_native,
             sp > limit,
-            sp.saturating_sub(limit) / 1024,
         );
     }
 }
@@ -2771,18 +2746,6 @@ static V8_INITED: AtomicBool = AtomicBool::new(false);
 fn init_v8() {
     static ONCE: Once = Once::new();
     ONCE.call_once(|| {
-        // In-thread V8 runs on the calling Ruby thread's stack and is entered
-        // from ARBITRARY depths (e.g. a deep Capybara/Rack frame). V8's
-        // "central stack" view — what IsOnCentralStack() (CHECKed on every
-        // exception throw) compares the SP against — is only the TOP
-        // `--stack-size` bytes below the stack start. The default ~984 KiB is
-        // far too small: a throw from a deep entry (or a real overflow at the
-        // per-op limit near the stack bottom) lands OUTSIDE the view and trips a
-        // FATAL `Check failed: IsOnCentralStack()`. Size it to span a whole main
-        // thread's stack so the view covers any entry/limit (the per-op
-        // set_v8_stack_limit still sets the real RangeError point). Oversizing is
-        // harmless — `--stack-size` only sizes that view + compiler recursion.
-        v8::V8::set_flags_from_string(&format!("--stack-size={}", v8_central_stack_kb()));
         STACK_DEBUG.store(
             std::env::var_os("RUSTY_RACER_STACK_DEBUG").is_some(),
             Ordering::Relaxed,
@@ -2792,27 +2755,6 @@ fn init_v8() {
         v8::V8::initialize();
         V8_INITED.store(true, Ordering::SeqCst);
     });
-}
-
-// KiB to give V8's `--stack-size` (its central-stack-view size). Track the main
-// thread's stack (RLIMIT_STACK — the largest native stack ops run on), floored
-// at 8 MiB and capped so a giant/unlimited rlimit doesn't produce an absurd
-// value. Worker threads have smaller stacks; an oversized view just extends
-// harmlessly below them.
-fn v8_central_stack_kb() -> u64 {
-    const FLOOR_KB: u64 = 8 * 1024;
-    const CAP_KB: u64 = 256 * 1024;
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        let mut rl: libc::rlimit = unsafe { std::mem::zeroed() };
-        if unsafe { libc::getrlimit(libc::RLIMIT_STACK, &mut rl) } == 0
-            && rl.rlim_cur != libc::RLIM_INFINITY
-            && rl.rlim_cur > 0
-        {
-            return (rl.rlim_cur as u64 / 1024).clamp(FLOOR_KB, CAP_KB);
-        }
-    }
-    CAP_KB
 }
 
 // RustyRacer.cached_data_version_tag -> Integer (V8's CachedData version tag).
