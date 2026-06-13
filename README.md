@@ -9,6 +9,34 @@ Embed [V8](https://v8.dev/) in Ruby, built on [rusty_v8](https://crates.io/crate
 > is **thread-confined**: every operation must happen on that owner thread, or it
 > raises. `Isolate#terminate` is the exception — it is safe from any thread.
 
+## Highlights
+
+- **ES modules**, including dynamic `import()` with an embedder-owned resolver —
+  not just classic scripts.
+- **Faithful value marshalling**: `BigInt`, `Date`, `Map`, `Set`, typed binary
+  (`Uint8Array`/`ArrayBuffer` ↔ binary `String`), and shared/cyclic object
+  graphs all round-trip — no lossy JSON hop.
+- **In-thread execution** — V8 runs on the calling Ruby thread, with no dedicated
+  V8 thread and no per-op thread hop; fast when you run many small ops.
+- **Drop-in [ExecJS](#execjs) runtime** — any ExecJS consumer switches with no
+  code change.
+- **Snapshots, realms (`Context`s), host callbacks, and a bytecode cache.**
+- **Precompiled gems** bundle V8 for Linux/macOS × Ruby 3.3–4.0 — no V8 build,
+  no Rust toolchain.
+
+### Compared to mini_racer
+
+[mini_racer](https://github.com/rubyjs/mini_racer) is the mature, widely-deployed
+incumbent — if you want a battle-tested binding or **Windows** support, reach for
+it. rusty_racer differs where it counts for some workloads: native **ES modules +
+dynamic import** (mini_racer is eval/classic-script oriented); **richer
+marshalling** (the types above round-trip natively instead of through a
+JSON-shaped projection); and **in-thread execution** with no per-op thread hop,
+which is faster for overhead-dominated workloads (lots of tiny `eval`/`call`) and
+at parity once the per-op JS work dominates. It is also younger and
+**experimental** — fewer miles, no Windows yet, no per-isolate memory cap. Parity
+with mini_racer is not a goal; the overlap is convergent evolution, not a port.
+
 ## What it can do
 
 Names follow V8's: an `Isolate` is the VM; it hands out `Context`s (v8::Context,
