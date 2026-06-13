@@ -122,6 +122,28 @@ warm isolate — a per-visit reset that avoids rebuilding the VM. Its contract:
   suspended on the V8 stack (e.g. resetting a realm from inside one of its own
   host fns).
 
+## ExecJS
+
+rusty_racer ships an optional [ExecJS](https://github.com/rails/execjs) runtime,
+so any ExecJS consumer (asset pipelines, CoffeeScript/Babel/Uglify wrappers, …)
+can run on V8-in-Ruby with no code change:
+
+```ruby
+require "rusty_racer/execjs"
+ExecJS.runtime = RustyRacer::ExecJSRuntime.new
+
+ExecJS.eval("'foo bar'.toUpperCase()")   # => "FOO BAR"
+ctx = ExecJS.compile("function add(a, b) { return a + b }")
+ctx.call("add", 1, 2)                     # => 3
+```
+
+The adapter is **opt-in** — `rusty_racer` never requires `execjs` itself, so it
+stays a non-dependency; `require "rusty_racer/execjs"` pulls it in only when you
+ask. Values cross with ExecJS's JSON semantics (functions and `undefined` drop
+out, Dates become ISO strings), matching what ExecJS's external runtimes give, so
+results are identical whatever runtime a library picked. The integration is
+verified against ExecJS's own runtime contract suite (`test/execjs_test.rb`).
+
 ## Threading
 
 An `Isolate` runs V8 **in-thread** on the Ruby thread that created it, and is
