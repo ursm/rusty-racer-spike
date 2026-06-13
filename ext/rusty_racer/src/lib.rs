@@ -41,7 +41,7 @@ use std::collections::HashMap;
 use std::ffi::c_void;
 use std::ptr::null_mut;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, Once, Weak};
+use std::sync::{Arc, Mutex, Once, Weak};
 
 use magnus::block::Proc;
 use magnus::value::{BoxValue, ReprValue};
@@ -57,8 +57,7 @@ mod stack;
 use stack::{discover_scan_start_field, set_v8_stack_limit, STACK_DEBUG};
 mod watchdog;
 use watchdog::{
-    arm_watchdog, disarm_watchdog, run_js_bracketed, watchdog_loop, WatchdogInner, WatchdogShared,
-    WATCHDOG_DEBUG,
+    arm_watchdog, disarm_watchdog, run_js_bracketed, watchdog_loop, WatchdogShared, WATCHDOG_DEBUG,
 };
 
 // A Ruby Proc rooted for as long as the Core holds it. BoxValue registers a
@@ -543,15 +542,7 @@ impl IsolateState {
             core_ptr: std::ptr::null(),
             instantiate_resolve: None,
             instantiate_resolve_err: None,
-            watchdog: Arc::new(WatchdogShared {
-                inner: Mutex::new(WatchdogInner {
-                    frames: Vec::new(),
-                    next_generation: 0,
-                    fired_generation: None,
-                    shutdown: false,
-                }),
-                cv: Condvar::new(),
-            }),
+            watchdog: WatchdogShared::new(),
         }
     }
 }
@@ -2058,11 +2049,7 @@ impl Core {
     fn teardown(&self) {
         // Stop + join the watchdog before we touch the isolate, so its handle
         // can't fire a terminate into an isolate we're mid-disposing.
-        {
-            let mut inner = self.watchdog.inner.lock().unwrap();
-            inner.shutdown = true;
-        }
-        self.watchdog.cv.notify_one();
+        self.watchdog.request_shutdown();
         if let Some(join) = self.watchdog_join.lock().unwrap().take() {
             let _ = join.join();
         }
@@ -2139,11 +2126,7 @@ impl Drop for Core {
             // explicitly on the owner thread before the last wrapper drops avoids
             // this leak; the counter makes it observable (RustyRacer.leaked_isolate_count).
             LEAKED_ISOLATES.fetch_add(1, Ordering::Relaxed);
-            {
-                let mut inner = self.watchdog.inner.lock().unwrap();
-                inner.shutdown = true;
-            }
-            self.watchdog.cv.notify_one();
+            self.watchdog.request_shutdown();
         }
     }
 }

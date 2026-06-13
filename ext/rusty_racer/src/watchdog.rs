@@ -3,12 +3,13 @@
 // (run_js_bracketed) that arms/disarms it around every JS-running op and maps a
 // fired deadline to VmError::Terminated. Extracted from lib.rs verbatim.
 //
-// WatchdogShared/WatchdogInner (and their fields) are pub(crate) because
-// IsolateState holds the Arc<WatchdogShared> and Core's teardown locks
-// .inner / sets .shutdown / notifies .cv. run_js_bracketed, arm_watchdog,
+// Only WatchdogShared is pub(crate) (IsolateState holds the Arc<WatchdogShared>
+// and watchdog_loop takes it); its fields and the whole WatchdogInner/
+// WatchdogFrame state stay PRIVATE — lib.rs touches the watchdog through just
+// two methods, WatchdogShared::new() (initial state) and request_shutdown()
+// (teardown: set the flag + wake the loop). run_js_bracketed, arm_watchdog,
 // disarm_watchdog, watchdog_loop and WATCHDOG_DEBUG are pub(crate) because the
-// op handlers and isolate setup (still in lib.rs) call them. WatchdogFrame is
-// pub(crate) only so it can appear in the pub(crate) WatchdogInner.frames field;
+// op handlers and isolate setup (still in lib.rs) call them;
 // report_watchdog_anomaly is private to this module.
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -24,8 +25,31 @@ use crate::{IsolateState, JsVal, VmError};
 // a condvar until a deadline is armed, terminates execution once the deadline
 // passes, then goes back to sleep.
 pub(crate) struct WatchdogShared {
-    pub(crate) inner: Mutex<WatchdogInner>,
-    pub(crate) cv: Condvar,
+    inner: Mutex<WatchdogInner>,
+    cv: Condvar,
+}
+
+impl WatchdogShared {
+    // The initial (idle) watchdog state, boxed in the Arc IsolateState holds.
+    pub(crate) fn new() -> Arc<Self> {
+        Arc::new(WatchdogShared {
+            inner: Mutex::new(WatchdogInner {
+                frames: Vec::new(),
+                next_generation: 0,
+                fired_generation: None,
+                shutdown: false,
+            }),
+            cv: Condvar::new(),
+        })
+    }
+
+    // Signal the loop to stop and wake it. Called once at isolate teardown,
+    // before the isolate is touched, so the loop can't fire a terminate into an
+    // isolate we're mid-disposing.
+    pub(crate) fn request_shutdown(&self) {
+        self.inner.lock().unwrap().shutdown = true;
+        self.cv.notify_one();
+    }
 }
 
 // One armed request's deadline. `run_js_bracketed` is RE-ENTRANT — a host fn
@@ -35,24 +59,24 @@ pub(crate) struct WatchdogShared {
 // one thread must not let a nested arm/disarm clobber the outer op's deadline,
 // or the outer op would run unbounded after the nested call returns.)
 #[derive(Clone, Copy)]
-pub(crate) struct WatchdogFrame {
+struct WatchdogFrame {
     generation: u64,
     deadline: Instant,
 }
 
-pub(crate) struct WatchdogInner {
+struct WatchdogInner {
     // Every currently-armed op (with timeout_ms > 0), pushed on arm and removed
     // on disarm. The loop honours the EARLIEST deadline across all frames: the
     // most urgent timeout fires first, and since TerminateExecution is
     // isolate-global it tears down whatever is running (escalating outward).
-    pub(crate) frames: Vec<WatchdogFrame>,
+    frames: Vec<WatchdogFrame>,
     // Monotonic; each arm takes the next value as its frame's id.
-    pub(crate) next_generation: u64,
+    next_generation: u64,
     // The generation whose deadline the loop terminated on — consumed (and
     // cleared) by that op's disarm so it can map its outcome to Terminated.
-    pub(crate) fired_generation: Option<u64>,
+    fired_generation: Option<u64>,
     // Set at isolate teardown to break the loop.
-    pub(crate) shutdown: bool,
+    shutdown: bool,
 }
 
 // The persistent watchdog loop. Runs off a Send IsolateHandle so it never
