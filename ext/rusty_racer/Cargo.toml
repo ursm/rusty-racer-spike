@@ -4,7 +4,7 @@
 # libv8-rusty needed under the cibuildgem native-per-platform model).
 [package]
 name = "rusty_racer"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2021"
 publish = false
 
