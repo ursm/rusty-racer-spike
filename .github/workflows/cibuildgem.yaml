@@ -31,6 +31,14 @@ on:
         default: false
 env:
   CIBUILDGEM: 1
+  # Run JS actions on Node 24, not the deprecated Node 20. Our own steps already
+  # use current actions, but the shopify/cibuildgem composite action still pins
+  # actions/upload-artifact@v4, download-artifact@v5, and
+  # rubygems/configure-rubygems-credentials@v1.0.0 (Node 20) internally — we can't
+  # bump those, and even cibuildgem@main hasn't. This silences the deprecation
+  # warnings and matches the Node 24 default GitHub forces from 2026-06-16. Drop
+  # it once cibuildgem ships Node 24 actions.
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
 jobs:
   # Fail the whole run fast (before the ~30-min build matrix) if a release tag
   # doesn't match the packaged version: cibuildgem publishes whatever version.rb
