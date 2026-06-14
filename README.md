@@ -21,6 +21,9 @@ Embed [V8](https://v8.dev/) in Ruby, built on [rusty_v8](https://crates.io/crate
 - **Drop-in [ExecJS](#execjs) runtime** — any ExecJS consumer switches with no
   code change.
 - **Snapshots, realms (`Context`s), host callbacks, and a bytecode cache.**
+- **Resource limits on both axes** — a `timeout_ms` (time) and a `memory_limit`
+  (space), each catchable: a runaway script fails just its own `eval`, leaving
+  the isolate usable, instead of aborting the process.
 - **Precompiled gems** bundle V8 for Linux/macOS × Ruby 3.3–4.0 — no V8 build,
   no Rust toolchain.
 
@@ -33,9 +36,10 @@ dynamic import** (mini_racer is eval/classic-script oriented); **richer
 marshalling** (the types above round-trip natively instead of through a
 JSON-shaped projection); and **in-thread execution** with no per-op thread hop,
 which is faster for overhead-dominated workloads (lots of tiny `eval`/`call`) and
-at parity once the per-op JS work dominates. It is also younger and
-**experimental** — fewer miles, no Windows yet, no per-isolate memory cap. Parity
-with mini_racer is not a goal; the overlap is convergent evolution, not a port.
+at parity once the per-op JS work dominates. Both axes of resource limiting are
+covered — a `timeout_ms` (time) and a `memory_limit` (space), each catchable. It
+is also younger and **experimental** — fewer miles, no Windows yet. Parity with
+mini_racer is not a goal; the overlap is convergent evolution, not a port.
 
 ## What it can do
 
@@ -82,6 +86,25 @@ app.namespace["r"]                       # => 42
 ```
 
 Classic `<script>`s work the same way: `ctx.compile("1 + 1").run` # => 2.
+
+### Resource limits
+
+An isolate can cap untrusted code on both axes. Each limit terminates the
+offending op and raises a catchable error — the isolate stays usable afterward,
+so one runaway script fails just its own `eval`, not the whole process.
+
+```ruby
+# Time: timeout_ms caps each eval/call (per-call override on Context#eval).
+iso = RustyRacer::Isolate.new(timeout_ms: 1000)
+iso.context.eval("for (;;) {}")          # raises RustyRacer::ScriptTerminatedError
+
+# Space: memory_limit caps the V8 heap in bytes (a soft limit, enforced at GC
+# granularity). The isolate forces a GC and resets the ceiling on recovery.
+iso = RustyRacer::Isolate.new(memory_limit: 64 * 1024 * 1024)
+iso.context.eval("a = []; for (;;) a.push(new Array(1e6))")
+                                         # raises RustyRacer::V8OutOfMemoryError
+iso.context.eval("1 + 1")                # => 2 (still usable)
+```
 
 ### Bytecode caching
 

@@ -185,6 +185,7 @@ pub(crate) fn run_js_bracketed(
         && ran_js
         && !fired
         && matches!(outcome, Err(VmError::Terminated))
+        && !istate!(scope).oom_fired
     {
         report_watchdog_anomaly(scope, label, watchdog, timeout_ms, started.elapsed());
     }
@@ -193,6 +194,15 @@ pub(crate) fn run_js_bracketed(
         if ran_js {
             outcome = Err(VmError::Terminated);
         }
+    } else if ran_js && istate!(scope).oom_fired {
+        // The memory_limit callback fired TerminateExecution during this op. body
+        // may not have noticed it — a microtask/TLA drain that was interrupted
+        // leaves a pending promise and returns Ok (auto_drain just stops at the
+        // terminate) — so force the terminated outcome rather than let an OOM
+        // surface as a bogus success. Core::run relabels it to OutOfMemory and
+        // recovers the heap. (No watchdog_fired here: the OOM terminate is swept by
+        // Core::run's recovery, not the request end-sweep.)
+        outcome = Err(VmError::Terminated);
     }
     outcome
 }
