@@ -23,7 +23,9 @@ Embed [V8](https://v8.dev/) in Ruby, built on [rusty_v8](https://crates.io/crate
 - **Snapshots, realms (`Context`s), host callbacks, and a bytecode cache.**
 - **Resource limits on both axes** — a `timeout_ms` (time) and a `memory_limit`
   (space), each catchable: a runaway script fails just its own `eval`, leaving
-  the isolate usable, instead of aborting the process.
+  the isolate usable, instead of aborting the process. A heap runaway is caught
+  even with no explicit `memory_limit` — V8's default ceiling raises instead of
+  aborting.
 - **Precompiled gems** bundle V8 for Linux/macOS × Ruby 3.3–4.0 — no V8 build,
   no Rust toolchain.
 
@@ -105,6 +107,13 @@ iso.context.eval("a = []; for (;;) a.push(new Array(1e6))")
                                          # raises RustyRacer::V8OutOfMemoryError
 iso.context.eval("1 + 1")                # => 2 (still usable)
 ```
+
+Even without an explicit `memory_limit`, a heap runaway raises
+`V8OutOfMemoryError` against V8's own default ceiling (~2 GB on 64-bit) rather
+than aborting the process — pass `memory_limit:` for a tighter bound. (One
+caveat: if the process's available memory — e.g. a container cgroup limit — sits
+below the active ceiling, the OS may kill the process before V8's callback
+fires; set an explicit `memory_limit` under that bound to keep it catchable.)
 
 ### Bytecode caching
 
