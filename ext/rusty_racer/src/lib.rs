@@ -190,25 +190,36 @@ enum VmError {
     OutOfMemory, // memory_limit hit -> RustyRacer::V8OutOfMemoryError
 }
 
-// V8's near-heap-limit callback (registered per isolate when memory_limit > 0).
-// V8 calls this, synchronously on the owner thread, when a GC still leaves the
-// heap about to exceed the configured ceiling — i.e. the script is running away
-// on memory. `data` is the isolate ptr we registered (Core.iso_ptr). We flag the
-// isolate and terminate the running JS so it unwinds with a catchable error
-// rather than V8 aborting the process. The return value becomes V8's new ceiling:
-// hand it a DOUBLED limit so the unwind itself (and any pending finalizers) has
-// room to allocate without tripping a hard OOM abort mid-unwind. Core::run, once
-// the op has unwound, forces a GC to reclaim and resets the ceiling — see the OOM
-// recovery there. The bump is a no-op-after-the-fact: doubling here, GC + reset
-// after, so the limit keeps protecting later ops.
-unsafe extern "C" fn near_heap_limit_cb(data: *mut c_void, current_heap_limit: usize, _initial: usize) -> usize {
+// V8's near-heap-limit callback (registered on EVERY isolate). V8 calls this,
+// synchronously on the owner thread, when a GC still leaves the heap about to
+// exceed the current ceiling — i.e. the script is running away on memory. That
+// ceiling is the configured memory_limit when one was set, otherwise V8's own
+// platform-derived default (the default-protection path), so a runaway raises a
+// catchable error either way instead of aborting the process. `data` is the
+// isolate ptr we registered (Core.iso_ptr). We flag the isolate and terminate the
+// running JS so it unwinds with that catchable error. The return value becomes
+// V8's new ceiling: hand it a DOUBLED limit so the unwind itself (and any pending
+// finalizers) has room to allocate without tripping a hard OOM abort mid-unwind.
+// Core::run, once the op has unwound, forces a GC to reclaim and resets the
+// ceiling — see the OOM recovery there. The bump is a no-op-after-the-fact:
+// doubling here, GC + reset after, so the limit keeps protecting later ops.
+unsafe extern "C" fn near_heap_limit_cb(data: *mut c_void, current_heap_limit: usize, initial: usize) -> usize {
     let isolate = unsafe { &mut *(data as *mut v8::Isolate) };
     // get_slot_mut (not istate!): this runs as an extern "C" callback from V8's
     // C++ allocator, where a panic would unwind across the FFI boundary. The slot
     // is always present once an op can run (set in Isolate::new before any JS), but
     // skip flagging rather than .expect()-panic in the impossible absent case.
-    // Setting the flag releases the &mut borrow before terminate_execution (&self).
-    if isolate.get_slot_mut::<IsolateState>().map(|s| s.oom_fired = true).is_some() {
+    // The closure releases the &mut borrow before terminate_execution (&self).
+    // Also record V8's `initial` ceiling so recovery can restore it when no
+    // explicit memory_limit was set (see oom_initial_limit).
+    let flagged = isolate
+        .get_slot_mut::<IsolateState>()
+        .map(|s| {
+            s.oom_fired = true;
+            s.oom_initial_limit = initial;
+        })
+        .is_some();
+    if flagged {
         isolate.terminate_execution();
     }
     current_heap_limit.saturating_mul(2)
@@ -567,12 +578,18 @@ struct IsolateState {
     instantiate_resolve: Option<RootedProc>,
     instantiate_resolve_err: Option<BoxValue<Exception>>,
     watchdog: Arc<WatchdogShared>,
-    // Set by near_heap_limit_cb when the configured memory_limit is hit: it
-    // terminates the running JS, and Core::run reads this after the op to relabel
-    // the terminate as OutOfMemory and recover the heap (GC + reset the ceiling).
+    // Set by near_heap_limit_cb when the heap ceiling is hit: it terminates the
+    // running JS, and Core::run reads this after the op to relabel the terminate as
+    // OutOfMemory and recover the heap (GC + reset the ceiling).
     // Plain bool (no atomic): the callback fires synchronously on the owner thread,
     // never concurrently with the bracket that reads it.
     oom_fired: bool,
+    // V8's original heap ceiling, captured from the callback's `initial` argument
+    // when it fires. Recovery resets the ceiling to memory_limit when one was set,
+    // but with no explicit limit (the default-protection path) the ceiling IS V8's
+    // platform-derived default, whose value we don't otherwise know — so we restore
+    // to this captured initial instead. 0 until the callback has fired at least once.
+    oom_initial_limit: usize,
 }
 
 impl IsolateState {
@@ -595,6 +612,7 @@ impl IsolateState {
             instantiate_resolve_err: None,
             watchdog: WatchdogShared::new(),
             oom_fired: false,
+            oom_initial_limit: 0,
         }
     }
 }
@@ -1085,10 +1103,12 @@ struct Core {
     // Default per-eval/call timeout (ms); 0 = none. eval(timeout_ms:)'s explicit
     // value overrides it. Guards against an in-V8 infinite loop without a watchdog.
     default_timeout_ms: u64,
-    // Per-isolate heap ceiling (bytes); 0 = none. When set, the isolate is created
-    // with this as V8's max heap and near_heap_limit_cb is registered; Core::run's
-    // OOM recovery resets the ceiling back to this after each OOM. Space-axis twin
-    // of default_timeout_ms.
+    // Per-isolate heap ceiling (bytes); 0 = V8's default ceiling. When set, the
+    // isolate is created with this as V8's max heap; near_heap_limit_cb is registered
+    // either way (against this ceiling when set, V8's default otherwise), so a runaway
+    // is always catchable rather than a process abort. Core::run's OOM recovery resets
+    // the ceiling after each OOM (to this when set, else V8's captured default — see
+    // oom_initial_limit). Space-axis twin of default_timeout_ms.
     memory_limit: usize,
     // Set by Context#dynamic_import_resolver=; called for a JS import() to map
     // (specifier, referrer) to an already-loaded Module. GC-rooted like procs.
@@ -1514,8 +1534,8 @@ fn build_snapshot(code: &str, base: Option<Vec<u8>>, warmup: bool) -> Result<Vec
                         VmError::Parse(m) | VmError::Runtime(m) => m,
                         VmError::JsError { message, .. } => message,
                         VmError::Terminated => "snapshot code was terminated".to_string(),
-                        // Unreachable: the snapshot-creator isolate carries no
-                        // memory_limit, so near_heap_limit_cb is never registered.
+                        // Unreachable: the snapshot-creator is a separate isolate
+                        // that never registers near_heap_limit_cb.
                         VmError::OutOfMemory => "snapshot code ran out of memory".to_string(),
                     });
                 }
@@ -1565,6 +1585,8 @@ impl Isolate {
         };
         // Cap V8's heap at the configured limit so its near-heap-limit callback
         // fires as the script approaches it (initial 0 = V8's default initial heap).
+        // With no explicit limit the callback is still registered below, against
+        // V8's own default ceiling, so a runaway raises instead of aborting.
         if memory_limit > 0 {
             create_params = create_params.heap_limits(0, memory_limit);
         }
@@ -1607,12 +1629,12 @@ impl Isolate {
         // registry moves only the 8-byte pointer; the boxed OwnedIsolate stays put.
         let mut boxed = Box::new(isolate);
         let iso_ptr = IsoPtr(&mut **boxed as *mut v8::Isolate);
-        // Arm the memory limit now that iso_ptr is stable: the callback's data IS
-        // this ptr (it reads the slot's oom_fired and terminates through it), and
-        // Core::run resets the ceiling through the same ptr on recovery.
-        if memory_limit > 0 {
-            boxed.add_near_heap_limit_callback(near_heap_limit_cb, iso_ptr.0 as *mut c_void);
-        }
+        // Arm the heap-limit callback now that iso_ptr is stable: the callback's
+        // data IS this ptr (it reads the slot's oom_fired and terminates through
+        // it), and Core::run resets the ceiling through the same ptr on recovery.
+        // Registered unconditionally — with memory_limit it guards that ceiling,
+        // without one it guards V8's default ceiling (catchable, not a process abort).
+        boxed.add_near_heap_limit_callback(near_heap_limit_cb, iso_ptr.0 as *mut c_void);
         let iso_id = NEXT_ISOLATE_ID.fetch_add(1, Ordering::SeqCst);
         isolates().lock().unwrap().insert(iso_id, SendIso(boxed));
         // Root the owner Thread VALUE so its address can't be reused while this
@@ -1735,19 +1757,26 @@ impl Core {
                 // OOM recovery. The near-heap-limit callback bumped the ceiling and
                 // terminated the op so it could unwind; the scope is closed and JS has
                 // stopped now. Reclaim the runaway allocation (a forced GC) and reset
-                // the ceiling back to memory_limit so the limit keeps protecting later
-                // ops, then relabel the terminate as OutOfMemory. watchdog_fired stays
-                // false for an OOM, so the request's end-sweep left the terminate flag
-                // set — cancel it here.
-                if self.memory_limit > 0 && std::mem::take(&mut istate!(unsafe { &mut *iso }).oom_fired) {
+                // the ceiling so the limit keeps protecting later ops, then relabel the
+                // terminate as OutOfMemory. watchdog_fired stays false for an OOM, so
+                // the request's end-sweep left the terminate flag set — cancel it here.
+                if std::mem::take(&mut istate!(unsafe { &mut *iso }).oom_fired) {
                     let iso_ref = unsafe { &mut *iso };
+                    // The ceiling to restore: the configured memory_limit when one was
+                    // set, otherwise V8's default ceiling, which the callback captured
+                    // in oom_initial_limit (we don't otherwise know its value).
+                    let restore_to = if self.memory_limit > 0 {
+                        self.memory_limit
+                    } else {
+                        istate!(iso_ref).oom_initial_limit
+                    };
                     // Reclaim the runaway allocation, then reset the ceiling from the
-                    // doubled bump back to memory_limit (V8 clamps it no lower than the
+                    // doubled bump back to restore_to (V8 clamps it no lower than the
                     // live heap — a genuinely-retained set above the limit necessarily
                     // loosens it, inherent to recovering the isolate rather than
                     // discarding it), and re-arm the callback for the next op.
                     iso_ref.low_memory_notification();
-                    iso_ref.remove_near_heap_limit_callback(near_heap_limit_cb, self.memory_limit);
+                    iso_ref.remove_near_heap_limit_callback(near_heap_limit_cb, restore_to);
                     iso_ref.add_near_heap_limit_callback(near_heap_limit_cb, iso as *mut c_void);
                     // Clear the terminate the OOM set (the request end-sweep skips it —
                     // that only sweeps watchdog_fired). Do this AFTER the GC: the forced
@@ -2173,9 +2202,8 @@ impl Core {
         // runs V8's teardown GC, which could otherwise re-invoke near_heap_limit_cb
         // (touching the just-reset slot of an isolate being destroyed). The watchdog
         // is already stopped above; this closes the matching space-axis hole.
-        if self.memory_limit > 0 {
-            unsafe { &mut *self.iso_ptr.0 }.remove_near_heap_limit_callback(near_heap_limit_cb, 0);
-        }
+        // Registered unconditionally (default protection), so always remove it.
+        unsafe { &mut *self.iso_ptr.0 }.remove_near_heap_limit_callback(near_heap_limit_cb, 0);
         // Remove (and drop) the OwnedIsolate — V8 disposal runs here — AFTER the
         // watchdog joined and the Globals were cleared, while the isolate is
         // entered (above). Drop outside the lock so V8 teardown can't deadlock on

@@ -166,8 +166,12 @@ class RustyRacerTest < Minitest::Test
     assert_operator RustyRacer::V8OutOfMemoryError, :<, RustyRacer::EvalError
   end
 
-  def test_no_memory_limit_by_default
-    # Without a limit, a moderately large allocation just succeeds.
+  def test_no_explicit_memory_limit_allows_moderate_allocation
+    # With no explicit limit the callback still guards V8's (large, ~2GB) default
+    # ceiling, so a moderately large allocation well under it just succeeds — the
+    # default protection only bites a genuine multi-GB runaway (not unit-tested:
+    # driving the real default ceiling needs ~2GB and shares the mechanism the
+    # explicit-limit tests above already cover).
     assert_equal 500000, @ctx.eval("new Array(500000).fill(0).length")
   end
 

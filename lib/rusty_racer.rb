@@ -27,8 +27,9 @@ module RustyRacer
   class ParseError < EvalError; end
   class RuntimeError < EvalError; end
   class ScriptTerminatedError < EvalError; end
-  # Raised when JS allocation exceeds the isolate's memory_limit. Catchable like
-  # any eval error — a runaway script fails its own eval instead of aborting the
+  # Raised when JS allocation exceeds the isolate's heap ceiling (the configured
+  # memory_limit, or V8's default ceiling when none was set). Catchable like any
+  # eval error — a runaway script fails its own eval instead of aborting the
   # process. The space-axis twin of ScriptTerminatedError (the time axis).
   class V8OutOfMemoryError < EvalError; end
   class SnapshotError < Error; end
@@ -45,12 +46,19 @@ module RustyRacer
     # Keyword-arg constructor over the positional Rust primitive. A snapshot
     # (RustyRacer::Snapshot) boots the isolate with its baked-in state;
     # timeout_ms caps each eval/call (0 = no limit) against in-V8 infinite
-    # loops. memory_limit caps the V8 heap in bytes (0 = no limit): a script
-    # that exceeds it is terminated and raises V8OutOfMemoryError rather than
-    # aborting the process, and the isolate stays usable afterward. It is a soft
-    # limit — V8 enforces it at GC granularity, so usage may briefly overshoot,
-    # and it must comfortably exceed the isolate's baseline (and any snapshot's
-    # baked-in heap), since the limit is only armed once the isolate has booted.
+    # loops. memory_limit caps the V8 heap in bytes: a script that exceeds the
+    # ceiling is terminated and raises V8OutOfMemoryError rather than aborting
+    # the process, and the isolate stays usable afterward. 0 (the default) does
+    # NOT disable this — it leaves V8's own platform-derived default ceiling
+    # (typically ~2 GB on 64-bit) in place, so a runaway is still catchable
+    # instead of a fatal abort; pass a smaller value for a tighter bound. It is
+    # a soft limit — V8 enforces it at GC granularity, so usage may briefly
+    # overshoot, and an explicit limit must comfortably exceed the isolate's
+    # baseline (and any snapshot's baked-in heap), since it is only armed once
+    # the isolate has booted. Caveat: if the process's available memory (e.g. a
+    # container cgroup limit) is below the active ceiling, the OS may kill the
+    # process before V8's callback fires — set an explicit memory_limit under
+    # that bound to keep the error catchable.
     # microtasks mirrors V8's kAuto/kExplicit: :auto (default) drains
     # the microtask queue when the outermost eval/call/run/evaluate completes
     # (the standard embedder contract); :explicit drains only on
