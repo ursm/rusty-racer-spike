@@ -27,6 +27,10 @@ module RustyRacer
   class ParseError < EvalError; end
   class RuntimeError < EvalError; end
   class ScriptTerminatedError < EvalError; end
+  # Raised when JS allocation exceeds the isolate's memory_limit. Catchable like
+  # any eval error — a runaway script fails its own eval instead of aborting the
+  # process. The space-axis twin of ScriptTerminatedError (the time axis).
+  class V8OutOfMemoryError < EvalError; end
   class SnapshotError < Error; end
   class PlatformAlreadyInitialized < Error; end
 
@@ -41,16 +45,22 @@ module RustyRacer
     # Keyword-arg constructor over the positional Rust primitive. A snapshot
     # (RustyRacer::Snapshot) boots the isolate with its baked-in state;
     # timeout_ms caps each eval/call (0 = no limit) against in-V8 infinite
-    # loops. microtasks mirrors V8's kAuto/kExplicit: :auto (default) drains
+    # loops. memory_limit caps the V8 heap in bytes (0 = no limit): a script
+    # that exceeds it is terminated and raises V8OutOfMemoryError rather than
+    # aborting the process, and the isolate stays usable afterward. It is a soft
+    # limit — V8 enforces it at GC granularity, so usage may briefly overshoot,
+    # and it must comfortably exceed the isolate's baseline (and any snapshot's
+    # baked-in heap), since the limit is only armed once the isolate has booted.
+    # microtasks mirrors V8's kAuto/kExplicit: :auto (default) drains
     # the microtask queue when the outermost eval/call/run/evaluate completes
     # (the standard embedder contract); :explicit drains only on
     # #perform_microtask_checkpoint.
-    def self.new(host_namespace: nil, snapshot: nil, timeout_ms: 0, microtasks: :auto)
+    def self.new(host_namespace: nil, snapshot: nil, timeout_ms: 0, memory_limit: 0, microtasks: :auto)
       unless %i[auto explicit].include?(microtasks)
         raise ArgumentError, "microtasks must be :auto or :explicit, got #{microtasks.inspect}"
       end
 
-      _new(host_namespace, snapshot, timeout_ms, microtasks == :explicit)
+      _new(host_namespace, snapshot, timeout_ms, memory_limit, microtasks == :explicit)
     end
 
     # ->(specifier, referrer_url, context) { Module } for JS import(). |context|

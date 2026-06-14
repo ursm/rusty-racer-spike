@@ -120,6 +120,57 @@ class RustyRacerTest < Minitest::Test
     assert_equal 2, iso.context.eval("1 + 1") # isolate still usable
   end
 
+  # Bounded so a MISS fails fast instead of hanging or OS-OOM-killing: ~30 * 8MB
+  # = ~240MB worst case, well over the 50MB limit (OOMs in ~7 iterations) yet
+  # capped if the limit somehow doesn't bite. Numeric .fill keeps the backing
+  # store on V8's GC heap (what memory_limit counts).
+  RUNAWAY_JS = "var a = []; for (var i = 0; i < 30; i++) { a.push(new Array(1000000).fill(7)); }"
+
+  # Space-axis twin of the timeout test: a runaway allocation must fail its own
+  # eval (catchable) instead of aborting the process, and the isolate must
+  # recover (forced GC + ceiling reset) so it stays usable for the next eval.
+  def test_memory_limit_raises_v8_out_of_memory_and_recovers
+    iso = RustyRacer::Isolate.new(memory_limit: 50 * 1024 * 1024)
+    ctx = iso.context
+    assert_raises(RustyRacer::V8OutOfMemoryError) { ctx.eval(RUNAWAY_JS) }
+    # The process is still alive (no abort) and the isolate reclaimed the heap.
+    assert_equal 2, ctx.eval("1 + 1")
+    # And the limit still bites a second time — recovery re-armed the callback.
+    assert_raises(RustyRacer::V8OutOfMemoryError) { ctx.eval(RUNAWAY_JS) }
+    assert_equal 4, ctx.eval("2 + 2")
+  end
+
+  # An OOM that fires while draining microtasks (not during the synchronous eval)
+  # must still surface as V8OutOfMemoryError, not a bogus success: the drain stops
+  # at the terminate and leaves the eval's value (here 'queued') behind, so the
+  # bracket has to force the terminated outcome. Guards the silent-success path.
+  def test_memory_limit_during_microtask_drain_still_raises
+    iso = RustyRacer::Isolate.new(memory_limit: 50 * 1024 * 1024)
+    ctx = iso.context
+    src = "Promise.resolve().then(() => { #{RUNAWAY_JS} }); 'queued'"
+    assert_raises(RustyRacer::V8OutOfMemoryError) { ctx.eval(src) }
+    assert_equal 2, ctx.eval("1 + 1") # still usable
+  end
+
+  # Both axes armed at once: the runaway trips memory before the (generous)
+  # timeout, so it surfaces as an error and the isolate recovers. Exercises the
+  # watchdog/OOM interaction (the canary must not misfire — see watchdog.rs).
+  def test_memory_limit_and_timeout_together
+    iso = RustyRacer::Isolate.new(memory_limit: 50 * 1024 * 1024, timeout_ms: 10_000)
+    ctx = iso.context
+    assert_raises(RustyRacer::EvalError) { ctx.eval(RUNAWAY_JS) }
+    assert_equal 2, ctx.eval("1 + 1")
+  end
+
+  def test_v8_out_of_memory_is_an_eval_error
+    assert_operator RustyRacer::V8OutOfMemoryError, :<, RustyRacer::EvalError
+  end
+
+  def test_no_memory_limit_by_default
+    # Without a limit, a moderately large allocation just succeeds.
+    assert_equal 500000, @ctx.eval("new Array(500000).fill(0).length")
+  end
+
   def test_classic_script_dispose
     s = @ctx.compile("1")
     assert_equal false, s.disposed?
